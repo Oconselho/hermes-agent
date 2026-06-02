@@ -317,9 +317,7 @@ class WhatsAppAdapter(BasePlatformAdapter):
 
     def _effective_reply_prefix(self) -> str:
         """Return the prefix the Node bridge will add in self-chat mode."""
-        whatsapp_mode = os.getenv("WHATSAPP_MODE", "self-chat")
-        if whatsapp_mode != "self-chat":
-            return ""
+        # Reply prefix works in ALL modes (self-chat and multi-device)
         if self._reply_prefix is not None:
             return self._reply_prefix.replace("\\n", "\n")
         env_prefix = os.getenv("WHATSAPP_REPLY_PREFIX")

@@ -286,17 +286,39 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
 
 
 def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
-    """Sanitize final gateway replies before sending them to high-noise chats.
-
-    Telegram is Bob's mobile inbox, so it should receive concise, safe provider
-    failure categories instead of raw HTTP bodies, request IDs, or policy text.
-    Other platforms keep the existing behaviour for now.
-    """
+    """Sanitize final gateway replies before sending them to high-noise chats."""
     if not text:
         return text
-    if _gateway_platform_value(platform) != "telegram":
+    platform_value = _gateway_platform_value(platform)
+    if platform_value == "whatsapp":
+        cleaned = _redact_gateway_user_facing_secrets(str(text))
+        # Block leaked tool names
+        if re.search(r"(?im)^\s*(terminal|execute_code|search_files|read_file|browser_[a-z_]+|skill_view|session_search)\s*:", cleaned):
+            return "Recebi sua mensagem. O Dr. Victor verificará assim que possível."
+        # Block leaked XML tool call blocks (DeepSeek hallucination)
+        cleaned = re.sub(r"<function_calls>.*?</function_calls>", "", cleaned, flags=re.S | re.I)
+        cleaned = re.sub(r"<invoke[^>]*>.*?</invoke>", "", cleaned, flags=re.S | re.I)
+        cleaned = re.sub(r"<tool_calls>.*?</tool_calls>", "", cleaned, flags=re.S | re.I)
+        cleaned = re.sub(r"<parameter[^>]*>.*?</parameter>", "", cleaned, flags=re.S | re.I)
+        if re.search(r"<\s*(function_calls|invoke|tool_calls|parameter)", cleaned, re.I):
+            return "Recebi sua mensagem. O Dr. Victor verificará assim que possível."
+        # Block leaked internal reasoning
+        internal_reasoning_re = re.compile(
+            r"(?is)(\b[oae] usu[aá]ri[oa]\b.{0,220}\b(indica|mensagens anteriores|tom|intera[cç][aã]o|pedido)\b)"
+            r"|(\bcomo assistente\b.{0,220}\b(n[aã]o devo|devo|regra|responder|seguir)\b)"
+            r"|(\b(n[aã]o h[aá] necessidade|preciso|devo)\b.{0,220}\b(coletar|recado|responder|decis[aã]o|regra)\b)"
+            r"|(\b(racioc[ií]nio|pensamento|l[oó]gica interna|decis[aã]o interna|mensagens anteriores)\b)",
+        )
+        if internal_reasoning_re.search(cleaned):
+            return "Obrigado. O Dr. Victor verificará sua mensagem pessoalmente."
+        cleaned = re.sub(r"```.*?```", "", cleaned, flags=re.S)
+        cleaned = cleaned.replace("`", "").replace("*", "").replace("!", ".")
+        cleaned = re.sub(r"[\U0001F300-\U0001FAFF\u2600-\u27BF]", "", cleaned)
+        cleaned = re.sub(r"[ \t]+", " ", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+        return cleaned or "Recebi sua mensagem. O Dr. Victor verificará assim que possível."
+    if platform_value != "telegram":
         return text
-
     redacted = _redact_gateway_user_facing_secrets(str(text))
     if _looks_like_gateway_provider_error(redacted):
         return _gateway_provider_error_reply(redacted)
@@ -307,6 +329,8 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     """Filter/sanitize agent status callbacks before platform delivery."""
     text = str(message or "").strip()
     if not text:
+        return None
+    if _gateway_platform_value(platform) == "whatsapp":
         return None
     if _gateway_platform_value(platform) != "telegram":
         return text
@@ -9032,6 +9056,57 @@ class GatewayRunner:
             }
             await self.hooks.emit("agent:start", hook_ctx)
 
+            # ── WhatsApp: ignored numbers & owner cooldown ──
+            if source.platform and source.platform.value == "whatsapp":
+                import re as _wa_re
+                import glob as _wa_glob
+                _wa_sender = str(getattr(source, "user_id", "") or "")
+                _wa_sender_digits = _wa_re.sub(r"[^0-9]", "", _wa_sender)
+                # Resolve LID to phone
+                _wa_phone = ""
+                try:
+                    for _mf in _wa_glob.glob(os.path.join(os.path.expanduser("~/.hermes/whatsapp/session"), "lid-mapping-[0-9]*.json")):
+                        if "_reverse" not in _mf:
+                            with open(_mf) as _mfh:
+                                _mapped_lid = _mfh.read().strip().strip('"')
+                            if _mapped_lid and _mapped_lid in _wa_sender_digits:
+                                _wa_phone = os.path.basename(_mf).replace("lid-mapping-", "").replace(".json", "")
+                                break
+                except Exception:
+                    pass
+                _wa_check = _wa_phone if _wa_phone else _wa_sender_digits
+                _wa_owner = self._whatsapp_owner_digits if hasattr(self, "_whatsapp_owner_digits") else "557188048263"
+                # --- Check ignored numbers ---
+                try:
+                    _ignored_path = os.path.expanduser("~/.hermes/whatsapp/ignored_numbers.txt")
+                    if os.path.exists(_ignored_path):
+                        _ignored = set()
+                        with open(_ignored_path) as _f:
+                            for _line in _f:
+                                _line = _line.strip()
+                                if _line and not _line.startswith("#"):
+                                    _ignored.add(_line)
+                        _is_ignored = any(_n in _wa_check or _wa_check in _n for _n in _ignored)
+                        _is_ignored = _is_ignored or any(_n in _wa_sender_digits or _wa_sender_digits in _n for _n in _ignored)
+                        if _is_ignored:
+                            return
+                except Exception:
+                    pass
+                # --- Check cooldown (owner replied in this chat < 30min ago) ---
+                _wa_is_owner = _wa_owner in _wa_check or _wa_check in _wa_owner
+                _wa_chat_raw = str(getattr(source, "chat_id", "") or "")
+                _wa_chat_digits = _wa_re.sub(r"[^0-9]", "", _wa_chat_raw)
+                if _wa_is_owner:
+                    _wa_is_self_chat = _wa_owner in _wa_chat_digits or _wa_chat_digits in _wa_owner
+                    if not _wa_is_self_chat:
+                        # Owner messaging a third-party chat — record handoff
+                        self._owner_last_reply_timestamps[str(source.chat_id or "")] = time.time()
+                        return
+                else:
+                    _last_owner = self._owner_last_reply_timestamps.get(str(source.chat_id or ""), 0.0)
+                    if _last_owner > 0 and (time.time() - _last_owner) < 1800:
+                        return
+
             # Run the agent
             agent_result = await self._run_agent(
                 message=message_text,
@@ -9116,6 +9191,32 @@ class GatewayRunner:
                 agent_result, response, history_len=len(history),
             )
             response = _sanitize_gateway_final_response(source.platform, response)
+
+            # WhatsApp spam-protect: track "sem interesse" rejections
+            if source.platform and source.platform.value == "whatsapp" and response:
+                try:
+                    _spam_chat_id2 = str(source.chat_id or source.user_id or "")
+                    _spam_file2 = os.path.expanduser("~/.hermes/whatsapp/chat-cooldowns.json")
+                    _spam_state2 = {}
+                    if os.path.exists(_spam_file2):
+                        with open(_spam_file2) as _sf2:
+                            _spam_state2 = json.loads(_sf2.read() or "{}")
+                    _entry2 = _spam_state2.get(_spam_chat_id2, {})
+                    _resp_lower = response.lower()
+                    _reject_phrases = [
+                        "sem interesse",
+                        "obrigado, sem interesse",
+                        "não aceita interações",
+                        "não participa",
+                    ]
+                    if any(p in _resp_lower for p in _reject_phrases):
+                        _cur = _entry2.get("reject_count", 0)
+                        _entry2["reject_count"] = _cur + 1
+                        _spam_state2[_spam_chat_id2] = _entry2
+                        with open(_spam_file2, "w") as _sf2:
+                            json.dump(_spam_state2, _sf2)
+                except Exception:
+                    pass
 
             # If the agent's session_id changed during compression, update
             # session_entry so transcript writes below go to the right session.
@@ -17109,6 +17210,47 @@ class GatewayRunner:
             if self._ephemeral_system_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
 
+            # --------------------------------------------------------
+            # WhatsApp secretary: override system prompt for non-owner
+            # contacts. Model acts as professional assistant, not Hermes.
+            # --------------------------------------------------------
+            if source.platform and source.platform.value == "whatsapp":
+                import re as _so_re
+                import glob as _so_glob
+                _so_sender = str(getattr(source, "user_id", "") or "")
+                _so_sender_digits = _so_re.sub(r"[^0-9]", "", _so_sender)
+                _so_phone = ""
+                try:
+                    for _mf in _so_glob.glob(os.path.join(os.path.expanduser("~/.hermes/whatsapp/session"), "lid-mapping-[0-9]*.json")):
+                        if "_reverse" not in _mf:
+                            with open(_mf) as _mfh:
+                                _mapped_lid = _mfh.read().strip().strip('"')
+                            if _mapped_lid and _mapped_lid in _so_sender_digits:
+                                _so_phone = os.path.basename(_mf).replace("lid-mapping-", "").replace(".json", "")
+                                break
+                except Exception:
+                    pass
+                _so_check = _so_phone if _so_phone else _so_sender_digits
+                _owner = self._whatsapp_owner_digits if hasattr(self, "_whatsapp_owner_digits") else "557188048263"
+                if _owner not in _so_check and _so_check not in _owner:
+                    combined_ephemeral = """Você é assistente pessoal do Dr. Victor Almeida, endocrinologista (CRM-BA 22.586, RQE 13.396).
+Endereço: CEO Salvador Shopping, Torre Londres, Sala 1616. Horários: Ter-Sex 14h-18h, Sáb 9h-11h.
+Agendamento: WhatsApp 71996691002. Particular, sem convênios. Emite recibo.
+
+REGRAS ESTRITAS:
+1. Tom formal, claro, polido. NUNCA use travessão, reticências, markdown, emojis.
+2. NUNCA peça telefone ou e-mail. WhatsApp já tem os dados.
+3. RESPOSTA PADRÃO: "Dr. Victor está indisponível. Posso anotar seu recado?"
+4. Respostas curtas. Máximo 2 frases.
+5. PROIBIDO: emoji, informal, risadas, abreviações, chamar de querido/lindo/amigo.
+6. NUNCA mencione IA, robô, assistente virtual, sistema.
+7. NUNCA mostre raciocínio, análise ou justificativa na resposta.
+8. APRESENTAÇÃO OBRIGATÓRIA em todo primeiro contato: "Olá. Assistente do Dr. Victor Almeida. Em que posso ajudar?"
+9. AMIGO/FAMILIAR: "Obrigado. O Dr. Victor verificará pessoalmente."
+10. COMERCIAL: "Obrigado, sem interesse."
+11. AGRUPE RESPOSTAS: se múltiplas mensagens, UMA resposta final."""
+
+
             # Re-read .env and config for fresh credentials (gateway is long-lived,
             # keys may change without restart). Keep config.yaml authoritative for
             # runtime budget settings bridged into env vars.
@@ -17285,6 +17427,8 @@ class GatewayRunner:
                     verbose_logging=False,
                     enabled_toolsets=enabled_toolsets,
                     disabled_toolsets=disabled_toolsets,
+
+
                     ephemeral_system_prompt=combined_ephemeral or None,
                     prefill_messages=self._prefill_messages or None,
                     reasoning_config=reasoning_config,

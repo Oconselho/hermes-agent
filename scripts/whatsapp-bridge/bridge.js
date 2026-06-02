@@ -57,6 +57,13 @@ const REPLY_PREFIX = process.env.WHATSAPP_REPLY_PREFIX === undefined
   : process.env.WHATSAPP_REPLY_PREFIX.replace(/\\n/g, '\n');
 const MAX_MESSAGE_LENGTH = parseInt(process.env.WHATSAPP_MAX_MESSAGE_LENGTH || '4096', 10);
 const CHUNK_DELAY_MS = parseInt(process.env.WHATSAPP_CHUNK_DELAY_MS || '300', 10);
+// Owner reply cooldown: 30 minutes. When the primary WhatsApp account sends
+// a message in a third-party chat (Baileys msg.key.fromMe === true), record a
+// timestamp. Incoming messages in that same chat are then blocked before they
+// reach the Python gateway, so the secretary stays silent like a CRM handoff.
+const OWNER_COOLDOWN_MS = 30 * 60 * 1000;  // 30 min
+const OWNER_COOLDOWN_STATE_FILE = path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'owner-reply-cooldowns.json');
+const ownerReplyTimestamps = loadOwnerReplyTimestamps();  // key: chatId, value: timestamp
 // Per-call timeout for sock.sendMessage(). Baileys occasionally hangs forever
 // when uploading media to WhatsApp servers (and, less often, on text sends),
 // which pins the bridge's HTTP handler until the upstream aiohttp timeout
@@ -65,6 +72,50 @@ const SEND_TIMEOUT_MS = parseInt(process.env.WHATSAPP_SEND_TIMEOUT_MS || '60000'
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function pruneOwnerReplyTimestamps(now = Date.now()) {
+  for (const [chatId, ts] of Object.entries(ownerReplyTimestamps)) {
+    if (!Number.isFinite(ts) || (now - ts) >= OWNER_COOLDOWN_MS) {
+      delete ownerReplyTimestamps[chatId];
+    }
+  }
+}
+
+function loadOwnerReplyTimestamps() {
+  try {
+    if (!existsSync(OWNER_COOLDOWN_STATE_FILE)) return {};
+    const parsed = JSON.parse(readFileSync(OWNER_COOLDOWN_STATE_FILE, 'utf8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    const now = Date.now();
+    const result = {};
+    for (const [chatId, ts] of Object.entries(parsed)) {
+      const numericTs = Number(ts);
+      if (chatId && Number.isFinite(numericTs) && (now - numericTs) < OWNER_COOLDOWN_MS) {
+        result[chatId] = numericTs;
+      }
+    }
+    return result;
+  } catch {
+    return {};
+  }
+}
+
+function saveOwnerReplyTimestamps() {
+  try {
+    mkdirSync(path.dirname(OWNER_COOLDOWN_STATE_FILE), { recursive: true });
+    pruneOwnerReplyTimestamps();
+    writeFileSync(OWNER_COOLDOWN_STATE_FILE, JSON.stringify(ownerReplyTimestamps, null, 2));
+  } catch {}
+}
+
+function recordOwnerReply(chatId, reason = 'owner_outbound') {
+  const now = Date.now();
+  ownerReplyTimestamps[chatId] = now;
+  saveOwnerReplyTimestamps();
+  if (WHATSAPP_DEBUG) {
+    try { console.log(JSON.stringify({ event: 'owner_outbound', reason, chatId, cooldown_ms: OWNER_COOLDOWN_MS })); } catch {}
+  }
 }
 
 function sendWithTimeout(chatId, payload, timeoutMs = SEND_TIMEOUT_MS) {
@@ -269,11 +320,21 @@ async function startSocket() {
         if (isGroup || chatId.includes('status')) continue;
 
         if (WHATSAPP_MODE === 'bot') {
-          // Bot mode: separate number. ALL fromMe are echo-backs of our own replies — skip.
+          // Bot mode: separate number. Echo-backs of our own replies are
+          // filtered by recentlySentIds. Genuine owner messages from the
+          // primary phone trigger the cooldown so the secretary stays
+          // silent for 30 minutes.
+          if (recentlySentIds.has(msg.key.id)) continue;
+
+          // Owner message from primary phone: record cooldown timestamp
+          recordOwnerReply(chatId, 'from_me_bot_mode');
           continue;
         }
 
-        // Self-chat mode: only allow messages in the user's own self-chat
+        // Self-chat mode: only allow messages in the user's own self-chat.
+        // Multi-device mode is the public WhatsApp secretary mode: any fromMe
+        // message in a third-party DM means Dr. Victor is handling that chat
+        // manually. Record the handoff and do NOT forward it to the gateway.
         // WhatsApp now uses LID (Linked Identity Device) format: 67427329167522@lid
         // AND classic format: 34652029134@s.whatsapp.net
         // sock.user has both: { id: "number:10@s.whatsapp.net", lid: "lid_number:10@lid" }
@@ -281,6 +342,11 @@ async function startSocket() {
         const myLid = (sock.user?.lid || '').replace(/:.*@/, '@').replace(/@.*/, '');
         const chatNumber = chatId.replace(/@.*/, '');
         const isSelfChat = (myNumber && chatNumber === myNumber) || (myLid && chatNumber === myLid);
+        if (WHATSAPP_MODE === 'multi-device' && !isSelfChat) {
+          if (recentlySentIds.has(msg.key.id)) continue;
+          recordOwnerReply(chatId, 'from_me_multi_device');
+          continue;
+        }
         if (!isSelfChat) continue;
       }
 
@@ -290,6 +356,18 @@ async function startSocket() {
       // Python gateway, otherwise a pairing-code reply fires in response
       // to arbitrary incoming messages (#8389).
       if (!msg.key.fromMe) {
+        // Owner reply cooldown: if Dr. Victor replied to this chat
+        // within the last 30 minutes, block incoming messages from
+        // reaching the gateway so the secretary doesn't respond.
+        pruneOwnerReplyTimestamps();
+        const ownerTs = ownerReplyTimestamps[chatId];
+        if (ownerTs && (Date.now() - ownerTs) < OWNER_COOLDOWN_MS) {
+          if (WHATSAPP_DEBUG) {
+            try { console.log(JSON.stringify({ event: 'cooldown', reason: 'owner_replied_recently', chatId, senderId })); } catch {}
+          }
+          saveOwnerReplyTimestamps();
+          continue;
+        }
         if (WHATSAPP_MODE === 'self-chat') {
           try {
             console.log(JSON.stringify({
@@ -495,9 +573,15 @@ app.post('/send', async (req, res) => {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
 
-  const { chatId, message, replyTo } = req.body;
+  const { chatId, message, replyTo, ownerReply } = req.body;
   if (!chatId || !message) {
     return res.status(400).json({ error: 'chatId and message are required' });
+  }
+
+  // If this is a reply from the owner (Dr. Victor), record the timestamp
+  // so the cooldown blocks the secretary from responding for 30 min.
+  if (ownerReply) {
+    recordOwnerReply(chatId, 'send_endpoint_owner_reply');
   }
 
   try {

@@ -81,3 +81,30 @@ def test_telegram_final_response_keeps_normal_answers():
     answer = "Here is the clean summary you asked for."
 
     assert _sanitize_gateway_final_response(Platform.TELEGRAM, answer) == answer
+
+
+def test_whatsapp_final_response_blocks_leaked_internal_reasoning():
+    """Public WhatsApp contacts must never receive model decision notes."""
+    raw = (
+        'O usuário riu ("kkkkkkkkkkk"), o que, pelo tom das mensagens anteriores, '
+        "indica uma interação informal de amigo ou familiar. Como assistente, não "
+        "devo corresponder ao tom informal, mas devo seguir a regra para contatos "
+        'pessoais: responder com a frase padrão educada "Obrigado. O Dr. Victor '
+        'verificará sua mensagem pessoalmente." Não há necessidade de coletar '
+        "nenhum recado, pois a mensagem não continha um pedido."
+    )
+
+    sanitized = _sanitize_gateway_final_response(Platform.WHATSAPP, raw)
+
+    assert sanitized == "Obrigado. O Dr. Victor verificará sua mensagem pessoalmente."
+    assert "O usuário" not in sanitized
+    assert "Como assistente" not in sanitized
+    assert "não devo" not in sanitized
+    assert "regra" not in sanitized
+
+
+def test_whatsapp_final_response_keeps_clean_secretary_reply():
+    """Clean secretary messages should still pass through, minus WhatsApp cleanup."""
+    answer = "Obrigado. O Dr. Victor verificará sua mensagem pessoalmente."
+
+    assert _sanitize_gateway_final_response(Platform.WHATSAPP, answer) == answer
