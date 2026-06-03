@@ -307,7 +307,8 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
             r"(?is)(\b[oae] usu[aá]ri[oa]\b.{0,220}\b(indica|mensagens anteriores|tom|intera[cç][aã]o|pedido)\b)"
             r"|(\bcomo assistente\b.{0,220}\b(n[aã]o devo|devo|regra|responder|seguir)\b)"
             r"|(\b(n[aã]o h[aá] necessidade|preciso|devo)\b.{0,220}\b(coletar|recado|responder|decis[aã]o|regra)\b)"
-            r"|(\b(racioc[ií]nio|pensamento|l[oó]gica interna|decis[aã]o interna|mensagens anteriores)\b)",
+            r"|(\b(o que eu responderia|o que responderia|o que devo responder|o que eu devo responder|resposta ideal|resposta que eu daria|como devo responder|como responder|vou responder|vou dizer|justificativa|an[aá]lise interna|racioc[ií]nio de)\b)"
+            r"|(\b(racioc[ií]nio|pensamento|l[oó]gica interna|decis[aã]o interna|mensagens anteriores|an[aá]lise)\b)",
         )
         if internal_reasoning_re.search(cleaned):
             return "Obrigado. O Dr. Victor verificará sua mensagem pessoalmente."
@@ -17250,10 +17251,11 @@ REGRAS ESTRITAS:
 5. PROIBIDO: emoji, informal, risadas, abreviações, chamar de querido/lindo/amigo.
 6. NUNCA mencione IA, robô, assistente virtual, sistema.
 7. NUNCA mostre raciocínio, análise ou justificativa na resposta.
-8. APRESENTAÇÃO OBRIGATÓRIA em todo primeiro contato ou nova sessão: comece com "Olá, sou a assistente do Dr. Victor. Ele está ocupado no momento. Posso anotar seu recado?"
-9. AMIGO/FAMILIAR: "Obrigado. O Dr. Victor verificará pessoalmente."
-10. COMERCIAL: "Obrigado, sem interesse."
-11. AGRUPE RESPOSTAS: se múltiplas mensagens, UMA resposta final."""
+8. SAUDAÇÃO: use Bom dia, Boa tarde ou Boa noite conforme o horário, quando fizer sentido.
+9. APRESENTAÇÃO OBRIGATÓRIA em todo primeiro contato ou nova sessão: comece com "Olá, sou a assistente do Dr. Victor. Ele está ocupado no momento. Posso anotar seu recado?"
+10. AMIGO/FAMILIAR: "Obrigado. O Dr. Victor verificará pessoalmente."
+11. COMERCIAL: "Obrigado, sem interesse."
+12. AGRUPE RESPOSTAS: se múltiplas mensagens, UMA resposta final."""
 
 
             # Re-read .env and config for fresh credentials (gateway is long-lived,

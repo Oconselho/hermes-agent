@@ -103,6 +103,21 @@ def test_whatsapp_final_response_blocks_leaked_internal_reasoning():
     assert "regra" not in sanitized
 
 
+def test_whatsapp_final_response_blocks_explicit_meta_reasoning():
+    """Explicit descriptions of what the model would answer must be suppressed."""
+    raw = (
+        "Estou pensando no que eu responderia aqui. O raciocínio é que a melhor "
+        "resposta seria informar que o Dr. Victor verificará pessoalmente."
+    )
+
+    sanitized = _sanitize_gateway_final_response(Platform.WHATSAPP, raw)
+
+    assert sanitized == "Obrigado. O Dr. Victor verificará sua mensagem pessoalmente."
+    assert "racioc" not in sanitized.lower()
+    assert "responderia" not in sanitized.lower()
+    assert "pensando" not in sanitized.lower()
+
+
 def test_whatsapp_final_response_keeps_clean_secretary_reply():
     """Clean secretary messages should still pass through, minus WhatsApp cleanup."""
     answer = "Obrigado. O Dr. Victor verificará sua mensagem pessoalmente."
