@@ -45,7 +45,7 @@ def _make_store(policy=None, tmp_path=None):
 class TestShouldResetReason:
     def test_returns_none_when_not_expired(self, tmp_path):
         store = _make_store(
-            SessionResetPolicy(mode="both", idle_minutes=60, at_hour=4),
+            SessionResetPolicy(mode="both", idle_minutes=60, at_hour=0),
             tmp_path,
         )
         entry = SessionEntry(

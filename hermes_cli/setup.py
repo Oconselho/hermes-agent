@@ -1595,7 +1595,7 @@ def setup_agent_settings(config: dict):
         except ValueError:
             pass
         print_success(
-            f"Sessions reset after {config['session_reset'].get('idle_minutes', 1440)} min idle or daily at {config['session_reset'].get('at_hour', 4)}:00"
+            f"Sessions reset after {config['session_reset'].get('idle_minutes', 1440)} min idle or daily at {config['session_reset'].get('at_hour', 0)}:00"
         )
     elif reset_idx == 1:  # Idle only
         config["session_reset"]["mode"] = "idle"
@@ -1619,7 +1619,7 @@ def setup_agent_settings(config: dict):
         except ValueError:
             pass
         print_success(
-            f"Sessions reset daily at {config['session_reset'].get('at_hour', 4)}:00"
+            f"Sessions reset daily at {config['session_reset'].get('at_hour', 0)}:00"
         )
     elif reset_idx == 3:  # None
         config["session_reset"]["mode"] = "none"

@@ -147,7 +147,7 @@ class TestSessionResetPolicy:
     def test_defaults(self):
         policy = SessionResetPolicy()
         assert policy.mode == "both"
-        assert policy.at_hour == 4
+        assert policy.at_hour == 0
         assert policy.idle_minutes == 1440
 
     def test_from_dict_treats_null_values_as_defaults(self):
@@ -155,7 +155,7 @@ class TestSessionResetPolicy:
             {"mode": None, "at_hour": None, "idle_minutes": None}
         )
         assert restored.mode == "both"
-        assert restored.at_hour == 4
+        assert restored.at_hour == 0
         assert restored.idle_minutes == 1440
 
     def test_from_dict_coerces_quoted_false_notify(self):
