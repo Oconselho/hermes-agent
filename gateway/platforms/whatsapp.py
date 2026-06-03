@@ -326,7 +326,10 @@ class WhatsAppAdapter(BasePlatformAdapter):
         return self.DEFAULT_REPLY_PREFIX
 
     def _outgoing_chunk_limit(self) -> int:
-        """Reserve room for the bridge-side prefix so final WhatsApp text fits."""
+        """Reserve room for the bridge-side prefix when it will actually be used."""
+        whatsapp_mode = os.getenv("WHATSAPP_MODE", "self-chat").strip().lower()
+        if whatsapp_mode != "self-chat":
+            return self.MAX_MESSAGE_LENGTH
         prefix_len = len(self._effective_reply_prefix())
         # Keep enough space for truncate_message's pagination indicator and
         # code-fence repair even if a user configures a very long prefix.

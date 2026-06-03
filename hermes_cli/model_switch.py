@@ -1043,7 +1043,7 @@ def list_authenticated_providers(
     current_base_url: str = "",
     user_providers: dict = None,
     custom_providers: list | None = None,
-    max_models: int = 8,
+    max_models: int | None = 8,
     current_model: str = "",
 ) -> List[dict]:
     """Detect which providers have credentials and list their curated models.
@@ -1752,7 +1752,7 @@ def list_picker_providers(
     current_base_url: str = "",
     user_providers: dict = None,
     custom_providers: list | None = None,
-    max_models: int = 8,
+    max_models: int | None = 8,
     current_model: str = "",
 ) -> List[dict]:
     """Interactive-picker variant of :func:`list_authenticated_providers`.

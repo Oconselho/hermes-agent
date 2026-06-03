@@ -114,7 +114,7 @@ def build_models_payload(
     include_unconfigured: bool = False,
     picker_hints: bool = False,
     canonical_order: bool = False,
-    max_models: int = 50,
+    max_models: int | None = 50,
 ) -> dict:
     """Build the ``{providers, model, provider}`` shape every consumer
     needs from a single substrate call.
