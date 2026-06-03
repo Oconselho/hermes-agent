@@ -1744,6 +1744,11 @@ class GatewayRunner:
         self._exit_code: Optional[int] = None
         self._draining = False
         self._restart_requested = False
+
+        # WhatsApp secretary: owner identity and cooldown tracking
+        self._whatsapp_owner_digits = os.getenv("WHATSAPP_OWNER_DIGITS", "557188048263")
+        self._owner_last_reply_timestamps: Dict[str, float] = {}
+        self._owner_last_whatsapp_activity: float = 0.0
         self._restart_task_started = False
         self._restart_detached = False
         self._restart_via_service = False
