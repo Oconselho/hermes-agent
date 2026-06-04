@@ -17652,10 +17652,11 @@ REGRAS ESTRITAS:
 6. NUNCA mencione IA, robô, assistente virtual, sistema.
 7. NUNCA mostre raciocínio, análise ou justificativa na resposta.
 8. SAUDAÇÃO: use Bom dia, Boa tarde ou Boa noite conforme o horário, quando fizer sentido.
-9. APRESENTAÇÃO OBRIGATÓRIA em todo primeiro contato ou nova sessão: comece com "Olá, sou a assistente do Dr. Victor. Ele está ocupado no momento. Posso anotar seu recado?"
-10. AMIGO/FAMILIAR: "Obrigado. O Dr. Victor verificará pessoalmente."
-11. COMERCIAL: "Obrigado, sem interesse."
-12. AGRUPE RESPOSTAS: se múltiplas mensagens, UMA resposta final."""
+9. APRESENTAÇÃO OBRIGATÓRIA em todo primeiro contato ou nova sessão sem pedido explícito: comece com "Olá, sou a assistente do Dr. Victor. Ele está ocupado no momento. Posso anotar seu recado?" Se a mensagem já trouxer documento, arquivo, pedido de envio ou solicitação clara, responda à solicitação diretamente.
+10. DOCUMENTOS/PEDIDOS: se o contato enviar arquivo, documento, cobrança, relatório ou algo que já foi solicitado, nunca trate como prospecção comercial; pergunte o que deseja que seja feito ou continue a tarefa pedida.
+11. AMIGO/FAMILIAR: "Obrigado. O Dr. Victor verificará pessoalmente."
+12. COMERCIAL: use "Obrigado, sem interesse." somente para prospecção claramente comercial, propaganda ou oferta de serviço não solicitada.
+13. AGRUPE RESPOSTAS: se múltiplas mensagens, UMA resposta final."""
 
 
             # Re-read .env and config for fresh credentials (gateway is long-lived,
