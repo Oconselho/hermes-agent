@@ -9433,7 +9433,9 @@ class GatewayRunner:
                 except Exception:
                     pass
                 # --- Check cooldown (owner replied in this chat < 30min ago) ---
-                _wa_is_owner = _wa_owner in _wa_check or _wa_check in _wa_owner
+                # Guard: empty string is a substring of any string in Python,
+                # so skip the check when _wa_check couldn't be resolved to digits.
+                _wa_is_owner = bool(_wa_check) and (_wa_owner in _wa_check or _wa_check in _wa_owner)
                 _wa_chat_raw = str(getattr(source, "chat_id", "") or "")
                 _wa_chat_digits = _wa_re.sub(r"[^0-9]", "", _wa_chat_raw)
                 if _wa_is_owner:
@@ -17638,7 +17640,10 @@ class GatewayRunner:
                     pass
                 _so_check = _so_phone if _so_phone else _so_sender_digits
                 _owner = self._whatsapp_owner_digits if hasattr(self, "_whatsapp_owner_digits") else "557188048263"
-                if _owner not in _so_check and _so_check not in _owner:
+                # Guard: empty string is a substring of any string in Python.
+                # Also guard _so_check emptiness so an unresolvable sender is
+                # never mistakenly identified as the owner.
+                if not _so_check or (_owner not in _so_check and _so_check not in _owner):
                     combined_ephemeral = """Você é assistente pessoal do Dr. Victor Almeida, endocrinologista (CRM-BA 22.586, RQE 13.396).
 Endereço: CEO Salvador Shopping, Torre Londres, Sala 1616. Horários: Ter-Sex 14h-18h, Sáb 9h-11h.
 Agendamento: WhatsApp 71996691002. Particular, sem convênios. Emite recibo.
@@ -17656,7 +17661,20 @@ REGRAS ESTRITAS:
 10. DOCUMENTOS/PEDIDOS: se o contato enviar arquivo, documento, cobrança, relatório ou algo que já foi solicitado, nunca trate como prospecção comercial; pergunte o que deseja que seja feito ou continue a tarefa pedida.
 11. AMIGO/FAMILIAR: "Obrigado. O Dr. Victor verificará pessoalmente."
 12. COMERCIAL: use "Obrigado, sem interesse." somente para prospecção claramente comercial, propaganda ou oferta de serviço não solicitada.
-13. AGRUPE RESPOSTAS: se múltiplas mensagens, UMA resposta final."""
+13. AGRUPE RESPOSTAS: se múltiplas mensagens, UMA resposta final.
+14. VOCÊ NÃO TEM FERRAMENTAS. Responda apenas com texto. NUNCA chame funções, busque informações externas, ou acesse dados do sistema."""
+                    # ── WhatsApp secretary: strip ALL tools so the model
+                    # ── cannot accidentally call session_search, terminal,
+                    # ── or any other tool that leaks AI behavior.
+                    disabled_toolsets = list(set(disabled_toolsets or []) | {
+                        "browser", "clarify", "code_execution", "cronjob",
+                        "delegation", "file", "image_gen", "memory",
+                        "search", "send_message", "session_search",
+                        "skills", "terminal", "todo", "tts", "vision",
+                        "web", "spotify", "homeassistant", "discord",
+                        "discord_admin", "feishu_doc", "feishu_drive",
+                        "yuanbao", "kanban",
+                    })
 
 
             # Re-read .env and config for fresh credentials (gateway is long-lived,
