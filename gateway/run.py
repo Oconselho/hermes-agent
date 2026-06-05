@@ -302,13 +302,26 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
         cleaned = re.sub(r"<parameter[^>]*>.*?</parameter>", "", cleaned, flags=re.S | re.I)
         if re.search(r"<\s*(function_calls|invoke|tool_calls|parameter)", cleaned, re.I):
             return "Recebi sua mensagem. O Dr. Victor verificará assim que possível."
-        # Block leaked internal reasoning
+        # Block leaked internal reasoning (Portuguese + English patterns)
         internal_reasoning_re = re.compile(
+            # ── Portuguese patterns ──
             r"(?is)(\b[oae] usu[aá]ri[oa]\b.{0,220}\b(indica|mensagens anteriores|tom|intera[cç][aã]o|pedido)\b)"
             r"|(\bcomo assistente\b.{0,220}\b(n[aã]o devo|devo|regra|responder|seguir)\b)"
             r"|(\b(n[aã]o h[aá] necessidade|preciso|devo)\b.{0,220}\b(coletar|recado|responder|decis[aã]o|regra)\b)"
             r"|(\b(o que eu responderia|o que responderia|o que devo responder|o que eu devo responder|resposta ideal|resposta que eu daria|como devo responder|como responder|vou responder|vou dizer|justificativa|an[aá]lise interna|racioc[ií]nio de)\b)"
-            r"|(\b(racioc[ií]nio|pensamento|l[oó]gica interna|decis[aã]o interna|mensagens anteriores|an[aá]lise)\b)",
+            r"|(\b(racioc[ií]nio|pensamento|l[oó]gica interna|decis[aã]o interna|mensagens anteriores|an[aá]lise)\b)"
+            # ── English patterns ──
+            r"|(\bthe user\b.{0,220}\b(sent|indicated|asked|said|is asking|wants|requested|provided)\b)"
+            r"|(\bthe patient\b.{0,220}\b(is asking|wants|needs|sent|said)\b)"
+            r"|(\bI (should|shouldn't|need to|must|will|can|am going to) (respond|reply|say|tell|answer|ask|handle|ignore|follow)\b)"
+            r"|(\b(as an? (assistant|AI|bot|agent)|my role is|I am an? assistant)\b.{0,220}\b(respond|reply|follow|rule|should)\b)"
+            r"|(\b(let me (think|analyze|check|consider|review|see|examine)|I think|I believe|in my (analysis|assessment))\b)"
+            r"|(\b(based on the (rules?|instructions?|context|conversation|history|previous messages?)|according to the (rules?|prompt|instructions?))\b)"
+            r"|(\b(my response|the response|I will respond|I'll respond|I would respond|should respond|appropriate response|best response)\b)"
+            r"|(\b(reasoning|internal (thoughts?|logic|reasoning|monologue|decision)|thinking process|thought process|meta[- ]cognition)\b)"
+            r"|(\b(previous messages?|message history|conversation (history|context|so far)|earlier in (this|the) (chat|conversation))\b)"
+            r"|(\b(I('ve| have) (decided|determined|concluded|figured)|my (decision|conclusion) is)\b)"
+            r"|(\b</?(think|thinking|reasoning|thought)>)"
         )
         if internal_reasoning_re.search(cleaned):
             return "Obrigado. O Dr. Victor verificará sua mensagem pessoalmente."
@@ -17596,7 +17609,7 @@ class GatewayRunner:
             # read *and* reassign the outer `_run_agent` parameter without
             # triggering an UnboundLocalError on the earlier read at
             # `_resolve_turn_agent_config(message, …)`.
-            nonlocal message
+            nonlocal message, disabled_toolsets, enabled_toolsets
 
             # session_key is now set via contextvars in _set_session_env()
             # (concurrency-safe). Keep os.environ as fallback for CLI/cron.
