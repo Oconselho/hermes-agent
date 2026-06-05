@@ -9462,6 +9462,66 @@ class GatewayRunner:
                     if _last_owner > 0 and (time.time() - _last_owner) < 1800:
                         return
 
+                # --- WhatsApp spam / anti-bot protection ---
+                try:
+                    _spam_now = time.time()
+                    _spam_file = os.path.expanduser("~/.hermes/whatsapp/chat-cooldowns.json")
+                    _spam_state = {}
+                    if os.path.exists(_spam_file):
+                        with open(_spam_file) as _sf:
+                            _spam_state = json.loads(_sf.read() or "{}")
+                    _spam_chat_id = str(source.chat_id or source.user_id or "")
+                    _spam_entry = _spam_state.get(_spam_chat_id, {})
+
+                    # Check if chat is currently in enforced cooldown (silenced 1h)
+                    _spam_until = _spam_entry.get("cooldown_until", 0)
+                    if _spam_until and _spam_now < _spam_until:
+                        return  # still silenced — drop silently
+
+                    # Rate limit: 20+ messages in 5 minutes
+                    _spam_msgs = _spam_entry.get("msg_timestamps", [])
+                    _spam_msgs = [t for t in _spam_msgs if _spam_now - t < 300]  # 5-min window
+                    _spam_msgs.append(_spam_now)
+                    _spam_entry["msg_timestamps"] = _spam_msgs
+                    if len(_spam_msgs) >= 20:
+                        _spam_entry["cooldown_until"] = _spam_now + 3600  # silence 1h
+                        _spam_state[_spam_chat_id] = _spam_entry
+                        with open(_spam_file, "w") as _sf:
+                            json.dump(_spam_state, _sf)
+                        return
+
+                    # Bot detection: 10+ messages with chatbot patterns
+                    _msg_lower = message_text.lower() if message_text else ""
+                    _bot_patterns = [
+                        "não entendi", "digite uma das opções", "por favor, digite",
+                        "opção inválida", "menu principal", "digite o número",
+                        "não entendi", "opcao invalida", "digite uma opcao",
+                    ]
+                    _is_bot_msg = any(p in _msg_lower for p in _bot_patterns)
+                    if _is_bot_msg:
+                        _spam_entry["bot_msg_count"] = _spam_entry.get("bot_msg_count", 0) + 1
+                        if _spam_entry["bot_msg_count"] >= 10:
+                            _spam_entry["cooldown_until"] = _spam_now + 3600
+                            _spam_state[_spam_chat_id] = _spam_entry
+                            with open(_spam_file, "w") as _sf:
+                                json.dump(_spam_state, _sf)
+                            return
+
+                    # Check reject loop (≥5 "sem interesse" responses)
+                    if _spam_entry.get("reject_count", 0) >= 5:
+                        _spam_entry["cooldown_until"] = _spam_now + 3600
+                        _spam_state[_spam_chat_id] = _spam_entry
+                        with open(_spam_file, "w") as _sf:
+                            json.dump(_spam_state, _sf)
+                        return
+
+                    # Persist updated state (without cooldown)
+                    _spam_state[_spam_chat_id] = _spam_entry
+                    with open(_spam_file, "w") as _sf:
+                        json.dump(_spam_state, _sf)
+                except Exception:
+                    pass
+
             # Run the agent
             agent_result = await self._run_agent(
                 message=message_text,
