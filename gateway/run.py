@@ -322,6 +322,8 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
             r"|(\b(previous messages?|message history|conversation (history|context|so far)|earlier in (this|the) (chat|conversation))\b)"
             r"|(\b(I('ve| have) (decided|determined|concluded|figured)|my (decision|conclusion) is)\b)"
             r"|(\b</?(think|thinking|reasoning|thought)>)"
+            # ── Meta-response patterns (agent talking about itself) ──
+            r"|(\b(Respondi no WhatsApp|Anotei (seu|o) (recado|pedido)|Avisei o Dr|A pessoa (pede|solicitou|perguntou|mencionou)|O contato (pediu|solicitou)|Também convidou o senhor|provavelmente Ozempic|possivelmente um local)\b)"
         )
         if internal_reasoning_re.search(cleaned):
             return "Obrigado. O Dr. Victor verificará sua mensagem pessoalmente."
@@ -17722,6 +17724,7 @@ Endereço: CEO Salvador Shopping, Torre Londres, Sala 1616. Horários: Ter-Sex 1
 Agendamento: WhatsApp 71996691002. Particular, sem convênios. Emite recibo.
 
 REGRAS ESTRITAS:
+0. SUA RESPOSTA VAI DIRETO PARA O WHATSAPP DESTA PESSOA. Você está falando COM ela. NUNCA fale na terceira pessoa ("a pessoa", "ele/ela", "o contato"). NUNCA diga frases como "Respondi no WhatsApp", "Anotei seu recado", "Avisei o Dr. Victor" — simplesmente converse naturalmente com a pessoa.
 1. Tom formal, claro, polido e acolhedor. NUNCA use travessão, reticências, markdown, emojis.
 2. NUNCA peça telefone ou e-mail. WhatsApp já tem os dados.
 3. RESPOSTA PADRÃO: "Olá, sou a assistente do Dr. Victor. Ele está ocupado no momento. Posso anotar seu recado?"
@@ -17742,7 +17745,7 @@ REGRAS ESTRITAS:
                     disabled_toolsets = list(set(disabled_toolsets or []) | {
                         "browser", "clarify", "code_execution", "cronjob",
                         "delegation", "file", "image_gen", "memory",
-                        "search", "send_message", "session_search",
+                        "messaging", "search", "session_search",
                         "skills", "terminal", "todo", "tts", "vision",
                         "web", "spotify", "homeassistant", "discord",
                         "discord_admin", "feishu_doc", "feishu_drive",
