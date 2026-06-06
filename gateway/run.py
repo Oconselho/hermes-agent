@@ -3396,30 +3396,12 @@ class GatewayRunner:
             )
             return True  # handled (silently dropped); do not fall through
 
-        # --- WhatsApp non-owner guard: suppress system messages to patients ---
-        # Busy-acks ("⚡ Interrupting current task..."), draining messages,
-        # and other internal gateway chatter must NEVER reach WhatsApp patients.
+        # --- WhatsApp guard: suppress ALL system messages to patients ---
+        # Dr. Victor interacts exclusively via Telegram. Every WhatsApp
+        # contact is a patient/third-party. Busy-acks, draining messages,
+        # and internal gateway chatter must NEVER reach them.
         if event.source.platform and event.source.platform.value == "whatsapp":
-            import re as _bsy_re
-            import glob as _bsy_glob
-            _bsy_sender = str(getattr(event.source, "user_id", "") or "")
-            _bsy_sender_digits = _bsy_re.sub(r"[^0-9]", "", _bsy_sender)
-            _bsy_phone = ""
-            try:
-                for _mf in _bsy_glob.glob(os.path.join(os.path.expanduser("~/.hermes/whatsapp/session"), "lid-mapping-[0-9]*.json")):
-                    if "_reverse" not in _mf:
-                        with open(_mf) as _mfh:
-                            _mapped_lid = _mfh.read().strip().strip('"')
-                        if _mapped_lid and _mapped_lid in _bsy_sender_digits:
-                            _bsy_phone = os.path.basename(_mf).replace("lid-mapping-", "").replace(".json", "")
-                            break
-            except Exception:
-                pass
-            _bsy_check = _bsy_phone if _bsy_phone else _bsy_sender_digits
-            _bsy_owner = self._whatsapp_owner_digits if hasattr(self, "_whatsapp_owner_digits") else "557188048263"
-            # If sender is NOT the owner, silently suppress — no system messages to patients
-            if not _bsy_check or (_bsy_owner not in _bsy_check and _bsy_check not in _bsy_owner):
-                return True  # silently drop — patient never sees busy-ack or draining msg
+            return True  # silently drop — patient never sees system messages
 
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
@@ -9436,13 +9418,16 @@ class GatewayRunner:
             }
             await self.hooks.emit("agent:start", hook_ctx)
 
-            # ── WhatsApp: ignored numbers & owner cooldown ──
+            # ── WhatsApp: ignored numbers & spam protection ──
+            # Dr. Victor interacts exclusively via Telegram — all
+            # WhatsApp contacts are patients/third-parties. No owner
+            # detection needed (bridge handles fromMe cooldown).
             if source.platform and source.platform.value == "whatsapp":
                 import re as _wa_re
                 import glob as _wa_glob
                 _wa_sender = str(getattr(source, "user_id", "") or "")
                 _wa_sender_digits = _wa_re.sub(r"[^0-9]", "", _wa_sender)
-                # Resolve LID to phone
+                # Resolve LID to phone (needed for ignored numbers matching)
                 _wa_phone = ""
                 try:
                     for _mf in _wa_glob.glob(os.path.join(os.path.expanduser("~/.hermes/whatsapp/session"), "lid-mapping-[0-9]*.json")):
@@ -9455,7 +9440,6 @@ class GatewayRunner:
                 except Exception:
                     pass
                 _wa_check = _wa_phone if _wa_phone else _wa_sender_digits
-                _wa_owner = self._whatsapp_owner_digits if hasattr(self, "_whatsapp_owner_digits") else "557188048263"
                 # --- Check ignored numbers ---
                 try:
                     _ignored_path = os.path.expanduser("~/.hermes/whatsapp/ignored_numbers.txt")
@@ -9472,22 +9456,6 @@ class GatewayRunner:
                             return
                 except Exception:
                     pass
-                # --- Check cooldown (owner replied in this chat < 30min ago) ---
-                # Guard: empty string is a substring of any string in Python,
-                # so skip the check when _wa_check couldn't be resolved to digits.
-                _wa_is_owner = bool(_wa_check) and (_wa_owner in _wa_check or _wa_check in _wa_owner)
-                _wa_chat_raw = str(getattr(source, "chat_id", "") or "")
-                _wa_chat_digits = _wa_re.sub(r"[^0-9]", "", _wa_chat_raw)
-                if _wa_is_owner:
-                    _wa_is_self_chat = _wa_owner in _wa_chat_digits or _wa_chat_digits in _wa_owner
-                    if not _wa_is_self_chat:
-                        # Owner messaging a third-party chat — record handoff
-                        self._owner_last_reply_timestamps[str(source.chat_id or "")] = time.time()
-                        return
-                else:
-                    _last_owner = self._owner_last_reply_timestamps.get(str(source.chat_id or ""), 0.0)
-                    if _last_owner > 0 and (time.time() - _last_owner) < 1800:
-                        return
 
                 # --- WhatsApp spam / anti-bot protection ---
                 try:
@@ -17719,32 +17687,13 @@ class GatewayRunner:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + self._ephemeral_system_prompt).strip()
 
             # --------------------------------------------------------
-            # WhatsApp secretary: override system prompt for non-owner
-            # contacts. Model acts as professional assistant, not Hermes.
+            # --------------------------------------------------------
+            # WhatsApp: ALWAYS secretary mode — Dr. Victor interacts
+            # exclusively via Telegram. Every WhatsApp contact is a
+            # patient/third-party. No owner detection needed.
             # --------------------------------------------------------
             if source.platform and source.platform.value == "whatsapp":
-                import re as _so_re
-                import glob as _so_glob
-                _so_sender = str(getattr(source, "user_id", "") or "")
-                _so_sender_digits = _so_re.sub(r"[^0-9]", "", _so_sender)
-                _so_phone = ""
-                try:
-                    for _mf in _so_glob.glob(os.path.join(os.path.expanduser("~/.hermes/whatsapp/session"), "lid-mapping-[0-9]*.json")):
-                        if "_reverse" not in _mf:
-                            with open(_mf) as _mfh:
-                                _mapped_lid = _mfh.read().strip().strip('"')
-                            if _mapped_lid and _mapped_lid in _so_sender_digits:
-                                _so_phone = os.path.basename(_mf).replace("lid-mapping-", "").replace(".json", "")
-                                break
-                except Exception:
-                    pass
-                _so_check = _so_phone if _so_phone else _so_sender_digits
-                _owner = self._whatsapp_owner_digits if hasattr(self, "_whatsapp_owner_digits") else "557188048263"
-                # Guard: empty string is a substring of any string in Python.
-                # Also guard _so_check emptiness so an unresolvable sender is
-                # never mistakenly identified as the owner.
-                if not _so_check or (_owner not in _so_check and _so_check not in _owner):
-                    combined_ephemeral = """Você é assistente pessoal do Dr. Victor Almeida, endocrinologista (CRM-BA 22.586, RQE 13.396).
+                combined_ephemeral = """Você é assistente pessoal do Dr. Victor Almeida, endocrinologista (CRM-BA 22.586, RQE 13.396).
 Endereço: CEO Salvador Shopping, Torre Londres, Sala 1616. Horários: Ter-Sex 14h-18h, Sáb 9h-11h.
 Agendamento: WhatsApp 71996691002. Particular, sem convênios. Emite recibo.
 
@@ -17764,18 +17713,18 @@ REGRAS ESTRITAS:
 12. COMERCIAL: use "Obrigado, sem interesse." somente para prospecção claramente comercial, propaganda ou oferta de serviço não solicitada.
 13. AGRUPE RESPOSTAS: se múltiplas mensagens, UMA resposta final.
 14. VOCÊ NÃO TEM FERRAMENTAS. Responda apenas com texto. NUNCA chame funções, busque informações externas, ou acesse dados do sistema."""
-                    # ── WhatsApp secretary: strip ALL tools so the model
-                    # ── cannot accidentally call session_search, terminal,
-                    # ── or any other tool that leaks AI behavior.
-                    disabled_toolsets = list(set(disabled_toolsets or []) | {
-                        "browser", "clarify", "code_execution", "cronjob",
-                        "delegation", "file", "image_gen", "memory",
-                        "messaging", "search", "session_search",
-                        "skills", "terminal", "todo", "tts", "vision",
-                        "web", "spotify", "homeassistant", "discord",
-                        "discord_admin", "feishu_doc", "feishu_drive",
-                        "yuanbao", "kanban",
-                    })
+                # ── WhatsApp secretary: strip ALL tools so the model
+                # ── cannot accidentally call session_search, terminal,
+                # ── or any other tool that leaks AI behavior.
+                disabled_toolsets = list(set(disabled_toolsets or []) | {
+                    "browser", "clarify", "code_execution", "cronjob",
+                    "delegation", "file", "image_gen", "memory",
+                    "messaging", "search", "session_search",
+                    "skills", "terminal", "todo", "tts", "vision",
+                    "web", "spotify", "homeassistant", "discord",
+                    "discord_admin", "feishu_doc", "feishu_drive",
+                    "yuanbao", "kanban",
+                })
 
 
             # Re-read .env and config for fresh credentials (gateway is long-lived,
