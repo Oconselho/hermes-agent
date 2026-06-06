@@ -3396,6 +3396,31 @@ class GatewayRunner:
             )
             return True  # handled (silently dropped); do not fall through
 
+        # --- WhatsApp non-owner guard: suppress system messages to patients ---
+        # Busy-acks ("⚡ Interrupting current task..."), draining messages,
+        # and other internal gateway chatter must NEVER reach WhatsApp patients.
+        if event.source.platform and event.source.platform.value == "whatsapp":
+            import re as _bsy_re
+            import glob as _bsy_glob
+            _bsy_sender = str(getattr(event.source, "user_id", "") or "")
+            _bsy_sender_digits = _bsy_re.sub(r"[^0-9]", "", _bsy_sender)
+            _bsy_phone = ""
+            try:
+                for _mf in _bsy_glob.glob(os.path.join(os.path.expanduser("~/.hermes/whatsapp/session"), "lid-mapping-[0-9]*.json")):
+                    if "_reverse" not in _mf:
+                        with open(_mf) as _mfh:
+                            _mapped_lid = _mfh.read().strip().strip('"')
+                        if _mapped_lid and _mapped_lid in _bsy_sender_digits:
+                            _bsy_phone = os.path.basename(_mf).replace("lid-mapping-", "").replace(".json", "")
+                            break
+            except Exception:
+                pass
+            _bsy_check = _bsy_phone if _bsy_phone else _bsy_sender_digits
+            _bsy_owner = self._whatsapp_owner_digits if hasattr(self, "_whatsapp_owner_digits") else "557188048263"
+            # If sender is NOT the owner, silently suppress — no system messages to patients
+            if not _bsy_check or (_bsy_owner not in _bsy_check and _bsy_check not in _bsy_owner):
+                return True  # silently drop — patient never sees busy-ack or draining msg
+
         # --- Draining case (gateway restarting/stopping) ---
         if self._draining:
             adapter = self.adapters.get(event.source.platform)
