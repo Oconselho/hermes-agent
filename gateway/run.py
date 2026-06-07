@@ -15733,18 +15733,32 @@ class GatewayRunner:
                         f"image_url: {path} ~]"
                     )
                 else:
-                    enriched_parts.append(
-                        "[The user sent an image but I couldn't quite see it "
-                        "this time (>_<) You can try looking at it yourself "
-                        f"with vision_analyze using image_url: {path}]"
-                    )
+                    ocr_fallback = await self._ocr_image_fallback(path)
+                    if ocr_fallback:
+                        enriched_parts.append(
+                            f"[The user sent an image. OCR extracted this text from it:\n{ocr_fallback}]\n"
+                            f"[Image path: {path}]"
+                        )
+                    else:
+                        enriched_parts.append(
+                            f"[The user sent an image but automatic analysis and OCR both failed. "
+                            f"The image is saved at: {path}. "
+                            f"Let the user know you received their image and ask them to describe what it shows.]"
+                        )
             except Exception as e:
-                logger.error("Vision auto-analysis error: %s", e)
-                enriched_parts.append(
-                    f"[The user sent an image but something went wrong when I "
-                    f"tried to look at it~ You can try examining it yourself "
-                    f"with vision_analyze using image_url: {path}]"
-                )
+                logger.error("Vision auto-analysis error for %s: %s", path, e)
+                ocr_fallback = await self._ocr_image_fallback(path)
+                if ocr_fallback:
+                    enriched_parts.append(
+                        f"[The user sent an image. OCR extracted this text from it:\n{ocr_fallback}]\n"
+                        f"[Image path: {path}]"
+                    )
+                else:
+                    enriched_parts.append(
+                        f"[The user sent an image but automatic analysis and OCR both failed. "
+                        f"The image is saved at: {path}. "
+                        f"Let the user know you received their image and ask them to describe what it shows.]"
+                    )
 
         # Combine: vision descriptions first, then the user's original text
         if enriched_parts:
@@ -15753,6 +15767,64 @@ class GatewayRunner:
                 return f"{prefix}\n\n{user_text}"
             return prefix
         return user_text
+
+    async def _ocr_image_fallback(self, image_path: str) -> str:
+        """Run OCR (easyocr + tesseract) on an image when vision analysis fails.
+
+        Returns the extracted text, or empty string if OCR also fails.
+        The easyocr Reader is cached on the instance for reuse across calls.
+        """
+        import asyncio
+
+        def _run_ocr(path: str) -> str:
+            texts = []
+
+            # ── EasyOCR (better for scene text, mixed languages, complex layouts) ──
+            try:
+                import easyocr
+                reader = getattr(self, "_easyocr_reader", None)
+                if reader is None:
+                    reader = easyocr.Reader(['pt', 'en'], gpu=False)
+                    self._easyocr_reader = reader
+                results = reader.readtext(path)
+                if results:
+                    text = ' '.join(item[1] for item in results)
+                    if text.strip():
+                        texts.append(text.strip())
+            except Exception as _eocr:
+                logger.debug("EasyOCR fallback failed for %s: %s", path, _eocr)
+
+            # ── Tesseract (better for clean documents, printed text) ──
+            try:
+                import pytesseract
+                from PIL import Image
+                img = Image.open(path)
+                # Try Portuguese first, then English
+                for lang in ('por', 'eng'):
+                    try:
+                        ttext = pytesseract.image_to_string(img, lang=lang)
+                        if ttext and ttext.strip():
+                            texts.append(ttext.strip())
+                            break
+                    except Exception:
+                        continue
+            except Exception as _tess:
+                logger.debug("Tesseract fallback failed for %s: %s", path, _tess)
+
+            # Deduplicate: if tesseract and easyocr produced similar results,
+            # prefer the longer one
+            if len(texts) >= 2:
+                # Use the longer text (more detail)
+                texts.sort(key=len, reverse=True)
+                return texts[0]
+            return texts[0] if texts else ""
+
+        try:
+            result = await asyncio.to_thread(_run_ocr, image_path)
+            return result
+        except Exception as e:
+            logger.warning("OCR fallback failed for %s: %s", image_path, e)
+            return ""
 
     async def _enrich_message_with_transcription(
         self,
