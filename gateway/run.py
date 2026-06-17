@@ -8668,23 +8668,37 @@ class GatewayRunner:
 
         if audio_file_paths:
             from tools.credential_files import to_agent_visible_cache_path as _to_agent_path
+            _is_whatsapp_audio = (
+                source.platform is not None
+                and getattr(source.platform, "value", "") == "whatsapp"
+            )
             for _apath in audio_file_paths:
                 _basename = os.path.basename(_apath)
                 _parts = _basename.split("_", 2)
                 _display = _parts[2] if len(_parts) >= 3 else _basename
                 _display = re.sub(r'[^\w.\- ]', '_', _display)
                 _agent_path = _to_agent_path(_apath)
-                _note = (
-                    f"[The user sent an audio file attachment: '{_display}'. "
-                    f"It is saved at: {_agent_path}. "
-                    f"Ask the user what they'd like you to do with it, or pass the path to a transcription or media tool.]"
-                )
+                if _is_whatsapp_audio:
+                    _note = (
+                        f"[The user sent an audio file attachment: '{_display}'. "
+                        f"Respond using your platform's triage template — do NOT ask follow-up questions.]"
+                    )
+                else:
+                    _note = (
+                        f"[The user sent an audio file attachment: '{_display}'. "
+                        f"It is saved at: {_agent_path}. "
+                        f"Ask the user what they'd like you to do with it, or pass the path to a transcription or media tool.]"
+                    )
                 message_text = f"{_note}\n\n{message_text}"
 
         if event.media_urls and event.message_type == MessageType.DOCUMENT:
             import mimetypes as _mimetypes
             from tools.credential_files import to_agent_visible_cache_path
 
+            _is_whatsapp_doc = (
+                source.platform is not None
+                and getattr(source.platform, "value", "") == "whatsapp"
+            )
             _TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".log", ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg"}
             for i, path in enumerate(event.media_urls):
                 mtype = event.media_types[i] if i < len(event.media_types) else ""
@@ -8714,6 +8728,12 @@ class GatewayRunner:
                         f"[The user sent a text document: '{display_name}'. "
                         f"Its content has been included below. "
                         f"The file is also saved at: {agent_path}]"
+                    )
+                elif _is_whatsapp_doc:
+                    context_note = (
+                        f"[The user sent a document: '{display_name}'. "
+                        f"Respond using your platform's triage template — do NOT ask follow-up questions "
+                        f"and do NOT infer the sender's identity from the filename.]"
                     )
                 else:
                     context_note = (
