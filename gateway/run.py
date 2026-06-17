@@ -344,9 +344,21 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
         if _fake_appt_re.search(cleaned):
             return "Obrigado. O Dr. Victor verificará sua mensagem pessoalmente."
 
-        # ── Block any currency amounts ──
-        # The WhatsApp secretary must NEVER quote prices — any R$ figure is a hallucination.
-        if re.search(r"R\$\s*\d[\d.,]*", cleaned):
+        # ── Block any currency/price disclosure ──
+        # The WhatsApp secretary must NEVER quote prices. Patterns cover:
+        # formal (R$ 400), informal (400 reais, custa 600), and decimals (400,00).
+        _price_disclosure_re = re.compile(
+            r"(?is)"
+            # Pattern 1: cifrão + digits (R$ 400, R$600.00)
+            r"\bR\$\s*\d[\d.,]*"
+            # Pattern 2: digits before "reais"/"real"
+            r"|\d[\d.,]*\s*r(eais|eal)\b"
+            # Pattern 3: currency-like decimals: "400,00" or "600.00" (not dates/hours)
+            r"|\b\d{1,6}[.,]\d{2}\b"
+            # Pattern 4: price-related word within 40 chars of a number
+            r"|(?:\b(custa|pre[cç]o|valor|pagamento|parcela)\b.{0,40}?\b(\d[\d.,]*)\b)"
+        )
+        if _price_disclosure_re.search(cleaned):
             return "Obrigado. O Dr. Victor verificará sua mensagem pessoalmente."
 
         if internal_reasoning_re.search(cleaned):
