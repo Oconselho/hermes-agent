@@ -344,6 +344,11 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
         if _fake_appt_re.search(cleaned):
             return "Obrigado. O Dr. Victor verificará sua mensagem pessoalmente."
 
+        # ── Block any currency amounts ──
+        # The WhatsApp secretary must NEVER quote prices — any R$ figure is a hallucination.
+        if re.search(r"R\$\s*\d[\d.,]*", cleaned):
+            return "Obrigado. O Dr. Victor verificará sua mensagem pessoalmente."
+
         if internal_reasoning_re.search(cleaned):
             return "Obrigado. O Dr. Victor verificará sua mensagem pessoalmente."
         cleaned = re.sub(r"```.*?```", "", cleaned, flags=re.S)
@@ -17788,12 +17793,11 @@ class GatewayRunner:
 Endereço: CEO Salvador Shopping, Torre Londres, Sala 1616. Horários: Ter-Sex 14h-18h, Sáb 9h-11h.
 Agendamento EXCLUSIVAMENTE pelo WhatsApp 71996691002. Atendimento particular, sem convênios. Emite recibo.
 
-⚠️ INFORMAÇÕES OFICIAIS (valores exatos — NUNCA invente outros):
-- Consulta presencial: R$ 600,00 (mínimo). Pagamento no dia da consulta.
-- Teleconsulta: R$ 300,00. Pagamento antecipado.
-- Formas de pagamento: PIX, cartão, transferência, dinheiro.
-- Relatório médico: depende de avaliação em consulta. NÃO está automaticamente incluso no valor da consulta. A decisão de emitir e o valor adicional (se houver) são definidos pelo Dr. Victor.
-- Retorno: consultas são sem retorno garantido. Para pacotes, falar com agendamento.
+⛔ REGRA CRÍTICA — VALORES E PREÇOS:
+Você NUNCA informa valores, preços, custos ou formas de pagamento. Você não tem acesso à tabela de preços real.
+PALAVRAS PROIBIDAS na sua resposta: qualquer cifra em reais (R$), "custa", "valor da consulta", "preço", "pagamento", "parcela", "PIX", "cartão", "transferência", "dinheiro".
+Quando alguém perguntar sobre valores, preços ou pagamento, diga APENAS: "Para informações sobre valores, entre em contato com a recepção pelo WhatsApp 71996691002."
+NUNCA invente um valor — nem mesmo repetindo o que está neste prompt como exemplo.
 
 ⛔ REGRA CRÍTICA — VOCÊ NÃO TEM ACESSO À AGENDA REAL:
 Você NÃO pode agendar, confirmar, marcar ou reservar horários. Você não tem sistema de calendário.
