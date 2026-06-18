@@ -423,6 +423,79 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     """
     if not text:
         return text
+    platform_value = _gateway_platform_value(platform)
+    if platform_value == "whatsapp":
+        cleaned = _redact_gateway_user_facing_secrets(str(text))
+        # ── [SILENCIOSO]: model chose to stay silent (conversation already resolved)
+        if cleaned.strip().startswith("[SILENCIOSO]"):
+            return None
+        # Block leaked tool names
+        if re.search(r"(?im)^\s*(terminal|execute_code|search_files|read_file|browser_[a-z_]+|skill_view|session_search)\s*:", cleaned):
+            return "Recebi sua mensagem. O Dr. Victor verificará assim que possível."
+        # Block leaked XML tool call blocks (DeepSeek hallucination)
+        cleaned = re.sub(r"<function_calls>.*?</function_calls>", "", cleaned, flags=re.S | re.I)
+        cleaned = re.sub(r"<invoke[^>]*>.*?</invoke>", "", cleaned, flags=re.S | re.I)
+        cleaned = re.sub(r"<tool_calls>.*?</tool_calls>", "", cleaned, flags=re.S | re.I)
+        cleaned = re.sub(r"<parameter[^>]*>.*?</parameter>", "", cleaned, flags=re.S | re.I)
+        if re.search(r"<\s*(function_calls|invoke|tool_calls|parameter)", cleaned, re.I):
+            return "Recebi sua mensagem. O Dr. Victor verificará assim que possível."
+        # Block leaked internal reasoning (Portuguese + English patterns)
+        internal_reasoning_re = re.compile(
+            # ── Portuguese patterns ──
+            r"(?is)(\b[oae] usu[aá]ri[oa]\b.{0,220}\b(indica|mensagens anteriores|tom|intera[cç][aã]o|pedido)\b)"
+            r"|(\bcomo assistente\b.{0,220}\b(n[aã]o devo|devo|regra|responder|seguir)\b)"
+            r"|(\b(n[aã]o h[aá] necessidade|preciso|devo)\b.{0,220}\b(coletar|recado|responder|decis[aã]o|regra)\b)"
+            r"|(\b(o que eu responderia|o que responderia|o que devo responder|o que eu devo responder|resposta ideal|resposta que eu daria|como devo responder|como responder|vou responder|vou dizer|justificativa|an[aá]lise interna|racioc[ií]nio de)\b)"
+            r"|(\b(racioc[ií]nio|pensamento|l[oó]gica interna|decis[aã]o interna|mensagens anteriores|an[aá]lise)\b)"
+            # ── English patterns ──
+            r"|(\bthe user\b.{0,220}\b(sent|indicated|asked|said|is asking|wants|requested|provided)\b)"
+            r"|(\bthe patient\b.{0,220}\b(is asking|wants|needs|sent|said)\b)"
+            r"|(\bI (should|shouldn't|need to|must|will|can|am going to) (respond|reply|say|tell|answer|ask|handle|ignore|follow)\b)"
+            r"|(\b(as an? (assistant|AI|bot|agent)|my role is|I am an? assistant)\b.{0,220}\b(respond|reply|follow|rule|should)\b)"
+            r"|(\b(let me (think|analyze|check|consider|review|see|examine)|I think|I believe|in my (analysis|assessment))\b)"
+            r"|(\b(based on the (rules?|instructions?|context|conversation|history|previous messages?)|according to the (rules?|prompt|instructions?))\b)"
+            r"|(\b(my response|the response|I will respond|I'll respond|I would respond|should respond|appropriate response|best response)\b)"
+            r"|(\b(reasoning|internal (thoughts?|logic|reasoning|monologue|decision)|thinking process|thought process|meta[- ]cognition)\b)"
+            r"|(\b(previous messages?|message history|conversation (history|context|so far)|earlier in (this|the) (chat|conversation))\b)"
+            r"|(\b(I('ve| have) (decided|determined|concluded|figured)|my (decision|conclusion) is)\b)"
+            r"|(\b</?(think|thinking|reasoning|thought)>)"
+            # ── Meta-response patterns (agent talking about itself) ──
+            r"|(\b(Respondi no WhatsApp|Anotei (seu|o) (recado|pedido)|Avisei o Dr|A pessoa (pede|solicitou|perguntou|mencionou)|O contato (pediu|solicitou)|Também convidou o senhor|provavelmente Ozempic|possivelmente um local)\b)"
+        )
+        # ── Block fake appointment/scheduling claims ──
+        _fake_appt_re = re.compile(
+            r"(?is)"
+            r"\b(agendad[oa]|confirmad[oa]|marcad[oa]|reservad[oa]|agendamento\s+confirmado|est[aá]\s+marcad[oa]|est[aá]\s+agendad[oa]|consulta\s+(confirmada|marcada|agendada))\b"
+            r"(?=.{0,80}("
+            r"\d{1,2}\s*(h|horas|hrs)\b"
+            r"|\b\d{1,2}:\d{2}\b"
+            r"|\b(segunda|ter[cç]a|quarta|quinta|sexta|s[aá]bado|domingo)\b"
+            r"|\b\d{1,2}\s+de\s+(janeiro|fevereiro|mar[cç]o|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)\b"
+            r"|\b(amanh[aã]|hoje)\b"
+            r"))"
+        )
+        if _fake_appt_re.search(cleaned):
+            return "Obrigado. O Dr. Victor verificará sua mensagem pessoalmente."
+
+        # ── Block any currency/price disclosure ──
+        _price_disclosure_re = re.compile(
+            r"(?is)"
+            r"\bR\$\s*\d[\d.,]*"
+            r"|\d[\d.,]*\s*r(eais|eal)\b"
+            r"|\b\d{1,6}[.,]\d{2}\b"
+            r"|(?:\b(custa|pre[cç]o|valor|pagamento|parcela)\b.{0,40}?\b(\d[\d.,]*)\b)"
+        )
+        if _price_disclosure_re.search(cleaned):
+            return "Obrigado. O Dr. Victor verificará sua mensagem pessoalmente."
+
+        if internal_reasoning_re.search(cleaned):
+            return "Obrigado. O Dr. Victor verificará sua mensagem pessoalmente."
+        cleaned = re.sub(r"```.*?```", "", cleaned, flags=re.S)
+        cleaned = cleaned.replace("`", "").replace("*", "").replace("!", ".")
+        cleaned = re.sub(r"[\U0001F300-\U0001FAFF\u2600-\u27BF]", "", cleaned)
+        cleaned = re.sub(r"[ \t]+", " ", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+        return cleaned or "Recebi sua mensagem. O Dr. Victor verificará assim que possível."
     if _gateway_surface_passes_raw_text(platform):
         return text
 
@@ -445,6 +518,8 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     """
     text = str(message or "").strip()
     if not text:
+        return None
+    if _gateway_platform_value(platform) == "whatsapp":
         return None
     if _gateway_surface_passes_raw_text(platform):
         return text
@@ -2932,6 +3007,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._pending_native_image_paths_by_session: Dict[str, List[str]] = {}
         self._busy_ack_ts: Dict[str, float] = {}  # last busy-ack timestamp per session (debounce)
         self._session_run_generation: Dict[str, int] = {}
+        # WhatsApp secretary: owner identity and cooldown tracking
+        self._whatsapp_owner_digits = os.getenv("WHATSAPP_OWNER_DIGITS", "557188048263")
+        self._owner_last_reply_timestamps: Dict[str, float] = {}
+        self._owner_last_whatsapp_activity: float = 0.0
         # Startup restore gate: while restart-interrupted sessions are being
         # auto-resumed, real inbound messages are queued instead of competing
         # with the synthetic resume turns for the same session.  The queued
@@ -11326,6 +11405,107 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # below; a /new or another lifecycle transition may move
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
+
+            # ── WhatsApp: ignored numbers & spam protection ──
+            # Dr. Victor interacts exclusively via Telegram — all
+            # WhatsApp contacts are patients/third-parties. No owner
+            # detection needed (bridge handles fromMe cooldown).
+            if source.platform and source.platform.value == "whatsapp":
+                import re as _wa_re
+                import glob as _wa_glob
+                _wa_sender = str(getattr(source, "user_id", "") or "")
+                _wa_sender_digits = _wa_re.sub(r"[^0-9]", "", _wa_sender)
+                # Resolve LID to phone (needed for ignored numbers matching)
+                _wa_phone = ""
+                try:
+                    for _mf in _wa_glob.glob(os.path.join(os.path.expanduser("~/.hermes/whatsapp/session"), "lid-mapping-[0-9]*.json")):
+                        if "_reverse" not in _mf:
+                            with open(_mf) as _mfh:
+                                _mapped_lid = _mfh.read().strip().strip('"')
+                            if _mapped_lid and _mapped_lid in _wa_sender_digits:
+                                _wa_phone = os.path.basename(_mf).replace("lid-mapping-", "").replace(".json", "")
+                                break
+                except Exception:
+                    pass
+                _wa_check = _wa_phone if _wa_phone else _wa_sender_digits
+                # --- Check ignored numbers ---
+                try:
+                    _ignored_path = os.path.expanduser("~/.hermes/whatsapp/ignored_numbers.txt")
+                    if os.path.exists(_ignored_path):
+                        _ignored = set()
+                        with open(_ignored_path) as _f:
+                            for _line in _f:
+                                _line = _line.strip()
+                                if _line and not _line.startswith("#"):
+                                    _ignored.add(_line)
+                        _is_ignored = any(_n in _wa_check or _wa_check in _n for _n in _ignored)
+                        _is_ignored = _is_ignored or any(_n in _wa_sender_digits or _wa_sender_digits in _n for _n in _ignored)
+                        if _is_ignored:
+                            return
+                except Exception:
+                    pass
+
+                # --- WhatsApp spam / anti-bot protection ---
+                try:
+                    _spam_now = time.time()
+                    _spam_file = os.path.expanduser("~/.hermes/whatsapp/chat-cooldowns.json")
+                    _spam_state = {}
+                    if os.path.exists(_spam_file):
+                        with open(_spam_file) as _sf:
+                            _spam_state = json.loads(_sf.read() or "{}")
+                    _spam_chat_id = str(source.chat_id or source.user_id or "")
+                    _spam_entry = _spam_state.get(_spam_chat_id, {})
+
+                    # Check if chat is currently in enforced cooldown (silenced 1h)
+                    _spam_until = _spam_entry.get("cooldown_until", 0)
+                    if _spam_until and _spam_now < _spam_until:
+                        return  # still silenced — drop silently
+
+                    # Rate limit: 20+ messages in 5 minutes
+                    _spam_msgs = _spam_entry.get("msg_timestamps", [])
+                    _spam_msgs = [t for t in _spam_msgs if _spam_now - t < 300]  # 5-min window
+                    _spam_msgs.append(_spam_now)
+                    _spam_entry["msg_timestamps"] = _spam_msgs
+                    if len(_spam_msgs) >= 20:
+                        _spam_entry["cooldown_until"] = _spam_now + 3600  # silence 1h
+                        _spam_state[_spam_chat_id] = _spam_entry
+                        with open(_spam_file, "w") as _sf:
+                            json.dump(_spam_state, _sf)
+                        return
+
+                    # Bot detection: 10+ messages with chatbot patterns
+                    _msg_lower = message_text.lower() if message_text else ""
+                    _bot_patterns = [
+                        "não entendi", "digite uma das opções", "por favor, digite",
+                        "opção inválida", "menu principal", "digite o número",
+                        "não entendi", "opcao invalida", "digite uma opcao",
+                    ]
+                    _is_bot_msg = any(p in _msg_lower for p in _bot_patterns)
+                    if _is_bot_msg:
+                        _spam_entry["bot_msg_count"] = _spam_entry.get("bot_msg_count", 0) + 1
+                        if _spam_entry["bot_msg_count"] >= 10:
+                            _spam_entry["cooldown_until"] = _spam_now + 3600
+                            _spam_state[_spam_chat_id] = _spam_entry
+                            with open(_spam_file, "w") as _sf:
+                                json.dump(_spam_state, _sf)
+                            return
+
+                    # Check reject loop (≥5 "sem interesse" responses)
+                    if _spam_entry.get("reject_count", 0) >= 5:
+                        _spam_entry["cooldown_until"] = _spam_now + 3600
+                        _spam_state[_spam_chat_id] = _spam_entry
+                        with open(_spam_file, "w") as _sf:
+                            json.dump(_spam_state, _sf)
+                        return
+
+                    # Persist updated state (without cooldown)
+                    _spam_state[_spam_chat_id] = _spam_entry
+                    with open(_spam_file, "w") as _sf:
+                        json.dump(_spam_state, _sf)
+                except Exception:
+                    pass
+
+            # Run the agent
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
@@ -11427,6 +11607,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     agent_result, response, history_len=len(history),
                 )
                 response = _sanitize_gateway_final_response(source.platform, response)
+                if response is None:
+                    # Model returned [SILENCIOSO] — conversation already resolved,
+                    # no message should be sent.
+                    logger.debug(
+                        "[WhatsApp] Suppressing response for %s (conversation resolved)",
+                        getattr(source, "chat_id", "?"),
+                    )
+                    return None
+
+                # WhatsApp spam-protect: track "sem interesse" rejections
+                if source.platform and source.platform.value == "whatsapp" and response:
+                    try:
+                        _spam_chat_id2 = str(source.chat_id or source.user_id or "")
+                        _spam_file2 = os.path.expanduser("~/.hermes/whatsapp/chat-cooldowns.json")
+                        _spam_state2 = {}
+                        if os.path.exists(_spam_file2):
+                            with open(_spam_file2) as _sf2:
+                                _spam_state2 = json.loads(_sf2.read() or "{}")
+                        _entry2 = _spam_state2.get(_spam_chat_id2, {})
+                        _resp_lower = response.lower()
+                        _reject_phrases = [
+                            "sem interesse",
+                            "obrigado, sem interesse",
+                            "não aceita interações",
+                            "não participa",
+                        ]
+                        if any(p in _resp_lower for p in _reject_phrases):
+                            _cur = _entry2.get("reject_count", 0)
+                            _entry2["reject_count"] = _cur + 1
+                            _spam_state2[_spam_chat_id2] = _entry2
+                            with open(_spam_file2, "w") as _sf2:
+                                json.dump(_spam_state2, _sf2)
+                    except Exception:
+                        pass
 
             # Ordering contract: the agent thread already updated the contextvar
             # in conversation_compression.py; propagate to SessionEntry + _save().
@@ -17650,7 +17864,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # read *and* reassign the outer `_run_agent` parameter without
             # triggering an UnboundLocalError on the earlier read at
             # `_resolve_turn_agent_config(message, …)`.
-            nonlocal message
+            nonlocal message, disabled_toolsets, enabled_toolsets
 
             # session_key is propagated via contextvars in _set_session_env()
             # (_SESSION_KEY) and via set_current_session_key() (_approval_session_key)
@@ -17688,6 +17902,111 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 combined_ephemeral = (combined_ephemeral + "\n\n" + cfg_channel_prompt).strip()
 
             max_iterations = _current_max_iterations()
+
+            # --------------------------------------------------------
+            # --------------------------------------------------------
+            # WhatsApp: ALWAYS secretary mode — Dr. Victor interacts
+            # exclusively via Telegram. Every WhatsApp contact is a
+            # patient/third-party. No owner detection needed.
+            # --------------------------------------------------------
+            if source.platform and source.platform.value == "whatsapp":
+                # Compute BRT (UTC-3) time for time-aware greeting
+                from datetime import datetime, timezone, timedelta as _td
+                _brt = datetime.now(timezone(_td(hours=-3)))
+                _brt_str = _brt.strftime("%H:%M")
+                _brt_hour = _brt.hour
+                combined_ephemeral = f"""Você é a secretária do Dr. Victor Almeida, endocrinologista (CRM-BA 22.586, RQE 13.396).
+Agora são {_brt_str} em Salvador/BA (UTC-3).
+
+SAUDAÇÃO — SEMPRE comece com o cumprimento correto e se identifique:
+- Se o horário atual for antes de 12:00 → comece com "Bom dia"
+- Se for entre 12:00 e 18:00 → comece com "Boa tarde"
+- Se for após 18:00 → comece com "Boa noite"
+- SEMPRE se identifique. Varie NATURALMENTE entre estas formas:
+  "Aqui é a secretária do Dr. Victor Almeida."
+  "Sou a secretária do Dr. Victor Almeida."
+  "Aqui é a assistente do Dr. Victor Almeida."
+- Varie também o corpo da mensagem entre 2-3 formulações equivalentes (ex: "entre em contato com a recepção" / "fale com a recepção" / "a recepção pode ajudar").
+Endereço: CEO Salvador Shopping, Torre Londres, Sala 1616.
+Recepção: WhatsApp 71996691002.
+
+CLASSIFICAÇÃO DO CONTATO — identifique UMA categoria e responda com o template:
+
+A) PACIENTE — pedindo informação sobre consulta, agendamento, exame, receita, relatório,
+   valor, convênio, endereço, resultado, sintoma, tratamento ou qualquer dúvida médica.
+   ⚠️ NÃO é paciente: tom comercial/vendas, familiar íntimo, prestador de serviço do Dr. Victor.
+   ➤ TEMPLATE: "[Saudação]! [Identificação]. Se deseja falar sobre consultas, relatórios
+      ou agendamento, por favor [fale diretamente/entre em contato] com a recepção
+      pelo WhatsApp 71996691002."
+
+B) PRÓXIMO — apelido, "meu irmão", "cunhado", "tio", "primo", "amigo",
+   "saudade", "abraço", "beijo", tom familiar, "e aí" + nome, referência a contexto pessoal íntimo.
+   ⚠️ Se houver dúvida entre B e D, escolha D (mais seguro).
+   ➤ TEMPLATE: "[Saudação]! Obrigada. O Dr. Victor verificará sua mensagem pessoalmente."
+
+C) SPAM / PROPAGANDA — oferta NÃO solicitada de produto/serviço, "oportunidade de negócio",
+   "solução empresarial", "parceria", "mentoria", "consultoria", "aumentar seu faturamento",
+   "captação de clientes", "divulgação", links de marketing, abordagem genérica sem nome.
+   ⚠️ NÃO é spam se: menciona serviço JÁ contratado, "sua conta", "seu financiamento",
+   "sua consulta" (agendamento PARA o Dr. Victor), ou nome de clínica/banco conhecido.
+   ➤ TEMPLATE: "[Saudação]! Obrigada, sem interesse."
+
+D) PROFISSIONAL — contato comercial COM relação existente: gerente de banco ("sua conta",
+   "financiamento"), contador, dentista, clínica onde Dr. Victor É paciente ("sua consulta",
+   "seu retorno", "seu atendimento"), reunião marcada ("nossa reunião"),
+   "Dr. Victor"/"Sr. Victor" + contexto de serviço prestado A ELE.
+   ⚠️ Diferença de C (SPAM): aqui o contato PRESTA SERVIÇO ao Dr. Victor (relação existe).
+   Em C, o contato QUER VENDER algo ao Dr. Victor (relação não existe).
+   ➤ TEMPLATE: "[Saudação]! Obrigada pelo contato. O Dr. Victor verificará sua mensagem."
+
+E) INSTITUCIONAL — palestra, evento, congresso, entrevista, imprensa, podcast, live,
+   convite para falar ou participar de evento.
+   ➤ TEMPLATE: "[Saudação]! [Identificação]. Para convites institucionais, por favor
+      envie os detalhes para a recepção pelo WhatsApp 71996691002."
+
+F) URGÊNCIA MÉDICA — "passando mal", "dor no peito", "falta de ar", "desmaio", "convulsão",
+   "infarto", "AVC", "derrame".
+   ➤ TEMPLATE: "Este canal não atende urgência. Procure emergência imediatamente ou ligue 192."
+   (Sem saudação — mensagem de emergência é direta)
+
+NA DÚVIDA, use a categoria D (PROFISSIONAL) — é a opção mais segura.
+
+CONTEXTO DA CONVERSA — INTELIGÊNCIA ANTI-DUPLICIDADE:
+- Se a conversa JÁ FOI RESOLVIDA (houve troca completa: pergunta→resposta→agradecimento)
+  e a nova mensagem for APENAS "ok", "obrigado", "beleza", "combinado", "👍", "certo",
+  "até mais", "abraço", "boa tarde", "bom dia", "boa noite", responda EXATAMENTE:
+  [SILENCIOSO]
+- Se a mensagem for um FRAGMENTO DE DESPEDIDA após conversa já respondida,
+  responda EXATAMENTE: [SILENCIOSO]
+- Se a mensagem trouxer NOVO assunto, nova pergunta, mudança de tema ou dúvida adicional,
+  responda normalmente com o template da categoria.
+- NUNCA repita a mesma resposta duas vezes seguidas para o mesmo contato.
+
+REGRAS ABSOLUTAS:
+- SEMPRE use a saudação correta baseada no horário de Salvador ({_brt_str}, UTC-3).
+- SEMPRE se identifique como secretária/assistente do Dr. Victor Almeida.
+- NUNCA responda perguntas. NUNCA dê informações além do template.
+- NUNCA diga nomes, datas, horários, valores, diagnósticos ou dados específicos.
+- NUNCA confirme agendamentos — você não tem acesso à agenda.
+- NUNCA use emoji, markdown ou formatação.
+- NUNCA mostre raciocínio, análise ou justificativa da sua classificação."""
+                # ── WhatsApp secretary: strip ALL tools so the model
+                # ── cannot accidentally call session_search, terminal,
+                # ── or any other tool that leaks AI behavior.
+                disabled_toolsets = list(set(disabled_toolsets or []) | {
+                    "browser", "clarify", "code_execution", "cronjob",
+                    "delegation", "file", "image_gen", "memory",
+                    "messaging", "search", "session_search",
+                    "skills", "terminal", "todo", "tts", "vision",
+                    "web", "spotify", "homeassistant", "discord",
+                    "discord_admin", "feishu_doc", "feishu_drive",
+                    "yuanbao", "kanban",
+                })
+
+            # Re-read .env and config for fresh credentials (gateway is long-lived,
+            # keys may change without restart). Keep config.yaml authoritative for
+            # runtime budget settings bridged into env vars.
+            _reload_runtime_env_preserving_config_authority()
 
             try:
                 model, runtime_kwargs = self._resolve_session_agent_runtime(
