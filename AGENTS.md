@@ -4,6 +4,24 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 
 **Never give up on the right solution.**
 
+## PREVC Workflow Compliance (MANDATORY)
+
+When operating under the PREVC workflow (`/prevc start`), these rules are ENFORCED:
+
+1. **Phase transitions require validation gate.** Before ANY E→V, V→C, or C→next-E transition, run:
+   ```bash
+   python3 ~/.hermes/scripts/prevc-validate.py <slug>
+   ```
+   If the script outputs `BLOCKED`, the transition is REJECTED. You CANNOT proceed.
+
+2. **One phase per E→V→C cycle.** Never batch multiple phases into a single cycle. Each phase has its own SPEC, its own judge, and its own commit.
+
+3. **Judge is MANDATORY in every Phase V.** A `delegate_task` judge must evaluate each phase's SPEC vs implementation. A phase CANNOT reach stage C without `judgePassed: true` and non-empty `validateEvidence`.
+
+4. **No commit without judge.** `git commit` is only allowed in Phase C, and Phase C requires prior Phase V with judge approval.
+
+Violating any of these rules defeats the purpose of PREVC.
+
 ## Development Environment
 
 ```bash
