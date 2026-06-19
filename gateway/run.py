@@ -351,16 +351,71 @@ def _sanitize_gateway_final_response(platform: Any, text: str):
         # ── [SILENCIOSO]: model chose to stay silent (conversation already resolved)
         if cleaned.strip().startswith("[SILENCIOSO]"):
             return None
-        # Block leaked tool names
+        # Block leaked tool names (colon format: "terminal: cmd")
         if re.search(r"(?im)^\s*(terminal|execute_code|search_files|read_file|browser_[a-z_]+|skill_view|session_search)\s*:", cleaned):
             return "Recebi sua mensagem. O Dr. Victor verificará assim que possível."
-        # Block leaked XML tool call blocks (DeepSeek hallucination)
+        # ── Block leaked XML tool call blocks (DeepSeek hallucination) ──
+        # Tier 1: Hermes native tool XML wrappers
         cleaned = re.sub(r"<function_calls>.*?</function_calls>", "", cleaned, flags=re.S | re.I)
         cleaned = re.sub(r"<invoke[^>]*>.*?</invoke>", "", cleaned, flags=re.S | re.I)
         cleaned = re.sub(r"<tool_calls>.*?</tool_calls>", "", cleaned, flags=re.S | re.I)
         cleaned = re.sub(r"<parameter[^>]*>.*?</parameter>", "", cleaned, flags=re.S | re.I)
-        if re.search(r"<\s*(function_calls|invoke|tool_calls|parameter)", cleaned, re.I):
+        # Tier 2: Block-level tool tags (terminal, file ops, search, delegation)
+        _TOOL_TAG_PATTERNS = (
+            r"<terminal[^>]*>.*?</terminal>",
+            r"<command[^>]*>.*?</command>",
+            r"<file_read[^>]*>.*?</file_read>",
+            r"<file_find[^>]*>.*?</file_find>",
+            r"<search_files[^>]*>.*?</search_files>",
+            r"<write_file[^>]*>.*?</write_file>",
+            r"<skill_manage[^>]*>.*?</skill_manage>",
+            r"<skill_view[^>]*>.*?</skill_view>",
+            r"<session_search[^>]*>.*?</session_search>",
+            r"<memory[^>]*>.*?</memory>",
+            r"<todo[^>]*>.*?</todo>",
+            r"<read_file[^>]*>.*?</read_file>",
+            r"<patch[^>]*>.*?</patch>",
+            r"<execute_code[^>]*>.*?</execute_code>",
+            r"<delegate_task[^>]*>.*?</delegate_task>",
+            r"<cronjob[^>]*>.*?</cronjob>",
+            r"<browser_navigate[^>]*>.*?</browser_navigate>",
+            r"<browser_click[^>]*>.*?</browser_click>",
+            r"<browser_snapshot[^>]*>.*?</browser_snapshot>",
+            r"<browser_type[^>]*>.*?</browser_type>",
+            r"<vision_analyze[^>]*>.*?</vision_analyze>",
+            r"<image_generate[^>]*>.*?</image_generate>",
+            r"<text_to_speech[^>]*>.*?</text_to_speech>",
+            r"<process[^>]*>.*?</process>",
+            r"<clarify[^>]*>.*?</clarify>",
+            r"<web_search[^>]*>.*?</web_search>",
+            r"<web_extract[^>]*>.*?</web_extract>",
+            r"<skills_list[^>]*>.*?</skills_list>",
+        )
+        for _pattern in _TOOL_TAG_PATTERNS:
+            cleaned = re.sub(_pattern, "", cleaned, flags=re.S | re.I)
+        # Tier 3: Self-closing tool tags (<tag ... />)
+        _SELF_CLOSING_TOOLS = (
+            r"<(?:file_read|file_find|search_files|read_file|write_file|patch|"
+            r"skill_view|skill_manage|session_search|memory|todo|"
+            r"vision_analyze|browser_snapshot|browser_navigate)\s[^>]*?/>"
+        )
+        cleaned = re.sub(_SELF_CLOSING_TOOLS, "", cleaned, flags=re.S | re.I)
+        # Tier 4: Catch-all — any remaining XML-like tool orchestration tags
+        if re.search(r"<\s*(function_calls|invoke|tool_calls|parameter|terminal|command|"
+                     r"file_read|file_find|search_files|write_file|read_file|"
+                     r"skill_manage|skill_view|session_search|memory|todo|patch|"
+                     r"execute_code|delegate_task|cronjob|browser_|"
+                     r"vision_analyze|image_generate|text_to_speech|"
+                     r"process|clarify|web_search|web_extract|skills_list)", cleaned, re.I):
             return "Recebi sua mensagem. O Dr. Victor verificará assim que possível."
+        # Tier 5: Catch-all — strip any remaining XML/HTML-like tags in WhatsApp text
+        _leftover_xml = re.search(r"</?[a-z_][a-z0-9_]*(?:\s[^>]*)?>", cleaned, re.I)
+        if _leftover_xml:
+            # Only block if there are multiple XML-looking tags (avoid false positives on
+            # genuine text like "Bom <3" or "<nome>" in informal chat)
+            _xml_count = len(re.findall(r"</?[a-z_][a-z0-9_]*(?:\s[^>]*)?>", cleaned, re.I))
+            if _xml_count >= 3:
+                return "Recebi sua mensagem. O Dr. Victor verificará assim que possível."
         # Block leaked internal reasoning (Portuguese + English patterns)
         internal_reasoning_re = re.compile(
             # ── Portuguese patterns ──
@@ -8351,6 +8406,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as exc:
                 logger.debug("@ context reference expansion failed: %s", exc)
 
+        # ── WhatsApp secretary: strip context compaction summaries ──
+        # When the agent core compacts a WhatsApp conversation, it injects a
+        # summary that carries cross-session contamination (e.g. Telegram session
+        # task state). Strip it before it reaches the model.
+        if source.platform and source.platform.value == "whatsapp":
+            _COMPACTION_MARKER = "[CONTEXT COMPACTION — REFERENCE ONLY]"
+            if _COMPACTION_MARKER in message_text:
+                logger.info(
+                    "WhatsApp: stripping context compaction summary "
+                    "(%d chars) to prevent cross-session contamination",
+                    len(message_text),
+                )
+                # Keep only what's after the END marker, which is the actual
+                # latest message from the contact
+                _end_marker = "--- END OF CONTEXT SUMMARY"
+                _end_idx = message_text.find(_end_marker)
+                if _end_idx != -1:
+                    # Find the actual message after the end marker
+                    _after = message_text[_end_idx + len(_end_marker):]
+                    # The marker continues with " — respond to the message below..."
+                    _respond_line = "respond to the message below, not the summary above ---"
+                    _respond_idx = _after.find(_respond_line)
+                    if _respond_idx != -1:
+                        message_text = _after[_respond_idx + len(_respond_line):].strip()
+                        if not message_text:
+                            message_text = "[Mensagem recebida]"
+                        logger.info("WhatsApp: stripped compaction, kept %d chars of real message", len(message_text))
+
         return message_text
 
     def _consume_pending_native_image_paths(self, session_key: str) -> List[str]:
@@ -14819,6 +14902,100 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # patient/third-party. No owner detection needed.
             # --------------------------------------------------------
             if source.platform and source.platform.value == "whatsapp":
+                # ── WhatsApp spam/bot detection (cooldown-based) ──
+                _chat_id = source.chat_id or ""
+                _cooldown_path = os.path.join(
+                    get_hermes_home(), "whatsapp", "chat-cooldowns.json"
+                )
+                _cooldowns = {}
+                try:
+                    if os.path.exists(_cooldown_path):
+                        with open(_cooldown_path, "r") as _f:
+                            _cooldowns = json.load(_f)
+                except Exception:
+                    pass
+                _now_ts = time.time()
+                # Check if chat is currently silenced
+                _silence_until = _cooldowns.get(_chat_id, 0)
+                if _now_ts < _silence_until:
+                    _remaining = int(_silence_until - _now_ts)
+                    logger.info(
+                        "WhatsApp: chat %s is silenced for %ds more, "
+                        "dropping message",
+                        _chat_id, _remaining,
+                    )
+                    return None  # Drop the message, no response
+                # Bot detection signals in the message text
+                _msg_lower = (message or "").lower()
+                _bot_signals = (
+                    "não entendi",
+                    "digite uma das opções",
+                    "programa de emagrecimento",
+                    "labchecap",
+                    "atendimento automático",
+                    "estamos à disposição",
+                    "atendimento será encerrado",
+                )
+                _bot_hits = sum(1 for s in _bot_signals if s in _msg_lower)
+                # Repeated identical messages
+                _msg_key = _chat_id + ":last_msg"
+                _last_msg = _cooldowns.get(_msg_key, "")
+                _msg_count_key = _chat_id + ":msg_count"
+                _msg_count = _cooldowns.get(_msg_count_key, 0)
+                _first_msg_ts_key = _chat_id + ":first_msg_ts"
+                _first_msg_ts = _cooldowns.get(_first_msg_ts_key, _now_ts)
+                _is_duplicate = bool(_last_msg and _last_msg == (message or ""))
+                # Rate limit: 10+ messages in 3 minutes → silence 30 min
+                if _now_ts - _first_msg_ts > 180:
+                    _msg_count = 0
+                    _first_msg_ts = _now_ts
+                _msg_count += 1
+                # Update tracking
+                _cooldowns[_msg_key] = message or ""
+                _cooldowns[_msg_count_key] = _msg_count
+                _cooldowns[_first_msg_ts_key] = _first_msg_ts
+                # Triggers
+                _should_silence = False
+                if _msg_count >= 10:
+                    logger.warning(
+                        "WhatsApp: rate limit triggered for %s (%d msgs in %ds)",
+                        _chat_id, _msg_count, int(_now_ts - _first_msg_ts),
+                    )
+                    _should_silence = True
+                if _bot_hits >= 2:
+                    logger.warning(
+                        "WhatsApp: bot pattern detected for %s (hits=%d)",
+                        _chat_id, _bot_hits,
+                    )
+                    _should_silence = True
+                if _should_silence:
+                    _cooldowns[_chat_id] = _now_ts + 1800  # 30 min
+                    # Send ONE final message then future ones get dropped
+                    try:
+                        _adapter = self.adapters.get(source.platform)
+                        if _adapter:
+                            safe_schedule_threadsafe(
+                                _adapter.send(
+                                    source.chat_id,
+                                    "Obrigado. O Dr. Victor verificará sua mensagem pessoalmente.",
+                                ),
+                                _loop_for_step,
+                                logger=logger,
+                                log_message="WhatsApp cooldown final message scheduling error",
+                            )
+                    except Exception:
+                        pass
+                # Persist cooldown state
+                try:
+                    os.makedirs(os.path.dirname(_cooldown_path), exist_ok=True)
+                    with open(_cooldown_path, "w") as _f:
+                        json.dump(_cooldowns, _f)
+                except Exception:
+                    pass
+                # If we just silenced, return None to skip agent
+                if _should_silence:
+                    return None
+                # ── End spam/bot detection ──
                 # Compute BRT (UTC-3) time for time-aware greeting
                 from datetime import datetime, timezone, timedelta as _td
                 _brt = datetime.now(timezone(_td(hours=-3)))
@@ -14912,6 +15089,8 @@ CONTEXTO DA CONVERSA — INTELIGÊNCIA ANTI-DUPLICIDADE:
 
 REGRAS ABSOLUTAS:
 - REGRA #1 — IDENTIFICAÇÃO OBRIGATÓRIA: toda resposta (exceto urgência F) DEVE começar com saudação + identificação. Sem exceção. Mesmo que a conversa já tenha 10 mensagens. Mesmo que você já tenha se apresentado antes. SEMPRE: "[Saudação]! [Identificação]." antes de qualquer outra coisa.
+- REGRA #2 — ZERO XML / ZERO CÓDIGO: você NÃO TEM ferramentas. NÃO EXISTEM comandos para você executar. NUNCA gere tags XML como <terminal>, <command>, <file_read>, <function_calls>, <invoke>, <tool_calls> ou QUALQUER tag entre < >. NUNCA gere blocos de código ou comandos. Se você sentir vontade de gerar uma tag ou comando, PARE IMEDIATAMENTE e responda apenas com o template da categoria. Qualquer texto entre < e > será bloqueado e sua resposta será descartada.
+- REGRA #3 — PROIBIDO MENCIONAR FERRAMENTAS: nunca diga "vou listar", "vou executar", "vou ler o arquivo", "vou buscar", "terminal", "comando", "python3", "script", "arquivo de código", "gateway/run.py", "métodos da classe", "status_message", "send_message" ou QUALQUER termo técnico de programação. Você é uma secretária, não uma engenheira de software.
 - SEMPRE use a saudação correta baseada no horário de Salvador ({_brt_str}, UTC-3).
 - Seja SEMPRE calorosa, humana e natural — nunca robótica ou fria.
 - NUNCA responda perguntas. NUNCA dê informações além do template.
@@ -14921,7 +15100,8 @@ REGRAS ABSOLUTAS:
 - NUNCA explique suas decisões ou mostre sua classificação.
 - Varie SEMPRE: o mesmo contato não pode receber a mesma mensagem duas vezes.
 - NUNCA responda com APENAS saudação (ex: \"Bom dia!\") — sempre inclua identificação.
-- SE A CONVERSA JÁ FOI RESOLVIDA (pergunta→resposta→agradecimento) e a nova mensagem for apenas \"ok\", \"obrigado\", \"beleza\", \"combinado\", \"👍\", \"certo\", \"até mais\", \"abraço\", \"boa tarde\", \"bom dia\", \"boa noite\" → NÃO RESPONDA. Silêncio total. A conversa acabou."""
+- SE A CONVERSA JÁ FOI RESOLVIDA (pergunta→resposta→agradecimento) e a nova mensagem for apenas \"ok\", \"obrigado\", \"beleza\", \"combinado\", \"👍\", \"certo\", \"até mais\", \"abraço\", \"boa tarde\", \"bom dia\", \"boa noite\" → NÃO RESPONDA. Silêncio total. A conversa acabou.
+- REGRA ANTI-BOT: se o contato parecer um robô (mensagens repetitivas, respostas genéricas, saudação automática, menção a "Labchecap", "MarIA", "Françoise", "atendimento automático", "programa de emagrecimento") → responda UMA ÚNICA VEZ com categoria C ou D e DEPOIS DISSO NUNCA MAIS RESPONDA. Silêncio absoluto após a primeira resposta. NUNCA entre em loop com outro bot."""
                 # ── WhatsApp secretary: strip ALL tools so the model
                 # ── cannot accidentally call session_search, terminal,
                 # ── or any other tool that leaks AI behavior.
