@@ -353,26 +353,157 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
 
 
-def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
+def _sanitize_gateway_final_response(platform: Any, text: str):
     """Sanitize final gateway replies before sending them to high-noise chats.
 
     Telegram is Bob's mobile inbox, so it should receive concise, safe provider
     failure categories instead of raw HTTP bodies, request IDs, or policy text.
-    Other platforms keep the existing behaviour for now.
+
+    WhatsApp is the patient-facing channel; it goes through a multi-layer
+    sanitisation pipeline to prevent tool-call XML, internal reasoning, and
+    structured JSON envelopes from leaking to patients.
     """
     if not text:
         return text
-    if _gateway_platform_value(platform) != "telegram":
+    platform_value = _gateway_platform_value(platform)
+
+    # ── Telegram: keep existing behaviour exactly ──────────────────────
+    if platform_value == "telegram":
+        redacted = _redact_gateway_user_facing_secrets(str(text))
+        if _looks_like_gateway_provider_error(redacted):
+            return _gateway_provider_error_reply(redacted)
+        return redacted
+
+    # ── Other platforms: pass through unchanged ────────────────────────
+    if platform_value != "whatsapp":
         return text
 
-    redacted = _redact_gateway_user_facing_secrets(str(text))
-    if _looks_like_gateway_provider_error(redacted):
-        return _gateway_provider_error_reply(redacted)
-    return redacted
+    # ═══════════════════════════════════════════════════════════════════
+    # WhatsApp multi-layer sanitisation
+    # ═══════════════════════════════════════════════════════════════════
+
+    SAFE_FALLBACK = "Recebi sua mensagem. O Dr. Victor verificara assim que possivel."
+    cleaned = text
+
+    # ── Layer 1: JSON envelope parsing ─────────────────────────────────
+    stripped = cleaned.strip()
+    m = re.match(r"^```(?:json)?\s*\n?(.*?)\n?```\s*$", stripped, re.S)
+    json_str = m.group(1) if m else stripped
+    try:
+        parsed = json.loads(json_str)
+        if isinstance(parsed, dict) and "acao" in parsed and "mensagem" in parsed:
+            acao = parsed.get("acao")
+            mensagem = parsed.get("mensagem", "")
+            if acao in ("ignorar", "escalar"):
+                logger.info("WhatsApp sanitize: JSON acao=%r, suppressing", acao)
+                return None
+            if acao in ("responder", "encerrar") and mensagem:
+                cleaned = str(mensagem)
+            else:
+                logger.info("WhatsApp sanitize: JSON acao=%r with empty mensagem, suppressing", acao)
+                return None
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass  # not valid JSON — continue to next layers
+
+    # ── Layer 2: [SILENCIOSO] marker ──────────────────────────────────
+    if cleaned.strip().startswith("[SILENCIOSO]"):
+        logger.info("WhatsApp sanitize: [SILENCIOSO] marker found, suppressing")
+        return None
+
+    # ── Layer 3: Strip XML tool tags ───────────────────────────────────
+    XML_TAGS = [
+        "function_calls", "invoke", "tool_calls", "parameter", "terminal",
+        "command", "file_read", "file_find", "search_files", "write_file",
+        "read_file", "skill_manage", "skill_view", "session_search",
+        "memory", "todo", "patch", "execute_code", "delegate_task",
+        "cronjob", "browser_navigate", "browser_click", "browser_snapshot",
+        "browser_type", "vision_analyze", "image_generate", "text_to_speech",
+        "process", "clarify", "web_search", "web_extract", "skills_list",
+    ]
+    for tag in XML_TAGS:
+        cleaned = re.sub(
+            rf"<{tag}[^>]*>.*?</{tag}>", "", cleaned, flags=re.S | re.I,
+        )
+    SELF_CLOSING_TAGS = [
+        "file_read", "file_find", "search_files", "read_file", "write_file",
+        "patch", "skill_view", "skill_manage", "session_search", "memory",
+        "todo", "vision_analyze", "browser_snapshot", "browser_navigate",
+    ]
+    for tag in SELF_CLOSING_TAGS:
+        cleaned = re.sub(
+            rf"<{tag}\s[^>]*?/>", "", cleaned, flags=re.S | re.I,
+        )
+
+    # ── Layer 4: Catch-all remaining XML tool tags ─────────────────────
+    _ALL_TAGS_ALT = "|".join(XML_TAGS)
+    if re.search(rf"</?(?:{_ALL_TAGS_ALT})\b", cleaned, re.I):
+        logger.info("WhatsApp sanitize: remaining tool orchestration tags found, suppressing")
+        return SAFE_FALLBACK
+
+    # ── Layer 5: Internal reasoning leakage ────────────────────────────
+    _PT_PATTERNS = (
+        r"o usu[aá]rio",
+        r"como assistente",
+        r"n[aã]o devo",
+        r"o que eu responderia",
+        r"racioc[ií]nio",
+        r"pensamento",
+        r"l[oó]gica interna",
+        r"Respondi no WhatsApp",
+        r"Anotei (?:seu|o) (?:recado|pedido)",
+        r"Avisei o Dr",
+    )
+    _EN_PATTERNS = (
+        r"the user",
+        r"the patient",
+        r"I (?:should|shouldn't|need to|must|will) (?:respond|reply|say|tell)",
+        r"as an? (?:assistant|AI|bot|agent)",
+        r"let me (?:think|analyze|check)",
+        r"I think",
+        r"based on the (?:rules?|instructions?)",
+        r"my response",
+        r"reasoning",
+        r"previous messages",
+    )
+    _INTERNAL_RE = re.compile(
+        "|".join(_PT_PATTERNS + _EN_PATTERNS), re.I | re.S,
+    )
+    if _INTERNAL_RE.search(cleaned):
+        logger.info("WhatsApp sanitize: internal reasoning leakage detected, suppressing")
+        return SAFE_FALLBACK
+
+    # ── Layer 6: Tool name leakage (colon-format) ─────────────────────
+    _TOOL_COLON_RE = re.compile(
+        r"(?im)^\s*(terminal|execute_code|search_files|read_file|"
+        r"browser_[a-z_]+|skill_view|session_search|delegate_task)\s*:",
+    )
+    if _TOOL_COLON_RE.search(cleaned):
+        logger.info("WhatsApp sanitize: tool name leakage detected, suppressing")
+        return SAFE_FALLBACK
+
+    # ── Layer 7: Remaining XML tag count ──────────────────────────────
+    xml_tag_count = len(
+        re.findall(r"</?[a-z_][a-z0-9_]*(?:\s[^>]*)?>", cleaned, re.I),
+    )
+    if xml_tag_count >= 3:
+        logger.info(
+            "WhatsApp sanitize: %d XML-like tags found, suppressing", xml_tag_count,
+        )
+        return SAFE_FALLBACK
+
+    # ── Layer 8: Cleanup — strip code fences / inline code ─────────────
+    cleaned = re.sub(r"```[\s\S]*?```", "", cleaned)
+    cleaned = re.sub(r"`[^`]+`", "", cleaned)
+    if not cleaned.strip():
+        return None
+
+    return cleaned
 
 
 def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
     """Filter/sanitize agent status callbacks before platform delivery."""
+    if _gateway_platform_value(platform) == "whatsapp":
+        return None
     text = str(message or "").strip()
     if not text:
         return None
