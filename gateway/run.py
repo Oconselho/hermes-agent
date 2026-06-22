@@ -15093,7 +15093,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 try:
                                     _wp_adapter = self.adapters.get(source.platform)
                                     if _wp_adapter and hasattr(_wp_adapter, "send"):
-                                        _recepcao_numero = "5571996691002@s.whatsapp.net"
+                                        _recepcao_numero = "557196691002@s.whatsapp.net"
                                         _notif_msg = (
                                             f"🔔 *NOVO AGENDAMENTO* — WhatsApp\n\n"
                                             f"Paciente: *{_p_nome}*\n"
@@ -15124,7 +15124,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 try:
                                     _wp_adapter = self.adapters.get(source.platform)
                                     if _wp_adapter and hasattr(_wp_adapter, "send"):
-                                        _recepcao_numero = "5571996691002@s.whatsapp.net"
+                                        _recepcao_numero = "557196691002@s.whatsapp.net"
                                         _notif_msg = (
                                             f"🆕 *NOVO PACIENTE* — WhatsApp\n\n"
                                             f"CPF informado: {_cpf_extracted}\n"
@@ -15248,7 +15248,7 @@ G) AGENDAMENTO — paciente quer marcar/remarcar/verificar consulta.
    e o encerramento conforme horário e dia da semana):
 
    "[Saudação]! [Identificação]. Nossa equipe entrará em contato pelo
-   telefone de WhatsApp 71 96691-0002 para confirmar os seus dados,
+   telefone de WhatsApp 71 99669-1002 para confirmar os seus dados,
    o dia e o horário. [Encerramento]!"
 
    ⚠️ ENCERRAMENTO — use EXATAMENTE a fórmula correta conforme o dia:
