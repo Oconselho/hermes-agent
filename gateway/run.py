@@ -15089,12 +15089,59 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         f"\n# DISPONIBILIDADE NA AGENDA (Feegow)\n"
                                         f"{_slots_text}\n"
                                     )
+                                # ── Enviar notificação para recepção ──
+                                try:
+                                    _wp_adapter = self.adapters.get(source.platform)
+                                    if _wp_adapter and hasattr(_wp_adapter, "send"):
+                                        _recepcao_numero = "5571996691002@s.whatsapp.net"
+                                        _notif_msg = (
+                                            f"🔔 *NOVO AGENDAMENTO* — WhatsApp\n\n"
+                                            f"Paciente: *{_p_nome}*\n"
+                                            f"CPF: {_cpf_extracted}\n"
+                                            f"ID Feegow: {_p_id}\n"
+                                            f"Telefone do paciente: {source.chat_id}\n\n"
+                                            f"O paciente solicitou agendar consulta. "
+                                            f"A secretária já está respondendo com "
+                                            f"os horários disponíveis.\n\n"
+                                            f"Por favor, entre em contato com o paciente "
+                                            f"para confirmar o agendamento."
+                                        )
+                                        safe_schedule_threadsafe(
+                                            _wp_adapter.send(_recepcao_numero, _notif_msg),
+                                            _loop_for_step,
+                                            logger=logger,
+                                            log_message="Feegow reception notification scheduling error",
+                                        )
+                                except Exception as _notif_err:
+                                    logger.debug("Failed to schedule reception notification: %s", _notif_err)
                             elif _has_scheduling:
                                 _feegow_context += (
                                     "\n\n# DADOS DO PACIENTE (Feegow)\n"
                                     "Paciente com CPF informado NÃO foi encontrado na base. "
                                     "Será necessário cadastrar como novo paciente.\n"
                                 )
+                                # ── Notificar recepção sobre paciente NOVO ──
+                                try:
+                                    _wp_adapter = self.adapters.get(source.platform)
+                                    if _wp_adapter and hasattr(_wp_adapter, "send"):
+                                        _recepcao_numero = "5571996691002@s.whatsapp.net"
+                                        _notif_msg = (
+                                            f"🆕 *NOVO PACIENTE* — WhatsApp\n\n"
+                                            f"CPF informado: {_cpf_extracted}\n"
+                                            f"Telefone do contato: {source.chat_id}\n\n"
+                                            f"Este paciente NÃO está cadastrado no Feegow. "
+                                            f"Solicitou agendar consulta. A secretária "
+                                            f"está orientando a entrar em contato com a "
+                                            f"recepção para cadastro e agendamento."
+                                        )
+                                        safe_schedule_threadsafe(
+                                            _wp_adapter.send(_recepcao_numero, _notif_msg),
+                                            _loop_for_step,
+                                            logger=logger,
+                                            log_message="Feegow new patient notification scheduling error",
+                                        )
+                                except Exception as _notif_err:
+                                    logger.debug("Failed to schedule new patient notification: %s", _notif_err)
                         elif _has_scheduling and not _cpf_extracted:
                             _feegow_context += (
                                 "\n\n# DADOS DO PACIENTE (Feegow)\n"
