@@ -18192,17 +18192,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _wp_adapter = self.adapters.get(source.platform)
                                     if _wp_adapter and hasattr(_wp_adapter, "send"):
                                         _recepcao_numero = "557196691002@s.whatsapp.net"
+                                        # Extrair telefone do paciente do JID
+                                        _tel_paciente = _wa_sender_digits if _wa_sender_digits else str(source.chat_id)
+                                        # Formatar: 5571912345678 → 71 91234-5678
+                                        if _tel_paciente.startswith("55") and len(_tel_paciente) >= 12:
+                                            _tel_formatado = f"{_tel_paciente[2:4]} {_tel_paciente[4:5]}{_tel_paciente[5:9]}-{_tel_paciente[9:]}"
+                                        else:
+                                            _tel_formatado = _tel_paciente
+                                        # Última mensagem do paciente (com dia/horário proposto)
+                                        _msg_paciente = _recent_text[:300] if _recent_text else "(mensagem não disponível)"
                                         _notif_msg = (
                                             f"🔔 *NOVO AGENDAMENTO* — WhatsApp\n\n"
                                             f"Paciente: *{_p_nome}*\n"
                                             f"CPF: {_cpf_extracted}\n"
                                             f"ID Feegow: {_p_id}\n"
-                                            f"Telefone do paciente: {source.chat_id}\n\n"
-                                            f"O paciente solicitou agendar consulta. "
-                                            f"A secretária já está respondendo com "
-                                            f"os horários disponíveis.\n\n"
-                                            f"Por favor, entre em contato com o paciente "
-                                            f"para confirmar o agendamento."
+                                            f"Tel: {_tel_formatado}\n\n"
+                                            f"Mensagem do paciente:\n"
+                                            f"\"{_msg_paciente}\"\n\n"
+                                            f"👉 *Responder direto para o paciente*:\n"
+                                            f"https://wa.me/{_tel_paciente}\n\n"
+                                            f"A secretária já respondeu com os dados da recepção."
                                         )
                                         safe_schedule_threadsafe(
                                             _wp_adapter.send(_recepcao_numero, _notif_msg),
@@ -18223,14 +18232,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _wp_adapter = self.adapters.get(source.platform)
                                     if _wp_adapter and hasattr(_wp_adapter, "send"):
                                         _recepcao_numero = "557196691002@s.whatsapp.net"
+                                        _tel_paciente = _wa_sender_digits if _wa_sender_digits else str(source.chat_id)
+                                        if _tel_paciente.startswith("55") and len(_tel_paciente) >= 12:
+                                            _tel_formatado = f"{_tel_paciente[2:4]} {_tel_paciente[4:5]}{_tel_paciente[5:9]}-{_tel_paciente[9:]}"
+                                        else:
+                                            _tel_formatado = _tel_paciente
+                                        _msg_paciente = _recent_text[:300] if _recent_text else "(mensagem não disponível)"
                                         _notif_msg = (
                                             f"🆕 *NOVO PACIENTE* — WhatsApp\n\n"
                                             f"CPF informado: {_cpf_extracted}\n"
-                                            f"Telefone do contato: {source.chat_id}\n\n"
+                                            f"Tel: {_tel_formatado}\n\n"
+                                            f"Mensagem do paciente:\n"
+                                            f"\"{_msg_paciente}\"\n\n"
+                                            f"👉 *Responder direto para o paciente*:\n"
+                                            f"https://wa.me/{_tel_paciente}\n\n"
                                             f"Este paciente NÃO está cadastrado no Feegow. "
-                                            f"Solicitou agendar consulta. A secretária "
-                                            f"está orientando a entrar em contato com a "
-                                            f"recepção para cadastro e agendamento."
+                                            f"Solicitou agendar consulta. "
+                                            f"É necessário cadastrar e agendar."
                                         )
                                         safe_schedule_threadsafe(
                                             _wp_adapter.send(_recepcao_numero, _notif_msg),
