@@ -18099,6 +18099,118 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _brt = datetime.now(timezone(_td(hours=-3)))
                 _brt_str = _brt.strftime("%H:%M")
                 _brt_hour = _brt.hour
+                _brt_weekday = _brt.weekday()  # 0=Segunda, ..., 6=Domingo
+
+                # ── Feegow API: injeção de contexto de agendamento ──────────
+                # A secretária não chama ferramentas diretamente; o Python
+                # pré-processa a conversa e injeta dados do Feegow como
+                # texto puro que o LLM pode usar na resposta JSON.
+                # NUNCA confirma agendamentos — apenas informa disponibilidade.
+                _feegow_context = ""
+                _feegow_token_path = os.path.join(
+                    os.path.expanduser("~/.hermes"), "feegow_token.txt"
+                )
+                _feegow_token = ""
+                for _token_path in (
+                    os.path.join(
+                        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "feegow_token.txt",
+                    ),
+                    _feegow_token_path,
+                    "/tmp/feegow_token.txt",
+                ):
+                    try:
+                        if os.path.exists(_token_path):
+                            with open(_token_path, "r", encoding="utf-8") as _f:
+                                _feegow_token = _f.read().strip()
+                            if _feegow_token:
+                                break
+                    except Exception:
+                        pass
+
+                if _feegow_token:
+                    try:
+                        from gateway.platforms.feegow_api import FeegowClient
+                        _feegow = FeegowClient(token=_feegow_token)
+
+                        # ── Detectar intenção de agendamento ──
+                        _recent_msgs = message.get("content", [])
+                        if isinstance(_recent_msgs, list):
+                            _recent_text = " ".join(
+                                str(m.get("text", "") if isinstance(m, dict) else m)
+                                for m in _recent_msgs[-5:]
+                            )
+                        elif isinstance(_recent_msgs, str):
+                            _recent_text = _recent_msgs
+                        else:
+                            _recent_text = ""
+
+                        _scheduling_keywords = [
+                            "marcar", "agendar", "consulta", "horário",
+                            "horario", "vaga", "disponível", "disponivel",
+                            "retorno", "encaixe", "marcação", "marcacao",
+                            "agendamento", "quando o dr", "quando dr",
+                            "tem vaga", "qual o dia", "quero marcar",
+                            "gostaria de marcar", "preciso marcar",
+                        ]
+                        _has_scheduling = any(
+                            kw in _recent_text.lower()
+                            for kw in _scheduling_keywords
+                        )
+
+                        # ── Extrair CPF do texto (###.###.###-## ou 11 dígitos) ──
+                        import re as _re_feegow
+                        _cpf_match = _re_feegow.search(
+                            r"\b(\d{3}\.?\d{3}\.?\d{3}-?\d{2})\b", _recent_text
+                        )
+                        _cpf_extracted = None
+                        if _cpf_match:
+                            _cpf_digits = _re_feegow.sub(r"[^0-9]", "", _cpf_match.group(1))
+                            if len(_cpf_digits) == 11:
+                                _cpf_extracted = _cpf_digits
+
+                        # ── Se há intenção de agendamento, injetar dados ──
+                        if _has_scheduling and _cpf_extracted:
+                            _patient = _feegow.find_patient_for_secretary(cpf=_cpf_extracted)
+                            if _patient and not _patient.get("error"):
+                                _p_nome = _patient.get("nome", _patient.get("name", "paciente"))
+                                _p_id = _patient.get("id", _patient.get("paciente_id", ""))
+                                _feegow_context += (
+                                    f"\n\n# DADOS DO PACIENTE (Feegow)\n"
+                                    f"Paciente encontrado: {_p_nome} (ID: {_p_id}).\n"
+                                )
+                                _d1 = _brt.strftime("%d-%m-%Y")
+                                _d7 = (_brt + _td(days=7)).strftime("%d-%m-%Y")
+                                _slots_text = _feegow.get_available_slots_text(_d1, _d7)
+                                if _slots_text and "erro" not in _slots_text.lower():
+                                    _feegow_context += (
+                                        f"\n# DISPONIBILIDADE NA AGENDA (Feegow)\n"
+                                        f"{_slots_text}\n"
+                                    )
+                            elif _has_scheduling:
+                                _feegow_context += (
+                                    "\n\n# DADOS DO PACIENTE (Feegow)\n"
+                                    "Paciente com CPF informado NÃO foi encontrado na base. "
+                                    "Será necessário cadastrar como novo paciente.\n"
+                                )
+                        elif _has_scheduling and not _cpf_extracted:
+                            _feegow_context += (
+                                "\n\n# DADOS DO PACIENTE (Feegow)\n"
+                                "Nenhum CPF identificado na mensagem. "
+                                "A secretária deve solicitar CPF ou nome completo + "
+                                "data de nascimento para prosseguir.\n"
+                            )
+                    except Exception as _feegow_err:
+                        logger.warning(
+                            "Feegow context injection failed: %s", _feegow_err
+                        )
+                        _feegow_context = (
+                            "\n\n# STATUS DA API FEEGOW\n"
+                            "A API Feegow está temporariamente indisponível. "
+                            "A secretária deve orientar o paciente a contatar "
+                            "a recepção pelo WhatsApp 71996691002.\n"
+                        )
+
                 combined_ephemeral = f"""Você é a secretária do Dr. Victor Almeida, endocrinologista (CRM-BA 22.586, RQE 13.396).
 Agora são {_brt_str} em Salvador/BA (UTC-3).
 
@@ -18173,6 +18285,47 @@ F) URGÊNCIA MÉDICA — "passando mal", "dor no peito", "falta de ar", "desmaio
    ➤ TEMPLATE: "Este canal não atende urgência. Procure emergência imediatamente ou ligue 192."
    (Sem saudação — mensagem de emergência é direta e urgente)
 
+G) AGENDAMENTO — paciente quer marcar/remarcar/verificar consulta.
+   ⚠️ PALAVRAS-CHAVE: "marcar consulta", "agendar", "horário disponível",
+   "quando o Dr. tem vaga", "qual o dia", "tem horário", "quero agendar",
+   "consulta", "retorno", "encaixe", "disponibilidade", "marcação".
+
+   ➤ REGRA ABSOLUTA DESTA CATEGORIA:
+   Você NUNCA confirma agendamento. Você NUNCA diz "está marcado",
+   "consulta registrada", "agendado", "confirmado", ou qualquer frase
+   que sugira que a consulta foi efetivamente marcada.
+   Você APENAS informa disponibilidade e encaminha para a recepção.
+
+   ➤ FLUXO EM 2 ETAPAS (siga sequencialmente, uma por mensagem):
+
+   ETAPA 1 — IDENTIFICAÇÃO (se não houver CPF/nome na mensagem):
+   "[Saudação]! [Identificação]. Para verificar a agenda, vou precisar
+   confirmar seu cadastro. Pode me informar seu CPF (apenas números)
+   ou nome completo e data de nascimento?"
+   ⚠️ Varie a formulação a cada uso.
+
+   ETAPA 2 — ENCAMINHAMENTO (quando o CPF/nome JÁ ESTÁ na conversa):
+   Se houver DADOS DO PACIENTE e DISPONIBILIDADE no contexto acima:
+   "[Saudação]! [Identificação]. [Nome do paciente], verifiquei sua
+   agenda. O Dr. Victor tem [liste os horários do contexto Feegow].
+   Para agendar, por favor entre em contato com a recepção pelo
+   WhatsApp 71996691002. Eles vão confirmar o horário com você."
+   
+   Se o paciente NÃO foi encontrado na base:
+   "[Saudação]! [Identificação]. Não encontrei seu cadastro. Para
+   agendar, é necessário fazer um cadastro rápido com a recepção
+   pelo WhatsApp 71996691002. Eles vão te atender e já marcar sua
+   consulta."
+   
+   Se a API Feegow estiver indisponível (STATUS DA API FEEGOW):
+   "[Saudação]! [Identificação]. Houve um problema técnico ao acessar
+   a agenda. Por favor, entre em contato com a recepção pelo WhatsApp
+   71996691002. Peço desculpas pelo inconveniente."
+
+   ⚠️ NUNCA invente horários. Use APENAS os dados do contexto Feegow.
+   ⚠️ NUNCA diga que a consulta foi marcada. SEMPRE encaminhe para recepção.
+   ⚠️ Se o contexto NÃO tiver dados Feegow, trate como categoria A (PACIENTE).
+
 NA DÚVIDA, use a categoria D (PROFISSIONAL) — é a opção mais segura e acolhedora.
 
 CONTEXTO DA CONVERSA — INTELIGÊNCIA ANTI-DUPLICIDADE:
@@ -18193,7 +18346,14 @@ REGRAS ABSOLUTAS:
 - Seja SEMPRE calorosa, humana e natural — nunca robótica ou fria.
 - NUNCA responda perguntas. NUNCA dê informações além do template.
 - NUNCA diga nomes, datas, horários, valores, diagnósticos ou dados específicos.
-- NUNCA confirme agendamentos — você não tem acesso à agenda.
+- CATEGORIA G (AGENDAMENTO): você TEM acesso aos dados do Feegow. Os dados
+  do paciente e horários disponíveis são injetados automaticamente no
+  contexto acima (seções DADOS DO PACIENTE e DISPONIBILIDADE NA AGENDA).
+  Use essas informações APENAS para informar disponibilidade na ETAPA 2.
+  ⚠️ Você NUNCA confirma agendamento. SEMPRE encaminha para a recepção.
+  Se o contexto indicar API indisponível, use o template de erro.
+- NUNCA diga "está marcado", "consulta registrada", "agendado", "confirmado"
+  ou qualquer frase que sugira que a consulta foi efetivamente agendada.
 - NUNCA use emoji, markdown ou formatação.
 - NUNCA explique suas decisões ou mostre sua classificação.
 - Varie SEMPRE: o mesmo contato não pode receber a mesma mensagem duas vezes.
