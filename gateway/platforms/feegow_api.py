@@ -341,36 +341,41 @@ class FeegowClient:
     ) -> Dict[str, Any]:
         """Busca pacientes na base Feegow.
 
+        Usa o endpoint ``patient/search`` (singular, GET).
+        Parâmetros em português: ``paciente_cpf``, ``paciente_nome``.
+
+        Retorna 409 (\"Paciente não encontrado\") quando o CPF não existe —
+        tratado como resposta normal (paciente não cadastrado).
+
         Pelo menos um dos parâmetros deve ser informado.
 
         Args:
-            cpf: CPF do paciente (apenas números, ex: "00000000000").
+            cpf: CPF do paciente (apenas números, 11 dígitos).
             nome: Nome completo ou parcial do paciente.
-            telefone: Telefone com DDD (ex: "71999999999").
+            telefone: Telefone com DDD (ex: \"71999999999\").
             email: Email do paciente.
 
         Returns:
-            Dicionário com a resposta da API. Em caso de sucesso, contém
-            a chave ``data`` com a lista de pacientes encontrados.
+            Dicionário com a resposta da API.
         """
-        body: Dict[str, str] = {}
+        params: Dict[str, str] = {}
         if cpf:
-            body["cpf"] = cpf
+            params["paciente_cpf"] = cpf
         if nome:
-            body["nome"] = nome
+            params["paciente_nome"] = nome
         if telefone:
-            body["telefone"] = telefone
+            params["telefone"] = telefone
         if email:
-            body["email"] = email
+            params["email"] = email
 
-        if not body:
+        if not params:
             raise FeegowValidationError(
                 "Informe ao menos um critério de busca: cpf, nome, telefone ou email."
             )
 
-        logger.info("Feegow: searching patients with %s", list(body.keys()))
+        logger.info("Feegow: searching patients with %s", list(params.keys()))
         return self._safe_call(
-            lambda: self._request("POST", "patients/search", json_data=body),
+            lambda: self._request("GET", "patient/search", params=params),
         )
 
     def create_patient(
@@ -385,10 +390,14 @@ class FeegowClient:
     ) -> Dict[str, Any]:
         """Cadastra um novo paciente na base Feegow.
 
+        Usa o endpoint ``patient/create`` (singular, POST).
+        Campos em português: ``nome_completo``, ``nome_paciente``.
+        Data de nascimento no formato YYYY-MM-DD.
+
         Args:
             nome: Nome completo do paciente.
-            cpf: CPF (apenas números).
-            data_nascimento: Data no formato DD-MM-AAAA (ex: "15-03-1985").
+            cpf: CPF (apenas números, 11 dígitos, deve ser válido).
+            data_nascimento: Data no formato YYYY-MM-DD (ex: "1990-01-01").
             telefone: Telefone com DDD (ex: "71999999999").
             email: Email do paciente (opcional).
             sexo: "M" para masculino, "F" para feminino.
@@ -397,10 +406,11 @@ class FeegowClient:
 
         Returns:
             Dicionário com a resposta da API. Em caso de sucesso, contém
-            os dados do paciente criado.
+            ``content.paciente_id`` com o ID do paciente criado.
         """
         body: Dict[str, Any] = {
-            "nome": nome,
+            "nome_completo": nome,
+            "nome_paciente": nome,
             "cpf": cpf,
             "data_nascimento": data_nascimento,
             "telefone": telefone,
@@ -411,7 +421,7 @@ class FeegowClient:
 
         logger.info("Feegow: creating patient %s (CPF: %s)", nome, cpf)
         result = self._safe_call(
-            lambda: self._request("POST", "patients/create", json_data=body),
+            lambda: self._request("POST", "patient/create", json_data=body),
         )
         # Se criou paciente, invalidar cache de busca
         if result.get("success"):
