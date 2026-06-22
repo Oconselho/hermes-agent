@@ -18199,7 +18199,8 @@ REGRAS ABSOLUTAS:
 - Varie SEMPRE: o mesmo contato não pode receber a mesma mensagem duas vezes.
 - NUNCA responda com APENAS saudação (ex: \"Bom dia!\") — sempre inclua identificação.
 - SE A CONVERSA JÁ FOI RESOLVIDA (pergunta→resposta→agradecimento) e a nova mensagem for apenas \"ok\", \"obrigado\", \"beleza\", \"combinado\", \"👍\", \"certo\", \"até mais\", \"abraço\", \"boa tarde\", \"bom dia\", \"boa noite\" → NÃO RESPONDA. Silêncio total. A conversa acabou.
-- REGRA ANTI-BOT: se o contato parecer um robô (mensagens repetitivas, respostas genéricas, saudação automática, menção a "Labchecap", "MarIA", "Françoise", "atendimento automático", "programa de emagrecimento") → responda UMA ÚNICA VEZ com categoria C ou D e DEPOIS DISSO NUNCA MAIS RESPONDA. Silêncio absoluto após a primeira resposta. NUNCA entre em loop com outro bot."""
+- REGRA ANTI-BOT: se o contato parecer um robô (mensagens repetitivas, respostas genéricas, saudação automática, menção a "Labchecap", "MarIA", "Françoise", "atendimento automático", "programa de emagrecimento") → responda UMA ÚNICA VEZ com categoria C ou D e DEPOIS DISSO NUNCA MAIS RESPONDA. Silêncio absoluto após a primeira resposta. NUNCA entre em loop com outro bot.
+{_feegow_context}"""
                 # ── WhatsApp secretary: strip ALL tools so the model
                 # ── cannot accidentally call session_search, terminal,
                 # ── or any other tool that leaks AI behavior.
