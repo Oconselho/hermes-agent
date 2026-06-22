@@ -30,6 +30,7 @@ import dataclasses
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -70,6 +71,43 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
+
+
+def _coerce_unix_timestamp_seconds(value: Any) -> float:
+    """Return a Unix timestamp in seconds from seconds or milliseconds input."""
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(timestamp) or timestamp <= 0:
+        return 0.0
+    # JavaScript bridge state is stored in milliseconds; Python state is seconds.
+    if timestamp > 10_000_000_000:
+        timestamp /= 1000.0
+    return timestamp
+
+
+def _whatsapp_cooldown_until_seconds(value: Any) -> float:
+    """Extract an active WhatsApp cooldown timestamp from legacy/current state.
+
+    Historical secretary code wrote ``chat_id -> <float seconds>``. Newer spam
+    protection stores ``chat_id -> {message_count, msg_timestamps, ...}`` and
+    only silences when a ``cooldown_until``/``silence_until`` key is present.
+    The bridge may also persist timestamps in JavaScript milliseconds.
+    """
+    if isinstance(value, dict):
+        for key in ("cooldown_until", "silence_until", "silenced_until", "until"):
+            if key in value:
+                return _coerce_unix_timestamp_seconds(value.get(key))
+        return 0.0
+    return _coerce_unix_timestamp_seconds(value)
+
+
+def _whatsapp_silent_agent_result() -> Dict[str, Any]:
+    """Agent-result shape recognized by gateway delivery as intentional silence."""
+    return {"final_response": "SILENT", "messages": [], "api_calls": 0}
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
@@ -11510,7 +11548,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 try:
                     for _mf in _wa_glob.glob(os.path.join(os.path.expanduser("~/.hermes/whatsapp/session"), "lid-mapping-[0-9]*.json")):
                         if "_reverse" not in _mf:
-                            with open(_mf) as _mfh:
+                            with open(_mf, encoding="utf-8") as _mfh:
                                 _mapped_lid = _mfh.read().strip().strip('"')
                             if _mapped_lid and _mapped_lid in _wa_sender_digits:
                                 _wa_phone = os.path.basename(_mf).replace("lid-mapping-", "").replace(".json", "")
@@ -11523,7 +11561,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _ignored_path = os.path.expanduser("~/.hermes/whatsapp/ignored_numbers.txt")
                     if os.path.exists(_ignored_path):
                         _ignored = set()
-                        with open(_ignored_path) as _f:
+                        with open(_ignored_path, encoding="utf-8") as _f:
                             for _line in _f:
                                 _line = _line.strip()
                                 if _line and not _line.startswith("#"):
@@ -11541,13 +11579,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _spam_file = os.path.expanduser("~/.hermes/whatsapp/chat-cooldowns.json")
                     _spam_state = {}
                     if os.path.exists(_spam_file):
-                        with open(_spam_file) as _sf:
+                        with open(_spam_file, encoding="utf-8") as _sf:
                             _spam_state = json.loads(_sf.read() or "{}")
                     _spam_chat_id = str(source.chat_id or source.user_id or "")
-                    _spam_entry = _spam_state.get(_spam_chat_id, {})
+                    _spam_entry_raw = _spam_state.get(_spam_chat_id, {})
+                    _spam_entry = _spam_entry_raw if isinstance(_spam_entry_raw, dict) else {}
 
                     # Check if chat is currently in enforced cooldown (silenced 1h)
-                    _spam_until = _spam_entry.get("cooldown_until", 0)
+                    _spam_until = _whatsapp_cooldown_until_seconds(_spam_entry_raw)
                     if _spam_until and _spam_now < _spam_until:
                         return  # still silenced — drop silently
 
@@ -11559,7 +11598,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if len(_spam_msgs) >= 20:
                         _spam_entry["cooldown_until"] = _spam_now + 3600  # silence 1h
                         _spam_state[_spam_chat_id] = _spam_entry
-                        with open(_spam_file, "w") as _sf:
+                        with open(_spam_file, "w", encoding="utf-8") as _sf:
                             json.dump(_spam_state, _sf)
                         return
 
@@ -11576,7 +11615,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if _spam_entry["bot_msg_count"] >= 10:
                             _spam_entry["cooldown_until"] = _spam_now + 3600
                             _spam_state[_spam_chat_id] = _spam_entry
-                            with open(_spam_file, "w") as _sf:
+                            with open(_spam_file, "w", encoding="utf-8") as _sf:
                                 json.dump(_spam_state, _sf)
                             return
 
@@ -11584,13 +11623,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if _spam_entry.get("reject_count", 0) >= 5:
                         _spam_entry["cooldown_until"] = _spam_now + 3600
                         _spam_state[_spam_chat_id] = _spam_entry
-                        with open(_spam_file, "w") as _sf:
+                        with open(_spam_file, "w", encoding="utf-8") as _sf:
                             json.dump(_spam_state, _sf)
                         return
 
                     # Persist updated state (without cooldown)
                     _spam_state[_spam_chat_id] = _spam_entry
-                    with open(_spam_file, "w") as _sf:
+                    with open(_spam_file, "w", encoding="utf-8") as _sf:
                         json.dump(_spam_state, _sf)
                 except Exception:
                     pass
@@ -11713,9 +11752,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _spam_file2 = os.path.expanduser("~/.hermes/whatsapp/chat-cooldowns.json")
                         _spam_state2 = {}
                         if os.path.exists(_spam_file2):
-                            with open(_spam_file2) as _sf2:
+                            with open(_spam_file2, encoding="utf-8") as _sf2:
                                 _spam_state2 = json.loads(_sf2.read() or "{}")
-                        _entry2 = _spam_state2.get(_spam_chat_id2, {})
+                        _entry2_raw = _spam_state2.get(_spam_chat_id2, {})
+                        _entry2 = _entry2_raw if isinstance(_entry2_raw, dict) else {}
                         _resp_lower = response.lower()
                         _reject_phrases = [
                             "sem interesse",
@@ -11727,7 +11767,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _cur = _entry2.get("reject_count", 0)
                             _entry2["reject_count"] = _cur + 1
                             _spam_state2[_spam_chat_id2] = _entry2
-                            with open(_spam_file2, "w") as _sf2:
+                            with open(_spam_file2, "w", encoding="utf-8") as _sf2:
                                 json.dump(_spam_state2, _sf2)
                     except Exception:
                         pass
@@ -18008,13 +18048,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _cooldowns = {}
                 try:
                     if os.path.exists(_cooldown_path):
-                        with open(_cooldown_path, "r") as _f:
+                        with open(_cooldown_path, "r", encoding="utf-8") as _f:
                             _cooldowns = json.load(_f)
                 except Exception:
                     pass
                 _now_ts = time.time()
                 # Check if chat is currently silenced
-                _silence_until = _cooldowns.get(_chat_id, 0)
+                _chat_cooldown_entry = _cooldowns.get(_chat_id, 0)
+                _silence_until = _whatsapp_cooldown_until_seconds(_chat_cooldown_entry)
                 if _now_ts < _silence_until:
                     _remaining = int(_silence_until - _now_ts)
                     logger.info(
@@ -18022,7 +18063,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "dropping message",
                         _chat_id, _remaining,
                     )
-                    return None  # Drop the message, no response
+                    return _whatsapp_silent_agent_result()
                 # Bot detection signals in the message text
                 _msg_lower = (message or "").lower()
                 _bot_signals = (
@@ -18067,7 +18108,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     _should_silence = True
                 if _should_silence:
-                    _cooldowns[_chat_id] = _now_ts + 1800  # 30 min
+                    _silence_until_new = _now_ts + 1800  # 30 min
+                    if isinstance(_chat_cooldown_entry, dict):
+                        _chat_cooldown_entry["cooldown_until"] = _silence_until_new
+                        _cooldowns[_chat_id] = _chat_cooldown_entry
+                    else:
+                        _cooldowns[_chat_id] = _silence_until_new
                     # Send ONE final message then future ones get dropped
                     try:
                         _adapter = self.adapters.get(source.platform)
@@ -18086,13 +18132,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Persist cooldown state
                 try:
                     os.makedirs(os.path.dirname(_cooldown_path), exist_ok=True)
-                    with open(_cooldown_path, "w") as _f:
+                    with open(_cooldown_path, "w", encoding="utf-8") as _f:
                         json.dump(_cooldowns, _f)
                 except Exception:
                     pass
-                # If we just silenced, return None to skip agent
+                # If we just silenced, return an intentional-silence marker
                 if _should_silence:
-                    return None
+                    return _whatsapp_silent_agent_result()
                 # ── End spam/bot detection ──
                 # Compute BRT (UTC-3) time for time-aware greeting
                 from datetime import datetime, timezone, timedelta as _td
