@@ -194,6 +194,60 @@ const MAX_QUEUE_SIZE = 100;
 const recentlySentIds = new Set();
 const MAX_RECENT_IDS = 50;
 
+// ── Owner-reply cooldown (Dr. Victor handoff) ──────────────────────
+// When the owner sends a message in a third-party chat, the secretary
+// must stay silent for 30 minutes so Dr. Victor can have a live
+// conversation without the bot jumping in.
+// Persisted to survive bridge restarts within the cooldown window.
+const OWNER_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
+const OWNER_COOLDOWN_PATH = path.join(SESSION_DIR, '..', 'owner-reply-cooldowns.json');
+let ownerReplyTimestamps = {};
+
+function loadOwnerCooldowns() {
+  try {
+    if (existsSync(OWNER_COOLDOWN_PATH)) {
+      ownerReplyTimestamps = JSON.parse(readFileSync(OWNER_COOLDOWN_PATH, 'utf8'));
+    }
+  } catch (err) {
+    console.error('[bridge] Failed to load owner cooldowns:', err.message);
+    ownerReplyTimestamps = {};
+  }
+}
+
+function saveOwnerCooldowns() {
+  try {
+    writeFileSync(OWNER_COOLDOWN_PATH, JSON.stringify(ownerReplyTimestamps, null, 2));
+  } catch (err) {
+    console.error('[bridge] Failed to save owner cooldowns:', err.message);
+  }
+}
+
+function pruneOwnerCooldowns() {
+  const now = Date.now();
+  let changed = false;
+  for (const chatId of Object.keys(ownerReplyTimestamps)) {
+    if (now - ownerReplyTimestamps[chatId] >= OWNER_COOLDOWN_MS) {
+      delete ownerReplyTimestamps[chatId];
+      changed = true;
+    }
+  }
+  if (changed) saveOwnerCooldowns();
+}
+
+function recordOwnerReply(chatId) {
+  ownerReplyTimestamps[chatId] = Date.now();
+  saveOwnerCooldowns();
+}
+
+function isOwnerCooldownActive(chatId) {
+  const ts = ownerReplyTimestamps[chatId];
+  return ts && (Date.now() - ts) < OWNER_COOLDOWN_MS;
+}
+
+// Load persisted cooldowns on startup
+loadOwnerCooldowns();
+pruneOwnerCooldowns(); // Clean expired entries
+
 let sock = null;
 let connectionState = 'disconnected';
 
@@ -301,7 +355,22 @@ async function startSocket() {
         const myLid = (sock.user?.lid || '').replace(/:.*@/, '@').replace(/@.*/, '');
         const chatNumber = chatId.replace(/@.*/, '');
         const isSelfChat = (myNumber && chatNumber === myNumber) || (myLid && chatNumber === myLid);
-        if (!isSelfChat) continue;
+        if (!isSelfChat) {
+          // Owner (Dr. Victor) replied in a third-party chat → record cooldown
+          // so the secretary stays silent for 30 minutes.
+          pruneOwnerCooldowns();
+          recordOwnerReply(chatId);
+          if (WHATSAPP_DEBUG) {
+            try {
+              console.log(JSON.stringify({
+                event: 'owner_reply_cooldown',
+                chatId,
+                cooldownMinutes: OWNER_COOLDOWN_MS / 60000,
+              }));
+            } catch {}
+          }
+          continue;
+        }
       }
 
       // Handle !fromMe messages (from other people) based on mode.
@@ -321,6 +390,28 @@ async function startSocket() {
           } catch {}
           continue;
         }
+
+        // Owner-reply cooldown: if Dr. Victor replied in this chat
+        // within the last 30 minutes, suppress the secretary so he
+        // can have a live conversation without bot interference.
+        pruneOwnerCooldowns();
+        if (isOwnerCooldownActive(chatId)) {
+          if (WHATSAPP_DEBUG) {
+            try {
+              const remaining = Math.ceil(
+                (OWNER_COOLDOWN_MS - (Date.now() - ownerReplyTimestamps[chatId])) / 60000
+              );
+              console.log(JSON.stringify({
+                event: 'suppressed_owner_cooldown',
+                chatId,
+                senderId,
+                remainingMinutes: remaining,
+              }));
+            } catch {}
+          }
+          continue;
+        }
+
         if (!matchesAllowedUser(senderId, ALLOWED_USERS, SESSION_DIR)) {
           try {
             console.log(JSON.stringify({

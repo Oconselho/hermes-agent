@@ -9632,6 +9632,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _stale_adapter._post_delivery_callbacks.pop(_quick_key, None)
                 return None
 
+            if agent_result is None:
+                logger.warning(
+                    "Agent returned None for %s — sending fallback error message",
+                    _quick_key or "?",
+                )
+                _response_time = time.time() - _msg_start_time
+                logger.info(
+                    "response ready: platform=%s chat=%s time=%.1fs api_calls=0 response=%d chars",
+                    source.platform,
+                    source.chat_id or "?",
+                    _response_time,
+                    0,
+                )
+                return await self._send_response_message(
+                    response="⚠️ O serviço está temporariamente indisponível. "
+                             "Por favor, tente novamente em alguns instantes.",
+                    source=source,
+                    agent_messages=[],
+                    tool_call_count=0,
+                    api_calls=0,
+                    _quick_key=_quick_key,
+                    _response_time=_response_time,
+                    event=event,
+                )
+
             response = agent_result.get("final_response") or ""
             try:
                 from gateway.response_filters import is_intentional_silence_agent_result
@@ -14501,7 +14526,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # 5+ exchanges/3min freeze, bot-like <3s pattern freeze
             _wa_sender = str(getattr(source, "user_id", "") or "")
             _wa_chat_id = str(getattr(source, "chat_id", "") or "")
-            if _wa_chat_id:
+
+            # OWNER WHITELIST: Dr. Victor's IDs bypass all rate limits
+            _OWNER_WHITELIST = {
+                "118347958063114",       # Dr. Victor LID
+                "118347958063114@lid",   # Dr. Victor LID (with suffix)
+                "5571999999999",         # Placeholder — add phone if needed
+            }
+            _is_owner = (
+                _wa_sender in _OWNER_WHITELIST
+                or _wa_chat_id in _OWNER_WHITELIST
+                or _wa_chat_id.replace("@lid", "") in _OWNER_WHITELIST
+                or _wa_sender.replace("@lid", "") in _OWNER_WHITELIST
+            )
+
+            if _is_owner:
+                logger.debug("WhatsApp: owner %s bypassing rate limits", _wa_chat_id)
+
+            if _wa_chat_id and not _is_owner:
                 import time as _time_mod
                 _cooldown_path = os.path.join(
                     os.path.expanduser("~/.hermes"), "whatsapp", "chat-cooldowns.json"
@@ -14636,6 +14678,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         json.dump(_cooldowns, _f)
                 except Exception:
                     pass
+
+                # OWNER-REPLY COOLDOWN (Python fallback)
+                # Bridge.js is the primary enforcer, but the Python gateway
+                # also reads the persisted cooldown file as a safety net.
+                # If Dr. Victor replied in this chat within 30 min, skip
+                # the secretary so he can have a live conversation.
+                _owner_cooldown_path = os.path.join(
+                    os.path.expanduser("~/.hermes"), "whatsapp", "owner-reply-cooldowns.json"
+                )
+                try:
+                    if os.path.exists(_owner_cooldown_path):
+                        with open(_owner_cooldown_path, "r") as _ocf:
+                            _owner_cooldowns = json.load(_ocf)
+                        if isinstance(_owner_cooldowns, dict):
+                            _oc_ts = _owner_cooldowns.get(_wa_chat_id)
+                            if _oc_ts and (_now_ts - _oc_ts) < 1800:  # 30 min
+                                _remaining = int(1800 - (_now_ts - _oc_ts))
+                                logger.info(
+                                    "WhatsApp owner-reply cooldown: suppressing secretary "
+                                    "in chat %s (owner replied %.0fs ago, %ds remaining)",
+                                    _wa_chat_id, _now_ts - _oc_ts, _remaining,
+                                )
+                                return
+                except Exception as _oce:
+                    logger.debug("Owner-reply cooldown check failed: %s", _oce)
 
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):
