@@ -13,8 +13,8 @@ from gateway.session import SessionSource, build_session_key
 
 
 class DummyTelegramAdapter(BasePlatformAdapter):
-    def __init__(self):
-        super().__init__(PlatformConfig(enabled=True, token="fake-token"), Platform.TELEGRAM)
+    def __init__(self, platform: Platform = Platform.TELEGRAM):
+        super().__init__(PlatformConfig(enabled=True, token="fake-token"), platform)
         self._busy_text_mode = ""
         self.sent = []
         self.typing = []
@@ -194,6 +194,39 @@ class TestBasePlatformTopicSessions:
         assert adapter.processing_hooks == [
             ("start", "1"),
             ("complete", "1", ProcessingOutcome.FAILURE),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_process_message_background_suppresses_exception_details_on_whatsapp(self):
+        adapter = DummyTelegramAdapter(platform=Platform.WHATSAPP)
+
+        async def handler(_event):
+            await asyncio.sleep(0)
+            raise ImportError("cannot import name 'env_float' from 'utils'")
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        adapter.set_message_handler(handler)
+        adapter._keep_typing = hold_typing
+
+        event = MessageEvent(
+            text="[audio received]",
+            source=SessionSource(
+                platform=Platform.WHATSAPP,
+                chat_id="121805440299183@lid",
+                chat_type="dm",
+                user_id="121805440299183@lid",
+                user_name="Franklin Martins",
+            ),
+            message_id="wa-1",
+        )
+        await adapter._process_message_background(event, build_session_key(event.source))
+
+        assert adapter.sent == []
+        assert adapter.processing_hooks == [
+            ("start", "wa-1"),
+            ("complete", "wa-1", ProcessingOutcome.FAILURE),
         ]
 
     @pytest.mark.asyncio
