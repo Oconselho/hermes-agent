@@ -15055,6 +15055,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # texto puro que o LLM pode usar na resposta JSON.
                 # NUNCA confirma agendamentos — apenas informa disponibilidade.
                 _feegow_context = ""
+                _has_scheduling = False  # inicializado fora do bloco token
                 _feegow_token_path = os.path.join(
                     os.path.expanduser("~/.hermes"), "feegow_token.txt"
                 )
