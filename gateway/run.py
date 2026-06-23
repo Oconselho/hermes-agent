@@ -392,9 +392,9 @@ def _sanitize_gateway_final_response(platform: Any, text: str):
         # Block leaked tool names (colon format: "terminal: cmd")
         if re.search(r"(?im)^\s*(terminal|execute_code|search_files|read_file|browser_[a-z_]+|skill_view|session_search)\s*:", cleaned):
             return "Recebi sua mensagem. O Dr. Victor verificará assim que possível."
-        # Block internal error messages (No reply, empty content, retries)
-        if re.search(r"(?i)no reply|empty content|after retries|fallback providers|all.*retries.*exhausted", cleaned):
-            return "Desculpe, houve um problema técnico. Nossa equipe entrará em contato pelo WhatsApp 71 99669-1002."
+        # Block internal error messages — suppress entirely, no reply
+        if re.search(r"(?i)no reply|empty content|after retries|fallback providers|all.*retries.*exhausted|⚠️ No reply|⚠️ Processing", cleaned):
+            return None  # SILENCE: don't send anything to WhatsApp
         # Block leaked XML tool call blocks (DeepSeek hallucination)
         # Tier 1: Hermes native tool XML wrappers
         cleaned = re.sub(r"<function_calls>.*?</function_calls>", "", cleaned, flags=re.S | re.I)
