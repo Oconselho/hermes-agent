@@ -18190,10 +18190,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         from gateway.platforms.feegow_api import FeegowClient
                         _feegow = FeegowClient(token=_feegow_token)
 
-                        # ── Extrair telefone do paciente ──
-                        import re as _wa_re2
+                        # ── Extrair telefone do paciente (resolver LID→phone) ──
+                        import re as _wa_re2, glob as _wa_glob2
                         _wa_sender = str(getattr(source, "user_id", "") or "")
                         _wa_sender_digits = _wa_re2.sub(r"[^0-9]", "", _wa_sender)
+                        # Resolver LID para número de telefone real
+                        _wa_phone_resolved = ""
+                        try:
+                            for _mf in _wa_glob2.glob(os.path.join(
+                                os.path.expanduser("~/.hermes/whatsapp/session"),
+                                "lid-mapping-[0-9]*.json"
+                            )):
+                                if "_reverse" not in _mf:
+                                    with open(_mf) as _mfh:
+                                        _mapped_lid = _mfh.read().strip().strip('"')
+                                    if _mapped_lid and _mapped_lid in _wa_sender_digits:
+                                        _wa_phone_resolved = os.path.basename(_mf).replace("lid-mapping-", "").replace(".json", "")
+                                        break
+                        except Exception:
+                            pass
+                        # Fallback: usa source.chat_id ou o próprio _wa_sender_digits
+                        _tel_paciente = _wa_phone_resolved or _wa_sender_digits or str(source.chat_id)
+                        if _tel_paciente.startswith("55") and len(_tel_paciente) >= 12:
+                            _tel_formatado = f"{_tel_paciente[2:4]} {_tel_paciente[4:5]}{_tel_paciente[5:9]}-{_tel_paciente[9:]}"
+                        else:
+                            _tel_formatado = _tel_paciente
 
                         # ── Detectar intenção de agendamento ──
                         # message is a str (raw user text), not a dict
@@ -18250,11 +18271,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 try:
                                     _wp_adapter = self.adapters.get(source.platform)
                                     if _wp_adapter and hasattr(_wp_adapter, "send"):
-                                        _tel_paciente = _wa_sender_digits if _wa_sender_digits else str(source.chat_id)
-                                        if _tel_paciente.startswith("55") and len(_tel_paciente) >= 12:
-                                            _tel_formatado = f"{_tel_paciente[2:4]} {_tel_paciente[4:5]}{_tel_paciente[5:9]}-{_tel_paciente[9:]}"
-                                        else:
-                                            _tel_formatado = _tel_paciente
                                         _msg_paciente = _recent_text[:300] if _recent_text else "(mensagem indisponível)"
                                         safe_schedule_threadsafe(
                                             _wp_adapter.send("557196691002@s.whatsapp.net",
@@ -18276,11 +18292,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 try:
                                     _wp_adapter = self.adapters.get(source.platform)
                                     if _wp_adapter and hasattr(_wp_adapter, "send"):
-                                        _tel_paciente = _wa_sender_digits if _wa_sender_digits else str(source.chat_id)
-                                        if _tel_paciente.startswith("55") and len(_tel_paciente) >= 12:
-                                            _tel_formatado = f"{_tel_paciente[2:4]} {_tel_paciente[4:5]}{_tel_paciente[5:9]}-{_tel_paciente[9:]}"
-                                        else:
-                                            _tel_formatado = _tel_paciente
                                         _msg_paciente = _recent_text[:300] if _recent_text else "(mensagem indisponível)"
                                         safe_schedule_threadsafe(
                                             _wp_adapter.send("557196691002@s.whatsapp.net",
@@ -18316,11 +18327,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             try:
                                 _wp_adapter = self.adapters.get(source.platform)
                                 if _wp_adapter and hasattr(_wp_adapter, "send"):
-                                    _tel_paciente = _wa_sender_digits if _wa_sender_digits else str(source.chat_id)
-                                    if _tel_paciente.startswith("55") and len(_tel_paciente) >= 12:
-                                        _tel_formatado = f"{_tel_paciente[2:4]} {_tel_paciente[4:5]}{_tel_paciente[5:9]}-{_tel_paciente[9:]}"
-                                    else:
-                                        _tel_formatado = _tel_paciente
                                     _msg_paciente = _recent_text[:300] if _recent_text else "(mensagem não disponível)"
                                     _notif_msg = (
                                         f"⚠️ *SOLICITAÇÃO DE AGENDAMENTO* — API indisponível\n\n"
