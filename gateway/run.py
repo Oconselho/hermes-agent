@@ -15223,6 +15223,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "A secretária deve orientar o paciente a contatar "
                             "a recepção pelo WhatsApp 71996691002.\n"
                         )
+                        # ── Mesmo com API indisponível, notificar recepção ──
+                        if _has_scheduling:
+                            try:
+                                _wp_adapter = self.adapters.get(source.platform)
+                                if _wp_adapter and hasattr(_wp_adapter, "send"):
+                                    _tel_paciente = _wa_sender_digits if _wa_sender_digits else str(source.chat_id)
+                                    if _tel_paciente.startswith("55") and len(_tel_paciente) >= 12:
+                                        _tel_formatado = f"{_tel_paciente[2:4]} {_tel_paciente[4:5]}{_tel_paciente[5:9]}-{_tel_paciente[9:]}"
+                                    else:
+                                        _tel_formatado = _tel_paciente
+                                    _msg_paciente = _recent_text[:300] if _recent_text else "(mensagem não disponível)"
+                                    _notif_msg = (
+                                        f"⚠️ *SOLICITAÇÃO DE AGENDAMENTO* — API indisponível\n\n"
+                                        f"Tel: {_tel_formatado}\n\n"
+                                        f"Mensagem do paciente:\n"
+                                        f"\"{_msg_paciente}\"\n\n"
+                                        f"👉 *Responder direto para o paciente*:\n"
+                                        f"https://wa.me/{_tel_paciente}\n\n"
+                                        f"A API Feegow está momentaneamente indisponível. "
+                                        f"Entre em contato com o paciente para agendar."
+                                    )
+                                    safe_schedule_threadsafe(
+                                        _wp_adapter.send("557196691002@s.whatsapp.net", _notif_msg),
+                                        _loop_for_step,
+                                        logger=logger,
+                                        log_message="Feegow fallback notification scheduling error",
+                                    )
+                            except Exception as _notif_err:
+                                logger.debug("Failed to schedule fallback notification: %s", _notif_err)
 
                 combined_ephemeral = f"""Você é a secretária do Dr. Victor Almeida, endocrinologista (CRM-BA 22.586, RQE 13.396).
 Agora são {_brt_str} em Salvador/BA (UTC-3).

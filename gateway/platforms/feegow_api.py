@@ -731,14 +731,23 @@ class FeegowClient:
             telefone: Telefone com DDD.
 
         Returns:
-            Dicionário com dados do paciente ou None se não encontrado.
+            Dicionário com dados do paciente ou None se não encontrado/erro.
         """
-        result = self.search_patients(cpf=cpf, nome=nome, telefone=telefone)
+        try:
+            result = self.search_patients(cpf=cpf, nome=nome, telefone=telefone)
+        except Exception:
+            logger.warning("Feegow find_patient_for_secretary: search failed")
+            return None
+        if not isinstance(result, dict):
+            logger.warning("Feegow find_patient: unexpected response type %s", type(result))
+            return None
         if result.get("error"):
             return None
-        data = result.get("data", [])
-        if isinstance(data, list) and data:
-            return data[0]
+        content_data = result.get("content", result.get("data", []))
+        if isinstance(content_data, dict) and not content_data.get("error"):
+            return content_data
+        if isinstance(content_data, list) and content_data:
+            return content_data[0]
         return None
 
     def get_available_slots_text(
