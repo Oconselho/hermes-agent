@@ -18181,6 +18181,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         pass
 
                 if _feegow_token:
+                    logger.info("Feegow: token loaded (%d chars), searching context", len(_feegow_token))
                     try:
                         from gateway.platforms.feegow_api import FeegowClient
                         _feegow = FeegowClient(token=_feegow_token)
@@ -18209,6 +18210,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             kw in _recent_text.lower()
                             for kw in _scheduling_keywords
                         )
+                        logger.info("Feegow: scheduling=%s, text_len=%d", _has_scheduling, len(_recent_text))
 
                         # ── Extrair CPF do texto (###.###.###-## ou 11 dígitos) ──
                         import re as _re_feegow
@@ -18220,10 +18222,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _cpf_digits = _re_feegow.sub(r"[^0-9]", "", _cpf_match.group(1))
                             if len(_cpf_digits) == 11:
                                 _cpf_extracted = _cpf_digits
+                        logger.info("Feegow: cpf_extracted=%s", _cpf_extracted)
 
                         # ── Se há intenção de agendamento, injetar dados ──
                         if _has_scheduling and _cpf_extracted:
                             _patient = _feegow.find_patient_for_secretary(cpf=_cpf_extracted)
+                            logger.info("Feegow: patient search result=%s", "found" if _patient else "none")
                             if _patient and not _patient.get("error"):
                                 _p_nome = _patient.get("nome", _patient.get("name", "paciente"))
                                 _p_id = _patient.get("id", _patient.get("paciente_id", ""))
