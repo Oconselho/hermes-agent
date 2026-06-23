@@ -15173,13 +15173,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 try:
                                     _wp_adapter = self.adapters.get(source.platform)
                                     if _wp_adapter and hasattr(_wp_adapter, "send"):
-                                        _msg_paciente = _recent_text[:300] if _recent_text else "(mensagem indisponível)"
+                                        _assunto = _recent_text[:200] if _recent_text else "Solicitou atendimento"
+                                        # Se a mensagem for só CPF, usar descrição contextual
+                                        if _cpf_extracted and _recent_text.replace(".","").replace("-","").strip() == _cpf_extracted:
+                                            _assunto = "Solicitou agendamento de consulta" if _has_scheduling else "Solicitou informação/atendimento"
                                         safe_schedule_threadsafe(
                                             _wp_adapter.send("557196691002@s.whatsapp.net",
                                                 f"🔔 *NOVO AGENDAMENTO* — WhatsApp\n\n"
                                                 f"Paciente: *{_p_nome}*\nCPF: {_cpf_extracted}\nID Feegow: {_p_id}\n"
                                                 f"Tel: {_tel_formatado}\n\n"
-                                                f"Mensagem: \"{_msg_paciente}\"\n\n"
+                                                f"Assunto: {_assunto}\n\n"
                                                 f"👉 https://wa.me/{_tel_paciente}"),
                                             _loop_for_step, logger=logger,
                                             log_message="Feegow notification error")
@@ -15191,17 +15194,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     "Paciente com CPF informado NÃO foi encontrado. "
                                     "Será necessário cadastrar como novo paciente.\n"
                                 )
+                                # ── Notificar recepção: paciente novo ──
                                 try:
                                     _wp_adapter = self.adapters.get(source.platform)
                                     if _wp_adapter and hasattr(_wp_adapter, "send"):
-                                        _msg_paciente = _recent_text[:300] if _recent_text else "(mensagem indisponível)"
+                                        _assunto = _recent_text[:200] if _recent_text else "Solicitou atendimento"
+                                        if _cpf_extracted and _recent_text.replace(".","").replace("-","").strip() == _cpf_extracted:
+                                            _assunto = "Solicitou agendamento de consulta" if _has_scheduling else "Solicitou informação/atendimento"
                                         safe_schedule_threadsafe(
                                             _wp_adapter.send("557196691002@s.whatsapp.net",
                                                 f"🆕 *NOVO PACIENTE* — WhatsApp\n\n"
                                                 f"CPF: {_cpf_extracted}\nTel: {_tel_formatado}\n\n"
-                                                f"Mensagem: \"{_msg_paciente}\"\n\n"
+                                                f"Assunto: {_assunto}\n\n"
                                                 f"👉 https://wa.me/{_tel_paciente}\n\n"
-                                                f"Não cadastrado no Feegow. Cadastrar e agendar."),
+                                                f"Não cadastrado no Feegow. Cadastrar e atender."),
                                             _loop_for_step, logger=logger,
                                             log_message="Feegow new patient notification error")
                                 except Exception:
