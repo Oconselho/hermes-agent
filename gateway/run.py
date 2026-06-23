@@ -18191,16 +18191,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _feegow = FeegowClient(token=_feegow_token)
 
                         # ── Detectar intenção de agendamento ──
-                        _recent_msgs = message.get("content", []) if isinstance(message, dict) else []
-                        if isinstance(_recent_msgs, list):
-                            _recent_text = " ".join(
-                                str(m.get("text", "") if isinstance(m, dict) else m)
-                                for m in _recent_msgs[-5:]
-                            )
-                        elif isinstance(_recent_msgs, str):
-                            _recent_text = _recent_msgs
-                        else:
-                            _recent_text = ""
+                        # message is a str (raw user text), not a dict
+                        _recent_text = message if isinstance(message, str) else ""
 
                         _scheduling_keywords = [
                             "marcar", "agendar", "consulta", "horário",
@@ -18214,7 +18206,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             kw in _recent_text.lower()
                             for kw in _scheduling_keywords
                         )
-                        logger.warning("Feegow: scheduling=%s, text_len=%d", _has_scheduling, len(_recent_text))
+                        logger.warning("Feegow: scheduling=%s, text='%s'", _has_scheduling, _recent_text[:80])
 
                         # ── Extrair CPF do texto (###.###.###-## ou 11 dígitos) ──
                         import re as _re_feegow
