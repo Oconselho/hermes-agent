@@ -18180,6 +18180,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception:
                         pass
 
+                logger.info("Feegow: token found=%s, len=%d", bool(_feegow_token), len(_feegow_token))
                 if _feegow_token:
                     logger.info("Feegow: token loaded (%d chars), searching context", len(_feegow_token))
                     try:
