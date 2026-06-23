@@ -18220,8 +18220,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 _cpf_extracted = _cpf_digits
                         logger.warning("Feegow: cpf_extracted=%s", _cpf_extracted)
 
-                        # ── Se há intenção de agendamento, injetar dados ──
-                        if _has_scheduling and _cpf_extracted:
+                        # ── Se há CPF, SEMPRE buscar paciente ──
+                        # (o paciente pode responder só "94961522520" após pedido de CPF)
+                        if _cpf_extracted:
                             _patient = _feegow.find_patient_for_secretary(cpf=_cpf_extracted)
                             logger.warning("Feegow: patient search result=%s", "found" if _patient else "none")
                             if _patient and not _patient.get("error"):
@@ -18231,85 +18232,62 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     f"\n\n# DADOS DO PACIENTE (Feegow)\n"
                                     f"Paciente encontrado: {_p_nome} (ID: {_p_id}).\n"
                                 )
-                                _d1 = _brt.strftime("%d-%m-%Y")
-                                _d7 = (_brt + _td(days=7)).strftime("%d-%m-%Y")
-                                _slots_text = _feegow.get_available_slots_text(_d1, _d7)
-                                if _slots_text and "erro" not in _slots_text.lower():
-                                    _feegow_context += (
-                                        f"\n# DISPONIBILIDADE NA AGENDA (Feegow)\n"
-                                        f"{_slots_text}\n"
-                                    )
-                                # ── Enviar notificação para recepção ──
+                                if _has_scheduling:
+                                    _d1 = _brt.strftime("%d-%m-%Y")
+                                    _d7 = (_brt + _td(days=7)).strftime("%d-%m-%Y")
+                                    _slots_text = _feegow.get_available_slots_text(_d1, _d7)
+                                    if _slots_text and "erro" not in _slots_text.lower():
+                                        _feegow_context += (
+                                            f"\n# DISPONIBILIDADE NA AGENDA (Feegow)\n"
+                                            f"{_slots_text}\n"
+                                        )
+                                # ── Notificar recepção ──
                                 try:
                                     _wp_adapter = self.adapters.get(source.platform)
                                     if _wp_adapter and hasattr(_wp_adapter, "send"):
-                                        _recepcao_numero = "557196691002@s.whatsapp.net"
-                                        # Extrair telefone do paciente do JID
                                         _tel_paciente = _wa_sender_digits if _wa_sender_digits else str(source.chat_id)
-                                        # Formatar: 5571912345678 → 71 91234-5678
                                         if _tel_paciente.startswith("55") and len(_tel_paciente) >= 12:
                                             _tel_formatado = f"{_tel_paciente[2:4]} {_tel_paciente[4:5]}{_tel_paciente[5:9]}-{_tel_paciente[9:]}"
                                         else:
                                             _tel_formatado = _tel_paciente
-                                        # Última mensagem do paciente (com dia/horário proposto)
-                                        _msg_paciente = _recent_text[:300] if _recent_text else "(mensagem não disponível)"
-                                        _notif_msg = (
-                                            f"🔔 *NOVO AGENDAMENTO* — WhatsApp\n\n"
-                                            f"Paciente: *{_p_nome}*\n"
-                                            f"CPF: {_cpf_extracted}\n"
-                                            f"ID Feegow: {_p_id}\n"
-                                            f"Tel: {_tel_formatado}\n\n"
-                                            f"Mensagem do paciente:\n"
-                                            f"\"{_msg_paciente}\"\n\n"
-                                            f"👉 *Responder direto para o paciente*:\n"
-                                            f"https://wa.me/{_tel_paciente}\n\n"
-                                            f"A secretária já respondeu com os dados da recepção."
-                                        )
+                                        _msg_paciente = _recent_text[:300] if _recent_text else "(mensagem indisponível)"
                                         safe_schedule_threadsafe(
-                                            _wp_adapter.send(_recepcao_numero, _notif_msg),
-                                            _loop_for_step,
-                                            logger=logger,
-                                            log_message="Feegow reception notification scheduling error",
-                                        )
-                                except Exception as _notif_err:
-                                    logger.debug("Failed to schedule reception notification: %s", _notif_err)
-                            elif _has_scheduling:
+                                            _wp_adapter.send("557196691002@s.whatsapp.net",
+                                                f"🔔 *NOVO AGENDAMENTO* — WhatsApp\n\n"
+                                                f"Paciente: *{_p_nome}*\nCPF: {_cpf_extracted}\nID Feegow: {_p_id}\n"
+                                                f"Tel: {_tel_formatado}\n\n"
+                                                f"Mensagem: \"{_msg_paciente}\"\n\n"
+                                                f"👉 https://wa.me/{_tel_paciente}"),
+                                            _loop_for_step, logger=logger,
+                                            log_message="Feegow notification error")
+                                except Exception:
+                                    pass
+                            else:
                                 _feegow_context += (
                                     "\n\n# DADOS DO PACIENTE (Feegow)\n"
-                                    "Paciente com CPF informado NÃO foi encontrado na base. "
+                                    "Paciente com CPF informado NÃO foi encontrado. "
                                     "Será necessário cadastrar como novo paciente.\n"
                                 )
-                                # ── Notificar recepção sobre paciente NOVO ──
                                 try:
                                     _wp_adapter = self.adapters.get(source.platform)
                                     if _wp_adapter and hasattr(_wp_adapter, "send"):
-                                        _recepcao_numero = "557196691002@s.whatsapp.net"
                                         _tel_paciente = _wa_sender_digits if _wa_sender_digits else str(source.chat_id)
                                         if _tel_paciente.startswith("55") and len(_tel_paciente) >= 12:
                                             _tel_formatado = f"{_tel_paciente[2:4]} {_tel_paciente[4:5]}{_tel_paciente[5:9]}-{_tel_paciente[9:]}"
                                         else:
                                             _tel_formatado = _tel_paciente
-                                        _msg_paciente = _recent_text[:300] if _recent_text else "(mensagem não disponível)"
-                                        _notif_msg = (
-                                            f"🆕 *NOVO PACIENTE* — WhatsApp\n\n"
-                                            f"CPF informado: {_cpf_extracted}\n"
-                                            f"Tel: {_tel_formatado}\n\n"
-                                            f"Mensagem do paciente:\n"
-                                            f"\"{_msg_paciente}\"\n\n"
-                                            f"👉 *Responder direto para o paciente*:\n"
-                                            f"https://wa.me/{_tel_paciente}\n\n"
-                                            f"Este paciente NÃO está cadastrado no Feegow. "
-                                            f"Solicitou agendar consulta. "
-                                            f"É necessário cadastrar e agendar."
-                                        )
+                                        _msg_paciente = _recent_text[:300] if _recent_text else "(mensagem indisponível)"
                                         safe_schedule_threadsafe(
-                                            _wp_adapter.send(_recepcao_numero, _notif_msg),
-                                            _loop_for_step,
-                                            logger=logger,
-                                            log_message="Feegow new patient notification scheduling error",
-                                        )
-                                except Exception as _notif_err:
-                                    logger.debug("Failed to schedule new patient notification: %s", _notif_err)
+                                            _wp_adapter.send("557196691002@s.whatsapp.net",
+                                                f"🆕 *NOVO PACIENTE* — WhatsApp\n\n"
+                                                f"CPF: {_cpf_extracted}\nTel: {_tel_formatado}\n\n"
+                                                f"Mensagem: \"{_msg_paciente}\"\n\n"
+                                                f"👉 https://wa.me/{_tel_paciente}\n\n"
+                                                f"Não cadastrado no Feegow. Cadastrar e agendar."),
+                                            _loop_for_step, logger=logger,
+                                            log_message="Feegow new patient notification error")
+                                except Exception:
+                                    pass
                         elif _has_scheduling and not _cpf_extracted:
                             _feegow_context += (
                                 "\n\n# DADOS DO PACIENTE (Feegow)\n"
@@ -18317,6 +18295,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "A secretária deve solicitar CPF ou nome completo + "
                                 "data de nascimento para prosseguir.\n"
                             )
+
                     except Exception as _feegow_err:
                         logger.warning(
                             "Feegow context injection failed: %s", _feegow_err
