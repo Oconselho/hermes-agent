@@ -71,6 +71,8 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
+_SPAM_PRUNE_INTERVAL_SECS = 3600.0
+_spam_last_prune = 0.0
 
 
 def _coerce_unix_timestamp_seconds(value: Any) -> float:
@@ -10756,6 +10758,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
+        global _spam_last_prune
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
@@ -11589,6 +11592,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if os.path.exists(_spam_file):
                         with open(_spam_file, encoding="utf-8") as _sf:
                             _spam_state = json.loads(_sf.read() or "{}")
+
+                    # Prune stale entries (once per hour)
+                    if _spam_now - _spam_last_prune > _SPAM_PRUNE_INTERVAL_SECS:
+                        _spam_last_prune = _spam_now
+                        _stale_before = _spam_now - 2592000  # 30 days
+                        _pruned = []
+                        for _cid, _entry in list(_spam_state.items()):
+                            if not isinstance(_entry, dict):
+                                _pruned.append(_cid)
+                                continue
+                            _cooldown = _whatsapp_cooldown_until_seconds(_entry)
+                            if _cooldown and _spam_now < _cooldown + 2592000:
+                                continue  # active or recently expired cooldown
+                            _latest = 0.0
+                            for _key in ("msg_timestamps", "bot_msg_timestamps", "reject_timestamps"):
+                                _ts_list = _entry.get(_key, [])
+                                if _ts_list:
+                                    _latest = max(_latest, max(_ts_list))
+                            if _latest < _stale_before:
+                                _pruned.append(_cid)
+                        for _cid in _pruned:
+                            del _spam_state[_cid]
+                        if _pruned:
+                            logger.info(
+                                "Pruned %d stale WhatsApp cooldown entries (inactive >30 days).",
+                                len(_pruned),
+                            )
+                            with open(_spam_file, "w", encoding="utf-8") as _sf:
+                                json.dump(_spam_state, _sf)
+
                     _spam_chat_id = str(source.chat_id or source.user_id or "")
                     _spam_entry_raw = _spam_state.get(_spam_chat_id, {})
                     _spam_entry = _spam_entry_raw if isinstance(_spam_entry_raw, dict) else {}
@@ -11596,7 +11629,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Check if chat is currently in enforced cooldown (silenced 1h)
                     _spam_until = _whatsapp_cooldown_until_seconds(_spam_entry_raw)
                     if _spam_until and _spam_now < _spam_until:
-                        return  # still silenced — drop silently
+                        return _whatsapp_silent_agent_result()  # still silenced — drop silently
 
                     # Rate limit: 20+ messages in 5 minutes
                     _spam_msgs = _spam_entry.get("msg_timestamps", [])
@@ -11608,32 +11641,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _spam_state[_spam_chat_id] = _spam_entry
                         with open(_spam_file, "w", encoding="utf-8") as _sf:
                             json.dump(_spam_state, _sf)
-                        return
+                        logger.warning(
+                            "WhatsApp spam cooldown triggered for chat %s: RATE-LIMIT (20+ msgs in 5min), silenced for 1h.",
+                            _spam_chat_id,
+                        )
+                        return _whatsapp_silent_agent_result()
 
-                    # Bot detection: 10+ messages with chatbot patterns
+                    # Bot detection: 10+ messages with chatbot patterns in 24h.
+                    # Mitigation for humans quoting chatbots: the 24h time window
+                    # ensures a real human won't generate 10 bot-like phrases
+                    # within a single day.
                     _msg_lower = message_text.lower() if message_text else ""
                     _bot_patterns = [
                         "não entendi", "digite uma das opções", "por favor, digite",
                         "opção inválida", "menu principal", "digite o número",
-                        "não entendi", "opcao invalida", "digite uma opcao",
+                        "opcao invalida", "digite uma opcao",
                     ]
                     _is_bot_msg = any(p in _msg_lower for p in _bot_patterns)
+                    # Image-only detection: empty/whitespace message with attachments
+                    if not _is_bot_msg and (not _msg_lower or not _msg_lower.strip()):
+                        _has_attachments = bool(getattr(event, "media_urls", None))
+                        if _has_attachments:
+                            _is_bot_msg = True
                     if _is_bot_msg:
-                        _spam_entry["bot_msg_count"] = _spam_entry.get("bot_msg_count", 0) + 1
-                        if _spam_entry["bot_msg_count"] >= 10:
+                        _bot_ts = _spam_entry.get("bot_msg_timestamps", [])
+                        _bot_ts = [t for t in _bot_ts if _spam_now - t < 86400]  # 24h window
+                        _bot_ts.append(_spam_now)
+                        _spam_entry["bot_msg_timestamps"] = _bot_ts
+                        # Clean up legacy key if present
+                        _spam_entry.pop("bot_msg_count", None)
+                        if len(_bot_ts) >= 10:
                             _spam_entry["cooldown_until"] = _spam_now + 3600
+                            _spam_entry["bot_msg_timestamps"] = []  # reset after cooldown
                             _spam_state[_spam_chat_id] = _spam_entry
                             with open(_spam_file, "w", encoding="utf-8") as _sf:
                                 json.dump(_spam_state, _sf)
-                            return
+                            logger.warning(
+                                "WhatsApp spam cooldown triggered for chat %s: BOT-PATTERN (10+ bot-like msgs in 24h), silenced for 1h.",
+                                _spam_chat_id,
+                            )
+                            return _whatsapp_silent_agent_result()
 
-                    # Check reject loop (≥5 "sem interesse" responses)
-                    if _spam_entry.get("reject_count", 0) >= 5:
-                        _spam_entry["cooldown_until"] = _spam_now + 3600
-                        _spam_state[_spam_chat_id] = _spam_entry
-                        with open(_spam_file, "w", encoding="utf-8") as _sf:
-                            json.dump(_spam_state, _sf)
-                        return
+                    # Reject-loop check moved to post-response (Section C).
+                    # Cooldown triggers when the secretary is ABOUT TO send the
+                    # 5th rejection (outbound), not when the patient sends an
+                    # innocent follow-up message (inbound).
+
+                    # Clean up legacy keys from older spam-protection format
+                    _spam_entry.pop("reject_count", None)
+                    _spam_entry.pop("bot_msg_count", None)
 
                     # Persist updated state (without cooldown)
                     _spam_state[_spam_chat_id] = _spam_entry
@@ -11753,7 +11809,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     return None
 
-                # WhatsApp spam-protect: track "sem interesse" rejections
+                # WhatsApp spam-protect: track "sem interesse" rejections.
+                # Cooldown triggers here (outbound) when the threshold is
+                # reached — not at inbound — so a patient's innocent follow-up
+                # after past rejections won't be silently dropped.
                 if source.platform and source.platform.value == "whatsapp" and response:
                     try:
                         _spam_chat_id2 = str(source.chat_id or source.user_id or "")
@@ -11772,11 +11831,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "não participa",
                         ]
                         if any(p in _resp_lower for p in _reject_phrases):
-                            _cur = _entry2.get("reject_count", 0)
-                            _entry2["reject_count"] = _cur + 1
-                            _spam_state2[_spam_chat_id2] = _entry2
-                            with open(_spam_file2, "w", encoding="utf-8") as _sf2:
-                                json.dump(_spam_state2, _sf2)
+                            _spam_now2 = time.time()
+                            _rej_ts = _entry2.get("reject_timestamps", [])
+                            _rej_ts = [t for t in _rej_ts if _spam_now2 - t < 259200]  # 72h window
+                            _rej_ts.append(_spam_now2)
+                            _entry2["reject_timestamps"] = _rej_ts
+                            # Clean up legacy key if present
+                            _entry2.pop("reject_count", None)
+                            if len(_rej_ts) >= 5:
+                                _entry2["cooldown_until"] = _spam_now2 + 3600
+                                _entry2["reject_timestamps"] = []  # reset after cooldown
+                                _spam_state2[_spam_chat_id2] = _entry2
+                                with open(_spam_file2, "w", encoding="utf-8") as _sf2:
+                                    json.dump(_spam_state2, _sf2)
+                                logger.warning(
+                                    "WhatsApp spam cooldown triggered for chat %s: REJECT-LOOP (5+ rejections in 72h), silenced for 1h.",
+                                    _spam_chat_id2,
+                                )
+                            else:
+                                _spam_state2[_spam_chat_id2] = _entry2
+                                with open(_spam_file2, "w", encoding="utf-8") as _sf2:
+                                    json.dump(_spam_state2, _sf2)
                     except Exception:
                         pass
 

@@ -5210,7 +5210,17 @@ class BasePlatformAdapter(ABC):
         except Exception as e:
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
-            # Send the error to the user so they aren't left with radio silence
+            # Public WhatsApp contacts must never receive internal stack/error text.
+            # The secretary-level sanitizer cannot catch exceptions that escape to
+            # this adapter boundary, so suppress here as the last safety net.
+            if _platform_name(getattr(event.source, "platform", None)) == "whatsapp":
+                logger.warning(
+                    "[%s] Suppressed adapter exception reply for WhatsApp chat %s",
+                    self.name,
+                    event.source.chat_id,
+                )
+                return
+            # Send the error to non-public channels so owners/operators aren't left with radio silence.
             try:
                 error_type = type(e).__name__
                 error_detail = str(e)[:300] if str(e) else "no details available"
