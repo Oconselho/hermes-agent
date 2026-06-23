@@ -18190,6 +18190,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         from gateway.platforms.feegow_api import FeegowClient
                         _feegow = FeegowClient(token=_feegow_token)
 
+                        # ── Extrair telefone do paciente ──
+                        import re as _wa_re2
+                        _wa_sender = str(getattr(source, "user_id", "") or "")
+                        _wa_sender_digits = _wa_re2.sub(r"[^0-9]", "", _wa_sender)
+
                         # ── Detectar intenção de agendamento ──
                         # message is a str (raw user text), not a dict
                         _recent_text = message if isinstance(message, str) else ""
@@ -18234,7 +18239,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 )
                                 if _has_scheduling:
                                     _d1 = _brt.strftime("%d-%m-%Y")
-                                    _d7 = (_brt + _td(days=7)).strftime("%d-%m-%Y")
+                                    _d7 = (_brt + _td(days=15)).strftime("%d-%m-%Y")
                                     _slots_text = _feegow.get_available_slots_text(_d1, _d7)
                                     if _slots_text and "erro" not in _slots_text.lower():
                                         _feegow_context += (
@@ -18439,8 +18444,8 @@ G) AGENDAMENTO — paciente quer marcar/remarcar/verificar consulta.
    
    Se o paciente foi ENCONTRADO mas NÃO há horários disponíveis:
    "[Saudação]! [Identificação]. [Nome], no momento não há horários
-   disponíveis nos próximos 7 dias. Nossa equipe entrará em contato
-   pelo WhatsApp 71 99669-1002 assim que abrir uma vaga.
+   disponíveis nos próximos 15 dias. Nossa equipe entrará em contato
+   pelo WhatsApp 71 99669-1002 para informar o primeiro horário disponível.
    [Encerramento]!"
    
    Se o paciente NÃO foi encontrado na base (ou CPF não cadastrado):
