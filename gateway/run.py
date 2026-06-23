@@ -18186,7 +18186,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _feegow = FeegowClient(token=_feegow_token)
 
                         # ── Detectar intenção de agendamento ──
-                        _recent_msgs = message.get("content", [])
+                        _recent_msgs = message.get("content", []) if isinstance(message, dict) else []
                         if isinstance(_recent_msgs, list):
                             _recent_text = " ".join(
                                 str(m.get("text", "") if isinstance(m, dict) else m)
