@@ -5831,6 +5831,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     continue
 
                 platform_cfg = self.config.platforms.get(platform)
+                # WhatsApp: never send restart/shutdown notifications.
+                # These messages break the illusion of a human secretary.
+                if platform == Platform.WHATSAPP:
+                    logger.debug("Restart notification suppressed for WhatsApp session %s", session_key)
+                    continue
                 if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
                     logger.info(
                         "Shutdown notification suppressed for active session: %s has gateway_restart_notification=false",
