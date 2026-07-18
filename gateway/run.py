@@ -1476,6 +1476,154 @@ from hermes_constants import get_hermes_home, get_hermes_home_override
 from utils import atomic_json_write, atomic_yaml_write, base_url_host_matches, is_truthy_value
 _hermes_home = get_hermes_home()
 
+
+def _whatsapp_blocklist_match(
+    sender_values,
+    ignored_entries,
+    mapping_pairs=(),
+):
+    """Return True when a WhatsApp sender matches ignored_numbers.txt.
+
+    WhatsApp may identify the same contact by a phone JID, a phone number, or
+    a LID.  ``mapping_pairs`` contains ``(phone_digits, lid_digits)`` pairs so
+    the comparison remains deterministic and independent of the model.
+    """
+    import re as _wa_block_re
+
+    def _digits(value):
+        return _wa_block_re.sub(r"[^0-9]", "", str(value or ""))
+
+    ignored = {
+        _digits(entry)
+        for entry in ignored_entries
+        if len(_digits(entry)) >= 7
+    }
+    candidates = {
+        _digits(value)
+        for value in sender_values
+        if len(_digits(value)) >= 7
+    }
+    expanded = set(candidates)
+    normalized_pairs = []
+    for phone, lid in mapping_pairs:
+        phone_digits = _digits(phone)
+        lid_digits = _digits(lid)
+        if len(phone_digits) >= 7 and len(lid_digits) >= 7:
+            normalized_pairs.append((phone_digits, lid_digits))
+
+    # Resolve only mappings belonging to this sender; never add every phone
+    # in the mapping directory to the candidate set.
+    for candidate in candidates:
+        for phone_digits, lid_digits in normalized_pairs:
+            if candidate == phone_digits or candidate == lid_digits:
+                expanded.update((phone_digits, lid_digits))
+
+    # Keep the historical bidirectional substring behavior: the list may use
+    # the WhatsApp DDD-71 form while the inbound source carries the full form,
+    # or vice versa.  Ignore very short values to avoid accidental matches.
+    return any(
+        len(candidate) >= 7
+        and len(entry) >= 7
+        and (candidate in entry or entry in candidate)
+        for candidate in expanded
+        for entry in ignored
+    )
+
+
+def _whatsapp_blocklist_status(source):
+    """Read the active profile blocklist and resolve sender LIDs.
+
+    The function returns ``(blocked, reason)``.  If an existing blocklist
+    cannot be read, it fails closed for WhatsApp rather than allowing a
+    potentially blocked contact to reach the agent.
+    """
+    import json as _wa_block_json
+    import re as _wa_block_re
+
+    try:
+        active_home = Path(get_hermes_home())
+    except Exception:
+        active_home = _hermes_home
+    homes = [active_home, Path.home() / ".hermes"]
+    list_paths = []
+    for home in homes:
+        path = home / "whatsapp" / "ignored_numbers.txt"
+        if path not in list_paths and path.exists():
+            list_paths.append(path)
+    if not list_paths:
+        logger.error(
+            "WhatsApp ignored_numbers.txt is missing; suppressing message fail-closed"
+        )
+        return True, "missing_blocklist"
+
+    ignored_entries = []
+    for path in list_paths:
+        try:
+            ignored_entries.extend(
+                line.strip()
+                for line in path.read_text(encoding="utf-8").splitlines()
+                if line.strip() and not line.lstrip().startswith("#")
+            )
+        except Exception:
+            logger.exception(
+                "Could not read WhatsApp ignored_numbers.txt at %s; "
+                "suppressing message fail-closed",
+                path,
+            )
+            return True, "unreadable_blocklist"
+
+    mapping_pairs = []
+    mapping_dir = active_home / "whatsapp" / "session"
+    try:
+        mapping_paths = mapping_dir.glob("lid-mapping-*.json")
+        for path in mapping_paths:
+            name = path.name
+            if not name.startswith("lid-mapping-") or not name.endswith(".json"):
+                continue
+            stem = name[len("lid-mapping-") : -len(".json")]
+            is_reverse = stem.endswith("_reverse")
+            if is_reverse:
+                stem = stem[: -len("_reverse")]
+            name_digits = _wa_block_re.sub(r"[^0-9]", "", stem)
+            if len(name_digits) < 7:
+                continue
+            try:
+                raw = path.read_text(encoding="utf-8").strip()
+                decoded = _wa_block_json.loads(raw)
+                if isinstance(decoded, dict):
+                    decoded = (
+                        decoded.get("lid")
+                        or decoded.get("phone")
+                        or decoded.get("value")
+                        or ""
+                    )
+                payload_digits = _wa_block_re.sub(r"[^0-9]", "", str(decoded))
+            except Exception:
+                logger.debug("Ignoring malformed WhatsApp LID mapping %s", path)
+                continue
+            if len(payload_digits) < 7:
+                continue
+            mapping_pairs.append(
+                (payload_digits, name_digits)
+                if is_reverse
+                else (name_digits, payload_digits)
+            )
+    except Exception:
+        logger.exception("Could not inspect WhatsApp LID mappings")
+
+    sender_values = (
+        getattr(source, "user_id", None),
+        getattr(source, "user_id_alt", None),
+        getattr(source, "chat_id", None),
+    )
+    blocked = _whatsapp_blocklist_match(
+        sender_values,
+        ignored_entries,
+        mapping_pairs,
+    )
+    return blocked, "matched" if blocked else "not_matched"
+
+
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
 from dotenv import load_dotenv  # noqa: F401  # backward-compat for tests that monkeypatch this symbol
@@ -10769,6 +10917,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _platform_name, source.user_name or source.user_id or "unknown",
             source.chat_id or "unknown", _msg_preview, _reply_id, _reply_txt,
         )
+
+        # WhatsApp ignored_numbers.txt is an absolute pre-agent denylist.  It
+        # must run before cooldown, session restoration, grouping, or model/API
+        # work so a blocked contact can never receive a fallback or cooldown
+        # message either.  LID-to-phone resolution is performed by the helper.
+        if _platform_name == "whatsapp":
+            _wa_blocked, _wa_block_reason = _whatsapp_blocklist_status(source)
+            if _wa_blocked:
+                logger.info(
+                    "WhatsApp ignored_numbers: silently ignoring blocked message "
+                    "(reason=%s, chat=%s)",
+                    _wa_block_reason,
+                    source.chat_id or "unknown",
+                )
+                return {
+                    "final_response": "",
+                    "messages": [],
+                    "api_calls": 0,
+                    "silent": True,
+                }
 
         # Get or create session
         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's
