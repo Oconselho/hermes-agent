@@ -767,8 +767,13 @@ class FeegowClient:
             Texto formatado com os horários ou mensagem de erro amigável.
         """
         result = self.search_appointments(data_start, data_end)
-        if isinstance(result, dict) and result.get("error"):
-            return FALLBACK_MESSAGE
+        if isinstance(result, dict):
+            if result.get("error") or result.get("success") is False:
+                return FALLBACK_MESSAGE
+            # Feegow returns successful collection endpoints in an envelope:
+            # {"success": true, "total": N, "content": [...]}.  Older
+            # responses may use ``data`` instead of ``content``.
+            result = result.get("content", result.get("data", []))
         if not result:
             return (
                 f"Não foram encontrados horários disponíveis entre "
