@@ -770,6 +770,7 @@ def test_cmd_update_force_bypasses_concurrent_check(_winp, tmp_path):
         gateway=False,
         yes=False,
         force=True,  # ← the bypass
+        branch="main",  # explicit target for the post-gate assertion
         backup=False,
         no_backup=True,
     )

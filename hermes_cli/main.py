@@ -8359,6 +8359,55 @@ def _resolve_update_branch(args) -> str:
     return (getattr(args, "branch", None) or "main").strip() or "main"
 
 
+def _resolve_update_remote(git_cmd: list[str], cwd: Path, branch: str) -> str:
+    """Resolve the fetch/pull remote for an explicit update branch.
+
+    Production forks may track their custom branch on a remote other than
+    ``origin`` (for example ``oconselho/whatsapp-secretary`` while ``origin``
+    points at the official upstream).  The historical updater hardcoded
+    ``origin`` and could therefore fail or switch to the wrong tree.  Honor
+    Git's branch tracking remote for non-main branches; retain ``origin`` as
+    the safe fallback when no tracking remote is configured.
+    """
+    if branch == "main":
+        return "origin"
+    try:
+        result = subprocess.run(
+            git_cmd + ["config", "--get", f"branch.{branch}.remote"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+        )
+        remote = result.stdout.strip()
+        if result.returncode == 0 and remote and remote != ".":
+            return remote
+    except Exception:
+        pass
+    return "origin"
+
+
+def _reject_implicit_main_on_custom_branch(args) -> None:
+    """Fail closed instead of silently switching a custom checkout to main."""
+    if getattr(args, "branch", None):
+        return
+    git_dir = PROJECT_ROOT / ".git"
+    if not git_dir.exists():
+        return
+    result = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    current_branch = result.stdout.strip()
+    if result.returncode == 0 and current_branch not in {"", "HEAD", "main"}:
+        print(
+            f"✗ Refusing implicit update from custom branch '{current_branch}'."
+        )
+        print(f"  Re-run with --branch {current_branch} after reviewing its remote.")
+        raise SystemExit(2)
+
+
 def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     """Implement ``hermes update --check``: fetch and report without installing.
 
@@ -8451,16 +8500,17 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
             upstream_exists = True
             compare_branch = f"upstream/{branch}"
     else:
-        # Non-default branch: compare against origin/<branch> directly.
-        print("→ Fetching from origin...")
+        # Non-default branches use their Git tracking remote when available.
+        update_remote = _resolve_update_remote(git_cmd, PROJECT_ROOT, branch)
+        print(f"→ Fetching from {update_remote}...")
         fetch_result = subprocess.run(
-            git_cmd + ["fetch"] + depth_args + ["origin", branch],
+            git_cmd + ["fetch"] + depth_args + [update_remote, branch],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
         )
         upstream_exists = False
-        compare_branch = f"origin/{branch}"
+        compare_branch = f"{update_remote}/{branch}"
 
     if fetch_result.returncode != 0:
         stderr = fetch_result.stderr.strip()
@@ -9274,6 +9324,7 @@ def cmd_update(args):
         sys.exit(1)
 
     if getattr(args, "check", False):
+        _reject_implicit_main_on_custom_branch(args)
         # --check honors --branch so the "any new commits?" answer matches
         # what a subsequent `hermes update --branch=<x>` would actually pull.
         branch = _resolve_update_branch(args)
@@ -9406,6 +9457,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 print(_format_concurrent_instances_message(concurrent, scripts_dir))
                 sys.exit(2)
 
+    _reject_implicit_main_on_custom_branch(args)
+
     # Pre-update backup — runs before any git/file mutation so users can
     # always roll back to the exact state they had before this update.
     _run_pre_update_backup(args)
@@ -9513,10 +9566,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # minutes on a non-single-branch checkout. Fetch only what we update
         # against.
         branch = _resolve_update_branch(args)
+        update_remote = _resolve_update_remote(git_cmd, PROJECT_ROOT, branch)
 
-        print("→ Fetching updates...")
+        print(f"→ Fetching updates from {update_remote}...")
         fetch_result = subprocess.run(
-            git_cmd + ["fetch", "origin", branch],
+            git_cmd + ["fetch", update_remote, branch],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
@@ -9570,11 +9624,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
             )
             if checkout_result.returncode != 0:
                 # Local checkout doesn't have this branch yet. Try to set
-                # it up as a tracking branch of origin/<branch>. This is
-                # the common case when the requested branch exists upstream
-                # but was never checked out locally.
+                # it up as a tracking branch of the resolved remote branch.
+                # This is the common case when the requested branch exists
+                # remotely but was never checked out locally.
                 track_result = subprocess.run(
-                    git_cmd + ["checkout", "-B", branch, f"origin/{branch}"],
+                    git_cmd + ["checkout", "-B", branch, f"{update_remote}/{branch}"],
                     cwd=PROJECT_ROOT,
                     capture_output=True,
                     text=True,
@@ -9590,7 +9644,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                             prompt_user=False,
                             input_fn=gw_input_fn,
                         )
-                    print(f"✗ Branch '{branch}' does not exist locally or on origin.")
+                    print(f"✗ Branch '{branch}' does not exist locally or on {update_remote}.")
                     if track_result.stderr.strip():
                         print(f"  {track_result.stderr.strip().splitlines()[0]}")
                     sys.exit(1)
@@ -9605,7 +9659,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         # Check if there are updates
         result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
+            git_cmd + ["rev-list", f"HEAD..{update_remote}/{branch}", "--count"],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
@@ -9720,7 +9774,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         pre_pull_sha = _capture_head_sha(git_cmd, PROJECT_ROOT)
         try:
             pull_result = subprocess.run(
-                git_cmd + ["pull", "--ff-only", "origin", branch],
+                git_cmd + ["pull", "--ff-only", update_remote, branch],
                 cwd=PROJECT_ROOT,
                 capture_output=True,
                 text=True,
@@ -9733,17 +9787,17 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
                 )
                 reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                    git_cmd + ["reset", "--hard", f"{update_remote}/{branch}"],
                     cwd=PROJECT_ROOT,
                     capture_output=True,
                     text=True,
                 )
                 if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
+                    print(f"✗ Failed to reset to {update_remote}/{branch}.")
                     if reset_result.stderr.strip():
                         print(f"  {reset_result.stderr.strip()}")
                     print(
-                        f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                        f"  Try manually: git fetch {update_remote} {branch} && git reset --hard {update_remote}/{branch}"
                     )
                     sys.exit(1)
 
