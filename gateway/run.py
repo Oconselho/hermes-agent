@@ -469,11 +469,21 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
         # ── [SILENCIOSO]: model chose to stay silent (conversation already resolved)
         if cleaned.strip().startswith("[SILENCIOSO]"):
             return None
+        # ── Effectively-empty reply: strip invisible format chars and odd
+        # unicode spaces (the same classes the WhatsApp transport strips on
+        # outbound). If nothing visible remains, stay silent — the bridge
+        # rejects empty messages ("chatId and message are required") and the
+        # upstream plain-text fallback would then leak a technical marker to
+        # the contact (incident 20/jul/2026).
+        _visible = re.sub(r"[\u200b\u2060\u2063\ufeff]", "", cleaned)
+        _visible = re.sub(r"[\u00a0\u1680\u180e\u2000-\u200a\u202f\u205f\u3000]", " ", _visible)
+        if not _visible.strip():
+            return None  # SILENCE: nothing visible to send
         # Block leaked tool names (colon format: "terminal: cmd")
         if re.search(r"(?im)^\s*(terminal|execute_code|search_files|read_file|browser_[a-z_]+|skill_view|session_search)\s*:", cleaned):
             return "Recebi sua mensagem. O Dr. Victor verificará assim que possível."
         # Block internal error messages — suppress entirely, no reply
-        if re.search(r"(?i)no reply|empty content|after retries|fallback providers|all.*retries.*exhausted|⚠️ No reply|⚠️ Processing", cleaned):
+        if re.search(r"(?i)no reply|empty content|after retries|fallback providers|all.*retries.*exhausted|⚠️ No reply|⚠️ Processing|response formatting failed", cleaned):
             return None  # SILENCE: don't send anything to WhatsApp
         # Block leaked XML tool call blocks (DeepSeek hallucination)
         # Tier 1: Hermes native tool XML wrappers

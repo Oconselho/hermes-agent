@@ -4151,6 +4151,16 @@ class BasePlatformAdapter(ABC):
 
         # Non-network / post-retry formatting failure: try plain text as fallback
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
+        if self.platform == Platform.WHATSAPP:
+            # Secretary hardening (20/jul/2026): the plain-text fallback
+            # prepends the technical marker "(Response formatting failed,
+            # plain text:)" which must never reach WhatsApp contacts.
+            # Fail silently (log-only) and return the original failure.
+            logger.warning(
+                "[%s] Plain-text fallback suppressed for WhatsApp — silence instead of technical marker",
+                self.name,
+            )
+            return result
         fallback_result = await self.send(
             chat_id=chat_id,
             content=f"(Response formatting failed, plain text:)\n\n{content[:3500]}",
