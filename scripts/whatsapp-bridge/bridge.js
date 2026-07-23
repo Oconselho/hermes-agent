@@ -798,6 +798,29 @@ app.get('/chat/:id', async (req, res) => {
   });
 });
 
+// List groups for local, read-only operator discovery. The bridge binds only
+// to loopback, and this endpoint does not expose message content or provide
+// any outbound group action.
+app.get('/groups', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  try {
+    const groups = await sock.groupFetchAllParticipating();
+    const result = Object.values(groups || {})
+      .map((group) => ({
+        id: group.id,
+        name: group.subject || group.name || group.id,
+        size: Array.isArray(group.participants) ? group.participants.length : 0,
+      }))
+      .filter((group) => typeof group.id === 'string' && group.id.endsWith('@g.us'))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    return res.json({ groups: result });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // Health check
 app.get('/health', (req, res) => {
   res.json({

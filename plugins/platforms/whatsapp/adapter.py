@@ -32,6 +32,11 @@ from hermes_constants import (
     get_hermes_dir,
     with_hermes_node_path,
 )
+from gateway.whatsapp_passive_monitor import (
+    PassiveMessageStore,
+    is_monitored_group,
+    normalize_jid,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -440,6 +445,30 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         )
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+
+        passive_config = config.extra.get("passive_monitor") or {}
+        if not isinstance(passive_config, dict):
+            passive_config = {}
+        raw_groups = passive_config.get("group_jids") or passive_config.get("group_jid") or []
+        if isinstance(raw_groups, str):
+            raw_groups = [raw_groups]
+        self._passive_monitor_group_jids = {
+            normalize_jid(item)
+            for item in raw_groups
+            if normalize_jid(item).endswith("@g.us")
+        }
+        self._passive_store = None
+        if self._passive_monitor_group_jids:
+            storage_dir = passive_config.get("storage_dir") or get_hermes_dir(
+                "whatsapp/passive-monitor", "whatsapp/passive-monitor"
+            )
+            self._passive_store = PassiveMessageStore(
+                storage_dir,
+                max_attachment_bytes=int(
+                    passive_config.get("max_attachment_bytes", 32 * 1024 * 1024)
+                ),
+                media_path_validator=_is_allowed_bridge_path,
+            )
 
     def _coerce_float_extra(self, key: str, default: float) -> float:
         """Read a float from ``config.extra``, guarding against bad/non-finite values.
@@ -1229,6 +1258,21 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         
         return {"name": chat_id, "type": "dm"}
     
+    async def _capture_passive_message(self, data: Dict[str, Any]) -> bool:
+        """Store an allowlisted group event without dispatching it anywhere."""
+        groups = getattr(self, "_passive_monitor_group_jids", set())
+        store = getattr(self, "_passive_store", None)
+        if not store or not is_monitored_group(data, groups):
+            return False
+        event = await self._build_message_event(data, bypass_policy=True)
+        if event is None:
+            return False
+        group_jid = normalize_jid(data.get("chatId"))
+        captured = store.capture(event, monitored_group_jid=group_jid)
+        if captured:
+            logger.info("[%s] Captured passive WhatsApp group message %s", self.name, event.message_id)
+        return captured
+
     async def _poll_messages(self) -> None:
         """Poll the bridge for incoming messages."""
         import aiohttp
@@ -1248,6 +1292,17 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     if resp.status == 200:
                         messages = await resp.json()
                         for msg_data in messages:
+                            if is_monitored_group(
+                                msg_data,
+                                getattr(self, "_passive_monitor_group_jids", set()),
+                            ):
+                                try:
+                                    await self._capture_passive_message(msg_data)
+                                except Exception:
+                                    logger.exception("[%s] Passive WhatsApp capture failed", self.name)
+                                # A monitored group is never sent through the
+                                # normal agent path, even if capture fails.
+                                continue
                             event = await self._build_message_event(msg_data)
                             if event:
                                 if event.message_type == MessageType.TEXT:
@@ -1326,10 +1381,15 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             if self._pending_text_batch_tasks.get(key) is current_task:
                 self._pending_text_batch_tasks.pop(key, None)
 
-    async def _build_message_event(self, data: Dict[str, Any]) -> Optional[MessageEvent]:
+    async def _build_message_event(
+        self,
+        data: Dict[str, Any],
+        *,
+        bypass_policy: bool = False,
+    ) -> Optional[MessageEvent]:
         """Build a MessageEvent from bridge message data, downloading images to cache."""
         try:
-            if not self._should_process_message(data):
+            if not bypass_policy and not self._should_process_message(data):
                 return None
 
             # Determine message type
