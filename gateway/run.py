@@ -128,13 +128,13 @@ _WHATSAPP_REPEAT_STOPWORDS = {
 _WHATSAPP_NEW_REQUEST_RE = re.compile(
     r"\?|\b(?:como|qual|quais|quanto|quando|onde|quem|posso|pode|tem|há|ha|"
     r"preciso|quero|gostaria|poderia|me informe|me diga|saber|verificar|"
-    r"agendar|agendo|marcar|remarcar|cancelar|enviar|envio|passar|ligar|"
+    r"manda|mandar|solicito|necessito|agendar|agendo|marcar|remarcar|cancelar|enviar|envio|passar|ligar|"
     r"responder)\b",
     re.IGNORECASE,
 )
 _WHATSAPP_NEW_CONTEXT_RE = re.compile(
     r"\b(?:nao|faltou|faltando|esqueci|errad[oa]|correc|corrig|"
-    r"tambem|alem|outr[oa]|nov[oa]|mas|porem|urgente|emergencia|"
+    r"tambem|alem|outr[oa]|nov[oa]|mas|porem|urgenc(?:ia|ias)|urgente|emergencia|"
     r"dor|desmaio|falta de ar|convuls|192)\b",
     re.IGNORECASE,
 )
@@ -230,11 +230,23 @@ def _should_suppress_whatsapp_followup(
         window = float(os.getenv("HERMES_WHATSAPP_REPEAT_SUPPRESSION_SECONDS", ""))
     except (TypeError, ValueError):
         window = _WHATSAPP_SECRETARY_REPEAT_WINDOW_SECS
-    if window <= 0:
+    if not math.isfinite(window) or window <= 0:
         window = _WHATSAPP_SECRETARY_REPEAT_WINDOW_SECS
+    window = min(window, _WHATSAPP_SECRETARY_REPEAT_WINDOW_SECS)
     if not assistant_timestamp or current_timestamp < assistant_timestamp:
         return False
     if current_timestamp - assistant_timestamp > window:
+        return False
+
+    # A question, correction, new request, or urgent context must always reach
+    # the agent, even when its normalized text overlaps the prior user turn.
+    if _WHATSAPP_NEW_REQUEST_RE.search(current_normalized):
+        return False
+    if _WHATSAPP_NEW_CONTEXT_RE.search(current_normalized):
+        return False
+
+    response_topic = _whatsapp_response_topic(_whatsapp_history_text(assistant))
+    if response_topic not in {"acknowledgement", "routing"}:
         return False
 
     previous_user_key = ""
@@ -251,18 +263,11 @@ def _should_suppress_whatsapp_followup(
         if overlap >= 0.80 and len(current_tokens) >= 2:
             return True
 
-    response_topic = _whatsapp_response_topic(_whatsapp_history_text(assistant))
-    if response_topic not in {"acknowledgement", "routing", "other"}:
-        return False
-    if _WHATSAPP_NEW_REQUEST_RE.search(current_normalized):
-        return False
-    if _WHATSAPP_NEW_CONTEXT_RE.search(current_normalized):
-        return False
     if not current_key or _WHATSAPP_ACK_RE.fullmatch(current_normalized.strip()):
         return True
     if _WHATSAPP_ATTACHMENT_FRAGMENT_RE.search(current_normalized):
         return True
-    return len(current_key.split()) <= 20
+    return False
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
