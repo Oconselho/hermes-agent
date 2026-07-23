@@ -41,6 +41,7 @@ import tempfile
 import threading
 import time
 import sqlite3
+import unicodedata
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
@@ -110,6 +111,158 @@ def _whatsapp_cooldown_until_seconds(value: Any) -> float:
 def _whatsapp_silent_agent_result() -> Dict[str, Any]:
     """Agent-result shape recognized by gateway delivery as intentional silence."""
     return {"final_response": "SILENT", "messages": [], "api_calls": 0}
+
+
+# A WhatsApp patient often sends an attachment, its caption, and a short
+# clarification as separate events.  The model should not be forced to emit a
+# new acknowledgement for every event when the previous acknowledgement
+# already covers the same request.  This is deliberately a short, bounded
+# window: a genuinely new question is never suppressed by this helper.
+_WHATSAPP_SECRETARY_REPEAT_WINDOW_SECS = 120.0
+_WHATSAPP_REPEAT_STOPWORDS = {
+    "a", "as", "ao", "aos", "da", "das", "de", "do", "dos", "e", "em",
+    "essa", "esse", "esta", "este", "eu", "foi", "isso", "ja", "me",
+    "na", "nas", "no", "nos", "o", "os", "para", "por", "que", "se",
+    "um", "uma", "voce", "vocês", "voces", "com", "sem", "sobre",
+}
+_WHATSAPP_NEW_REQUEST_RE = re.compile(
+    r"\?|\b(?:como|qual|quais|quanto|quando|onde|quem|posso|pode|tem|há|ha|"
+    r"preciso|quero|gostaria|poderia|me informe|me diga|saber|verificar|"
+    r"agendar|agendo|marcar|remarcar|cancelar|enviar|envio|passar|ligar|"
+    r"responder)\b",
+    re.IGNORECASE,
+)
+_WHATSAPP_NEW_CONTEXT_RE = re.compile(
+    r"\b(?:nao|faltou|faltando|esqueci|errad[oa]|correc|corrig|"
+    r"tambem|alem|outr[oa]|nov[oa]|mas|porem|urgente|emergencia|"
+    r"dor|desmaio|falta de ar|convuls|192)\b",
+    re.IGNORECASE,
+)
+_WHATSAPP_ATTACHMENT_FRAGMENT_RE = re.compile(
+    r"(?:document|arquivo|anexo|imagem|foto|comprovante|pdf|recebid[oa]|"
+    r"screenshot|segue|enviei)",
+    re.IGNORECASE,
+)
+_WHATSAPP_ACK_RE = re.compile(
+    r"^(?:ok|obrigad[oa]|valeu|beleza|certo|combinado|perfeito|entendi|"
+    r"joia|👍|até mais|ate mais|abraço|abraco|bom dia|boa tarde|boa noite)[!. ]*$",
+    re.IGNORECASE,
+)
+
+
+def _whatsapp_dedup_text(text: Any) -> str:
+    """Normalize repeated WhatsApp content without changing user-visible text."""
+    if text is None:
+        return ""
+    value = str(text)
+    value = re.sub(
+        r"\[[^\]]*(?:document|image|screenshot|arquivo|anexo|received|saved at)[^\]]*\]",
+        " ", value, flags=re.IGNORECASE,
+    )
+    value = re.sub(r"/(?:home|tmp|var)/\S+", " ", value, flags=re.IGNORECASE)
+    value = unicodedata.normalize("NFKD", value)
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    value = re.sub(r"[^a-zA-Z0-9?]+", " ", value).lower().strip()
+    tokens = [token for token in value.split() if token not in _WHATSAPP_REPEAT_STOPWORDS]
+    return " ".join(tokens)
+
+
+def _whatsapp_history_text(message: Any) -> str:
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content", "")
+    if isinstance(content, list):
+        content = " ".join(
+            item.get("text", "") if isinstance(item, dict) else str(item)
+            for item in content
+        )
+    return str(content or "")
+
+
+def _whatsapp_history_timestamp(message: Any) -> float:
+    if not isinstance(message, dict):
+        return 0.0
+    value = message.get("timestamp")
+    if isinstance(value, datetime):
+        return value.timestamp()
+    return _coerce_unix_timestamp_seconds(value)
+
+
+def _whatsapp_response_topic(text: str) -> str:
+    normalized = _whatsapp_dedup_text(text)
+    if re.search(r"\b(?:192|emergencia|desmaio|convuls|dor no peito|falta de ar)\b", normalized):
+        return "urgent"
+    if re.search(r"\b(?:recepcao|71996691002|agend|horario|cpf)\b", normalized):
+        return "routing"
+    if re.search(r"\b(?:recebi|recebemos|documento|comprovante|verificar|analisar|retorno|mensagem|dr victor)\b", normalized):
+        return "acknowledgement"
+    return "other"
+
+
+def _should_suppress_whatsapp_followup(
+    inbound_text: Any,
+    history: List[Dict[str, Any]],
+    *,
+    now: Optional[float] = None,
+) -> bool:
+    """Suppress only a recent follow-up already covered by the visible reply."""
+    if not history:
+        return False
+    current_raw = str(inbound_text or "")
+    current_key = _whatsapp_dedup_text(current_raw)
+    current_normalized = unicodedata.normalize("NFKD", current_raw)
+    current_normalized = "".join(
+        ch for ch in current_normalized if not unicodedata.combining(ch)
+    ).lower()
+
+    assistant_index = None
+    for index in range(len(history) - 1, -1, -1):
+        if history[index].get("role") == "assistant" and _whatsapp_history_text(history[index]).strip():
+            assistant_index = index
+            break
+    if assistant_index is None:
+        return False
+
+    assistant = history[assistant_index]
+    assistant_timestamp = _whatsapp_history_timestamp(assistant)
+    current_timestamp = time.time() if now is None else float(now)
+    try:
+        window = float(os.getenv("HERMES_WHATSAPP_REPEAT_SUPPRESSION_SECONDS", ""))
+    except (TypeError, ValueError):
+        window = _WHATSAPP_SECRETARY_REPEAT_WINDOW_SECS
+    if window <= 0:
+        window = _WHATSAPP_SECRETARY_REPEAT_WINDOW_SECS
+    if not assistant_timestamp or current_timestamp < assistant_timestamp:
+        return False
+    if current_timestamp - assistant_timestamp > window:
+        return False
+
+    previous_user_key = ""
+    for index in range(assistant_index - 1, -1, -1):
+        if history[index].get("role") == "user":
+            previous_user_key = _whatsapp_dedup_text(_whatsapp_history_text(history[index]))
+            break
+    if current_key and previous_user_key == current_key:
+        return True
+    if current_key and previous_user_key:
+        current_tokens = set(current_key.split())
+        previous_tokens = set(previous_user_key.split())
+        overlap = len(current_tokens & previous_tokens) / max(1, len(current_tokens | previous_tokens))
+        if overlap >= 0.80 and len(current_tokens) >= 2:
+            return True
+
+    response_topic = _whatsapp_response_topic(_whatsapp_history_text(assistant))
+    if response_topic not in {"acknowledgement", "routing", "other"}:
+        return False
+    if _WHATSAPP_NEW_REQUEST_RE.search(current_normalized):
+        return False
+    if _WHATSAPP_NEW_CONTEXT_RE.search(current_normalized):
+        return False
+    if not current_key or _WHATSAPP_ACK_RE.fullmatch(current_normalized.strip()):
+        return True
+    if _WHATSAPP_ATTACHMENT_FRAGMENT_RE.search(current_normalized):
+        return True
+    return len(current_key.split()) <= 20
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
@@ -11195,10 +11348,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Load conversation history from transcript
         history = self.session_store.load_transcript(session_entry.session_id)
-        
+
+        # Suppress a repeated attachment/caption/confirmation only when the
+        # recent visible secretary reply already covered the same request.
+        # Explicit questions, corrections, new requests, and urgency pass
+        # through to the model.
+        if (
+            getattr(source.platform, "value", source.platform) == "whatsapp"
+            and not str(event.text or "").lstrip().startswith("/")
+            and _should_suppress_whatsapp_followup(event.text, history)
+        ):
+            logger.info(
+                "[WhatsApp] Suppressing follow-up already covered by recent "
+                "secretary reply for session %s",
+                session_key,
+            )
+            return ""
+
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
-        #
+
         # Long-lived gateway sessions can accumulate enough history that
         # every new message rehydrates an oversized transcript, causing
         # repeated truncation/context failures.  Detect this early and
@@ -18612,7 +18781,7 @@ Agora são {_brt_str} em Salvador/BA (UTC-3).
 TOM DA SECRETÁRIA — você é uma pessoa real, calorosa e educada:
 - Seja SEMPRE gentil, acolhedora e humana. Nada de linguagem robótica ou fria.
 - Use um tom de voz natural, como se estivesse conversando pessoalmente.
-- Varie suas palavras — nunca soe como uma máquina repetindo o mesmo texto.
+- Varie suas palavras apenas quando houver uma nova resposta necessária — nunca soe como uma máquina repetindo o mesmo texto.
 - Demonstre empatia: as pessoas que entram em contato merecem respeito e atenção.
 - Seja breve mas calorosa. Uma mensagem curta pode ser acolhedora ao mesmo tempo.
 - Pense em como uma secretária humana de verdade responderia: educada, prestativa, direta.
@@ -18761,8 +18930,11 @@ REGRAS ABSOLUTAS:
   ou qualquer frase que sugira que a consulta foi efetivamente agendada.
 - NUNCA use emoji, markdown ou formatação.
 - NUNCA explique suas decisões ou mostre sua classificação.
-- Varie SEMPRE: o mesmo contato não pode receber a mesma mensagem duas vezes.
-- NUNCA responda com APENAS saudação (ex: \"Bom dia!\") — sempre inclua identificação.
+- Não reformule uma resposta já enviada apenas para variar o texto.
+- Mensagens consecutivas do mesmo assunto devem ser tratadas como um único bloco.
+- Quando a solicitação já foi contemplada pela resposta anterior, use [SILENCIOSO].
+- Só responda novamente se houver pergunta, correção, item faltante, pedido novo ou mudança real de contexto.
+- NUNCA responda com APENAS saudação (ex: \"Bom dia!\") — sempre inclua identificação quando uma resposta for necessária.
 - SE A CONVERSA JÁ FOI RESOLVIDA (pergunta→resposta→agradecimento) e a nova mensagem for apenas \"ok\", \"obrigado\", \"beleza\", \"combinado\", \"👍\", \"certo\", \"até mais\", \"abraço\", \"boa tarde\", \"bom dia\", \"boa noite\" → NÃO RESPONDA. Silêncio total. A conversa acabou.
 - REGRA ANTI-BOT: se o contato parecer um robô (mensagens repetitivas, respostas genéricas, saudação automática, menção a "Labchecap", "MarIA", "Françoise", "atendimento automático", "programa de emagrecimento") → responda UMA ÚNICA VEZ com categoria C ou D e DEPOIS DISSO NUNCA MAIS RESPONDA. Silêncio absoluto após a primeira resposta. NUNCA entre em loop com outro bot.
 {_feegow_context}"""
