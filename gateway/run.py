@@ -128,12 +128,12 @@ _WHATSAPP_REPEAT_STOPWORDS = {
 _WHATSAPP_NEW_REQUEST_RE = re.compile(
     r"\?|\b(?:como|qual|quais|quanto|quando|onde|quem|posso|pode|tem|há|ha|"
     r"preciso|quero|gostaria|poderia|me informe|me diga|saber|verificar|"
-    r"manda|mandar|solicito|necessito|agendar|agendo|marcar|remarcar|cancelar|enviar|envio|passar|ligar|"
+    r"manda|mandar|solicito|necessito|desej\w*|ajud\w*|agendar|agendo|marcar|remarcar|cancelar|enviar|envio|passar|ligar|"
     r"responder)\b",
     re.IGNORECASE,
 )
 _WHATSAPP_NEW_CONTEXT_RE = re.compile(
-    r"\b(?:nao|faltou|faltando|esqueci|errad[oa]|correc|corrig|"
+    r"\b(?:nao|faltou|faltando|esqueci|errad[oa]|correc\w*|corrig\w*|"
     r"tambem|alem|outr[oa]|nov[oa]|mas|porem|urgenc(?:ia|ias)|urgente|emergencia|"
     r"dor|desmaio|falta de ar|convuls|192)\b",
     re.IGNORECASE,

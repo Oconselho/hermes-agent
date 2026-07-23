@@ -1,5 +1,7 @@
 """Regression tests for WhatsApp secretary semantic duplicate suppression."""
 
+import pytest
+
 from gateway.run import _should_suppress_whatsapp_followup
 
 
@@ -69,6 +71,27 @@ def test_new_correction_or_missing_item_is_not_suppressed():
     assert _should_suppress_whatsapp_followup(
         "Faltou o pedido médico, podem verificar?", history, now=110.0
     ) is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Corrigindo: enviei o comprovante",
+        "Correção: enviei o comprovante",
+        "Desejo o comprovante",
+        "Me ajuda com o comprovante",
+    ],
+)
+def test_corrections_and_new_intents_are_not_suppressed(text):
+    history = _history(
+        _user("Enviei o comprovante", 100.0),
+        _assistant(
+            "Recebi o documento. O Dr. Victor vai verificar sua mensagem em breve.",
+            105.0,
+        ),
+    )
+
+    assert _should_suppress_whatsapp_followup(text, history, now=110.0) is False
 
 
 def test_urgency_is_not_suppressed_after_recent_ack():
