@@ -18,6 +18,55 @@ export function normalizeWhatsAppId(value) {
   return String(value).replace(':', '@');
 }
 
+function stripDeviceSuffix(value) {
+  const text = String(value || '').trim();
+  const at = text.indexOf('@');
+  if (at < 1) return '';
+  const local = text.slice(0, at).split(':', 1)[0];
+  const domain = text.slice(at + 1);
+  return local && domain ? `${local}@${domain}` : '';
+}
+
+export function resolveOutboundChatId(chatId, user) {
+  const target = String(chatId || '').trim();
+  if (!target || !user || target.endsWith('@g.us') || target === 'status@broadcast') {
+    return target;
+  }
+
+  const ownPhoneJid = stripDeviceSuffix(user.id);
+  const ownLidJid = stripDeviceSuffix(user.lid);
+  const normalizedTarget = stripDeviceSuffix(target);
+  if (ownPhoneJid && ownLidJid && normalizedTarget === ownPhoneJid) {
+    return ownLidJid;
+  }
+  return target;
+}
+
+export async function sendTextChunks({
+  requestedChatId,
+  user,
+  chunks,
+  send,
+  trackSent = () => {},
+  sleep = async () => {},
+  chunkDelayMs = 0,
+}) {
+  const resolvedChatId = resolveOutboundChatId(requestedChatId, user);
+  const messageIds = [];
+  const outboundChunks = Array.isArray(chunks) ? chunks : [];
+
+  for (let i = 0; i < outboundChunks.length; i += 1) {
+    const sent = await send(resolvedChatId, { text: outboundChunks[i] });
+    trackSent(sent);
+    if (sent?.key?.id) messageIds.push(sent.key.id);
+    if (chunkDelayMs > 0 && i < outboundChunks.length - 1) {
+      await sleep(chunkDelayMs);
+    }
+  }
+
+  return { resolvedChatId, messageIds };
+}
+
 export function getMessageContent(msg) {
   const content = msg?.message || {};
   if (content.ephemeralMessage?.message) return content.ephemeralMessage.message;

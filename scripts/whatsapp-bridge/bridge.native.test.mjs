@@ -21,7 +21,66 @@ import {
   mediaPayloadForFile,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
+  resolveOutboundChatId,
+  sendTextChunks,
 } from './bridge_helpers.js';
+
+// -- self-chat LID routing -------------------------------------------------
+{
+  const ownIdentity = {
+    id: '557188048263:92@s.whatsapp.net',
+    lid: '118347958063114:92@lid',
+  };
+
+  assert.equal(
+    resolveOutboundChatId('557188048263@s.whatsapp.net', ownIdentity),
+    '118347958063114@lid',
+  );
+  assert.equal(
+    resolveOutboundChatId('557188048263:92@s.whatsapp.net', ownIdentity),
+    '118347958063114@lid',
+  );
+  assert.equal(
+    resolveOutboundChatId('118347958063114@lid', ownIdentity),
+    '118347958063114@lid',
+  );
+  assert.equal(
+    resolveOutboundChatId('557188048263@s.whatsapp.net', { id: ownIdentity.id }),
+    '557188048263@s.whatsapp.net',
+  );
+  assert.equal(
+    resolveOutboundChatId('5511999999999@s.whatsapp.net', ownIdentity),
+    '5511999999999@s.whatsapp.net',
+  );
+  assert.equal(
+    resolveOutboundChatId('120363012345678901@g.us', ownIdentity),
+    '120363012345678901@g.us',
+  );
+  console.log('  ✓ self phone destination resolves to active LID while explicit LID, missing LID, external, and group targets stay unchanged');
+}
+
+// -- /send outbound target integration ------------------------------------
+{
+  const calls = [];
+  const result = await sendTextChunks({
+    requestedChatId: '557188048263@s.whatsapp.net',
+    user: {
+      id: '557188048263:92@s.whatsapp.net',
+      lid: '118347958063114:92@lid',
+    },
+    chunks: ['digest chunk'],
+    send: async (chatId, payload) => {
+      calls.push({ chatId, payload });
+      return { key: { id: 'message-1' } };
+    },
+    trackSent: () => {},
+    sleep: async () => {},
+  });
+  assert.equal(result.resolvedChatId, '118347958063114@lid');
+  assert.deepEqual(calls, [{ chatId: '118347958063114@lid', payload: { text: 'digest chunk' } }]);
+  assert.deepEqual(result.messageIds, ['message-1']);
+  console.log('  ✓ /send integration sends chunks to the resolved LID and returns audit IDs');
+}
 
 // -- quoted outbound text -------------------------------------------------
 {

@@ -30,6 +30,7 @@ import { execSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
+import { resolveOutboundChatId, sendTextChunks } from './bridge_helpers.js';
 
 // Parse CLI args
 const args = process.argv.slice(2);
@@ -598,26 +599,30 @@ app.post('/send', async (req, res) => {
     return res.status(400).json({ error: 'chatId and message are required' });
   }
 
+  const resolvedChatId = resolveOutboundChatId(chatId, sock.user);
+
   // If this is a reply from the owner (Dr. Victor), record the timestamp
   // so the cooldown blocks the secretary from responding for 30 min.
   if (ownerReply) {
-    recordOwnerReply(chatId, 'send_endpoint_owner_reply');
+    recordOwnerReply(resolvedChatId, 'send_endpoint_owner_reply');
   }
 
   try {
     const chunks = splitLongMessage(formatOutgoingMessage(message));
-    const messageIds = [];
-    for (let i = 0; i < chunks.length; i += 1) {
-      const sent = await sendWithTimeout(chatId, { text: chunks[i] });
-      trackSentMessageId(sent);
-      if (sent?.key?.id) messageIds.push(sent.key.id);
-      if (chunks.length > 1 && i < chunks.length - 1) {
-        await sleep(CHUNK_DELAY_MS);
-      }
-    }
+    const { resolvedChatId: sentChatId, messageIds } = await sendTextChunks({
+      requestedChatId: chatId,
+      user: sock.user,
+      chunks,
+      send: sendWithTimeout,
+      trackSent: trackSentMessageId,
+      sleep,
+      chunkDelayMs: CHUNK_DELAY_MS,
+    });
 
     res.json({
       success: true,
+      requestedChatId: chatId,
+      resolvedChatId: sentChatId,
       messageId: messageIds[messageIds.length - 1],
       messageIds,
     });
