@@ -182,3 +182,79 @@ def test_short_new_request_is_not_suppressed_by_fallback():
     assert _should_suppress_whatsapp_followup(
         "Me manda o endereço", history, now=110.0
     ) is False
+
+
+def test_near_duplicate_reply_is_rewritten_with_context_for_new_request():
+    from gateway.run import _whatsapp_redundant_response_fallback
+
+    history = _history(
+        _user(
+            "É, entendo que agrega sim à farmácia! Para oferecer já agregado esse serviço, temos que estar alinhados com os agendamentos",
+            100.0,
+        ),
+        _assistant(
+            "Boa tarde! Aqui é a assistente do Dr. Victor Almeida. Obrigada pelo contato. O Dr. Victor verificará sua mensagem e retornará assim que possível. Até mais!",
+            105.0,
+        ),
+    )
+
+    result = _whatsapp_redundant_response_fallback(
+        "Boa tarde! Aqui é a secretária do Dr. Victor Almeida. Obrigada pelo contato. O Dr. Victor verificará sua mensagem e retornará em breve. Tenha um bom dia!",
+        history,
+        current_text="Outra coisa: integrar as tabelas médicas com preços populares à telemedicina tem viabilidade?",
+        now=110.0,
+    )
+
+    assert result == (
+        "Entendi que você está avaliando integrar serviços/tabelas da farmácia "
+        "à telemedicina. Vou registrar esse ponto para o Dr. Victor avaliar "
+        "a viabilidade e retornar."
+    )
+
+
+def test_distinct_contextual_reply_is_preserved():
+    from gateway.run import _whatsapp_redundant_response_fallback
+
+    history = _history(
+        _user("Qual o valor da consulta?", 100.0),
+        _assistant("Recebi sua mensagem e encaminhei para a recepção.", 105.0),
+    )
+
+    candidate = "A recepção poderá informar o valor e as formas de atendimento."
+    assert _whatsapp_redundant_response_fallback(
+        candidate,
+        history,
+        current_text="Qual é o valor da consulta?",
+        now=110.0,
+    ) == candidate
+
+
+def test_contextual_fallback_does_not_reuse_stale_professional_topic():
+    from gateway.run import _whatsapp_redundant_response_fallback
+
+    history = _history(
+        _user("A farmácia quer integrar tabelas à telemedicina", 100.0),
+        _assistant(
+            "Obrigada pelo contato. O Dr. Victor verificará sua mensagem e retornará em breve.",
+            105.0,
+        ),
+    )
+
+    candidate = "Obrigada pelo contato. O Dr. Victor verificará sua mensagem e retornará assim que possível."
+    assert _whatsapp_redundant_response_fallback(
+        candidate,
+        history,
+        current_text="Outra dúvida: qual é o horário de atendimento?",
+        now=110.0,
+    ) == "Entendi o novo ponto da sua mensagem. Vou registrá-lo para o Dr. Victor avaliar e retornar."
+
+
+def test_secretary_prompt_allows_contextual_followups_without_forced_repetition():
+    from pathlib import Path
+    import gateway.run as run_module
+
+    prompt_source = Path(run_module.__file__).read_text(encoding="utf-8").lower()
+    assert "nunca responda perguntas. nunca dê informações além do template." not in prompt_source
+    assert "leia as mensagens recentes antes de responder" in prompt_source
+    assert "não repita automaticamente a saudação" in prompt_source
+    assert "não reformule uma resposta já enviada apenas para variar" in prompt_source

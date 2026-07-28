@@ -27,6 +27,7 @@ except ModuleNotFoundError:
 import asyncio
 import concurrent.futures
 import dataclasses
+from difflib import SequenceMatcher
 import inspect
 import json
 import logging
@@ -268,6 +269,96 @@ def _should_suppress_whatsapp_followup(
     if _WHATSAPP_ATTACHMENT_FRAGMENT_RE.search(current_normalized):
         return True
     return False
+
+
+_WHATSAPP_REDUNDANT_RESPONSE_WINDOW_SECS = 300.0
+_WHATSAPP_REDUNDANT_RESPONSE_SIMILARITY = 0.78
+
+
+def _whatsapp_response_similarity(left: Any, right: Any) -> float:
+    left_key = _whatsapp_dedup_text(left)
+    right_key = _whatsapp_dedup_text(right)
+    if not left_key or not right_key:
+        return 0.0
+    return SequenceMatcher(None, left_key, right_key).ratio()
+
+
+def _whatsapp_contextual_response_fallback(
+    current_text: Any,
+    *,
+    context_text: Any = "",
+) -> str:
+    """Return a safe, context-aware response when the model repeats its last reply."""
+    normalized = _whatsapp_dedup_text(current_text)
+    context_normalized = _whatsapp_dedup_text(context_text)
+    if (
+        re.search(r"\b(?:farmacia|farmacias)\b", normalized)
+        or (
+            re.search(r"\bfarmacia\b", context_normalized)
+            and re.search(r"\b(?:telemedicina|tabel\w*|agreg\w*|integr\w*)\b", normalized)
+        )
+    ):
+        return (
+            "Entendi que você está avaliando integrar serviços/tabelas da farmácia "
+            "à telemedicina. Vou registrar esse ponto para o Dr. Victor avaliar "
+            "a viabilidade e retornar."
+        )
+    if re.search(r"\b(?:viabilidad|viavel|agreg\w*|integr\w*|parcer\w*|servic\w*)\b", normalized):
+        return (
+            "Entendi que você está avaliando uma nova possibilidade de integração. "
+            "Vou registrar esse ponto para o Dr. Victor avaliar e retornar."
+        )
+    return (
+        "Entendi o novo ponto da sua mensagem. Vou registrá-lo para o Dr. Victor "
+        "avaliar e retornar."
+    )
+
+
+def _whatsapp_redundant_response_fallback(
+    candidate: Any,
+    history: List[Dict[str, Any]],
+    *,
+    current_text: Any,
+    now: Optional[float] = None,
+) -> str:
+    """Prevent a near-identical generic reply from being delivered twice."""
+    if not candidate or not history:
+        return candidate or ""
+
+    assistant = None
+    for message in reversed(history):
+        if message.get("role") == "assistant" and _whatsapp_history_text(message).strip():
+            assistant = message
+            break
+    if assistant is None:
+        return candidate
+
+    previous_text = _whatsapp_history_text(assistant)
+    previous_timestamp = _whatsapp_history_timestamp(assistant)
+    current_timestamp = time.time() if now is None else float(now)
+    if (
+        not previous_timestamp
+        or current_timestamp < previous_timestamp
+        or current_timestamp - previous_timestamp > _WHATSAPP_REDUNDANT_RESPONSE_WINDOW_SECS
+    ):
+        return candidate
+
+    previous_topic = _whatsapp_response_topic(previous_text)
+    candidate_topic = _whatsapp_response_topic(str(candidate))
+    if previous_topic != candidate_topic or previous_topic not in {"acknowledgement", "routing"}:
+        return candidate
+    if _whatsapp_response_similarity(previous_text, candidate) < _WHATSAPP_REDUNDANT_RESPONSE_SIMILARITY:
+        return candidate
+
+    _previous_user_text = ""
+    for message in reversed(history):
+        if message.get("role") == "user":
+            _previous_user_text = _whatsapp_history_text(message)
+            break
+    return _whatsapp_contextual_response_fallback(
+        current_text,
+        context_text=_previous_user_text,
+    )
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
@@ -12161,6 +12252,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     return None
 
+                if source.platform and source.platform.value == "whatsapp" and response:
+                    _original_response = response
+                    response = _whatsapp_redundant_response_fallback(
+                        response,
+                        history,
+                        current_text=message_text,
+                    )
+                    if response != _original_response:
+                        logger.warning(
+                            "[WhatsApp] Replaced near-duplicate generic reply with "
+                            "contextual fallback for %s",
+                            getattr(source, "chat_id", "?"),
+                        )
+                        if agent_result.get("agent_persisted", False):
+                            _rewrite_transcript = getattr(
+                                self.session_store,
+                                "replace_latest_assistant_content",
+                                None,
+                            )
+                            if callable(_rewrite_transcript) and not _rewrite_transcript(
+                                session_entry.session_id,
+                                _original_response,
+                                response,
+                            ):
+                                logger.warning(
+                                    "[WhatsApp] Could not align persisted assistant "
+                                    "reply with delivered fallback for %s",
+                                    getattr(source, "chat_id", "?"),
+                                )
+
                 # WhatsApp spam-protect: track "sem interesse" rejections.
                 # Cooldown triggers here (outbound) when the threshold is
                 # reached — not at inbound — so a patient's innocent follow-up
@@ -18791,20 +18912,21 @@ TOM DA SECRETÁRIA — você é uma pessoa real, calorosa e educada:
 - Seja breve mas calorosa. Uma mensagem curta pode ser acolhedora ao mesmo tempo.
 - Pense em como uma secretária humana de verdade responderia: educada, prestativa, direta.
 
-SAUDAÇÃO — SEMPRE comece com o cumprimento correto e se identifique:
+SAUDAÇÃO — no primeiro contato, comece com o cumprimento correto e se identifique:
 - Se o horário atual for antes de 12:00 → comece com "Bom dia"
 - Se for entre 12:00 e 18:00 → comece com "Boa tarde"
 - Se for após 18:00 → comece com "Boa noite"
-- SEMPRE se identifique de forma natural. Varie NATURALMENTE entre:
+- No primeiro contato, identifique-se de forma natural. Nos turnos seguintes, não repita automaticamente a identificação:
   "Aqui é a secretária do Dr. Victor Almeida."
   "Sou a secretária do Dr. Victor Almeida."
   "Aqui é a assistente do Dr. Victor."
   "Sou a assistente do Dr. Victor Almeida."
-- Varie também o corpo da mensagem entre 2-3 formulações equivalentes. NUNCA repita exatamente a mesma frase duas vezes seguidas.
+- Não varie uma resposta apenas para parecer diferente. Quando houver novo conteúdo, responda ao ponto concreto da mensagem atual.
 Endereço: CEO Salvador Shopping, Torre Londres, Sala 1616.
 Recepção: WhatsApp 71996691002.
 
-CLASSIFICAÇÃO DO CONTATO — identifique UMA categoria e responda com o template:
+CLASSIFICAÇÃO DO CONTATO — identifique UMA categoria. Use o template como base no primeiro contato;
+em continuações, use o contexto e responda ao ponto novo sem reiniciar o texto:
 
 A) PACIENTE — pedindo informação sobre consulta, agendamento, exame, receita, relatório,
    valor, convênio, endereço, resultado, sintoma, tratamento ou qualquer dúvida médica.
@@ -18841,6 +18963,9 @@ D) PROFISSIONAL — contato comercial COM relação existente: gerente de banco 
    ➤ TEMPLATE (profissional e cordial):
       "[Saudação]! [Identificação]. Obrigada pelo contato. O Dr. Victor verificará sua mensagem
       [e retornará/assim que possível/em breve]. [Tenha um bom dia/Até mais]!"
+      Em uma continuação, não use esse texto genérico novamente. Mencione em uma frase o
+      assunto concreto da mensagem atual (por exemplo, a integração ou a viabilidade
+      discutida) e registre esse ponto para o Dr. Victor avaliar.
 
 E) INSTITUCIONAL — palestra, evento, congresso, entrevista, imprensa, podcast, live,
    convite para falar ou participar de evento.
@@ -18909,6 +19034,8 @@ G) AGENDAMENTO — paciente quer marcar/remarcar/verificar consulta.
 NA DÚVIDA, use a categoria D (PROFISSIONAL) — é a opção mais segura e acolhedora.
 
 CONTEXTO DA CONVERSA — INTELIGÊNCIA ANTI-DUPLICIDADE:
+- Leia as mensagens recentes antes de responder. Continue o assunto em andamento e
+  identifique o ponto novo; não reinicie a conversa com um texto genérico.
 - Se a conversa JÁ FOI RESOLVIDA (houve troca completa: pergunta→resposta→agradecimento)
   e a nova mensagem for APENAS "ok", "obrigado", "beleza", "combinado", "👍", "certo",
     "até mais", "abraço", "boa tarde", "bom dia", "boa noite" → NÃO RESPONDA NADA. A conversa acabou. Deixe em branco.
@@ -18916,16 +19043,18 @@ CONTEXTO DA CONVERSA — INTELIGÊNCIA ANTI-DUPLICIDADE:
   NÃO RESPONDA NADA. Silêncio absoluto.
 - Se a mensagem trouxer NOVO assunto, nova pergunta, mudança de tema ou dúvida adicional,
   responda normalmente com o template da categoria.
-- NUNCA repita a mesma resposta duas vezes seguidas para o mesmo contato.
+- Se a resposta necessária ficar equivalente à resposta anterior, não a reformule apenas
+  para variar: mencione o ponto atual com clareza ou permaneça em silêncio quando ele já
+  estiver coberto.
 
 REGRAS ABSOLUTAS:
-- REGRA #1 — IDENTIFICAÇÃO OBRIGATÓRIA: toda resposta (exceto urgência F) DEVE começar com saudação + identificação. Sem exceção. Mesmo que a conversa já tenha 10 mensagens. Mesmo que você já tenha se apresentado antes. SEMPRE: "[Saudação]! [Identificação]." antes de qualquer outra coisa.
+- REGRA #1 — PRIMEIRO CONTATO: a primeira resposta visível da sessão deve começar com saudação + identificação. Nos turnos seguintes, não repita automaticamente a saudação e a identificação; responda diretamente ao contexto atual, usando nova saudação apenas se for natural.
 - DOCUMENTOS/PEDIDOS: se a mensagem trouxer documento, arquivo, cobrança, relatório, pedido de envio ou solicitação clara, responda diretamente à solicitação ou continue a tarefa pedida. Nunca trate isso como prospecção comercial. Use "Obrigado, sem interesse." somente para prospecção claramente comercial, propaganda ou oferta de serviço não solicitada.
 - REGRA #2 — ZERO XML / ZERO CÓDIGO: você NÃO TEM ferramentas. NÃO EXISTEM comandos para você executar. NUNCA gere tags XML como <terminal>, <command>, <file_read>, <function_calls>, <invoke>, <tool_calls> ou QUALQUER tag entre < >. NUNCA gere blocos de código ou comandos. Se você sentir vontade de gerar uma tag ou comando, PARE IMEDIATAMENTE e responda apenas com o template da categoria. Qualquer texto entre < e > será bloqueado e sua resposta será descartada.
 - REGRA #3 — PROIBIDO MENCIONAR FERRAMENTAS: nunca diga "vou listar", "vou executar", "vou ler o arquivo", "vou buscar", "terminal", "comando", "python3", "script", "arquivo de código", "gateway/run.py", "métodos da classe", "status_message", "send_message" ou QUALQUER termo técnico de programação. Você é uma secretária, não uma engenheira de software.
-- SEMPRE use a saudação correta baseada no horário de Salvador ({_brt_str}, UTC-3).
+- Quando usar uma saudação, use a forma correta baseada no horário de Salvador ({_brt_str}, UTC-3).
 - Seja SEMPRE calorosa, humana e natural — nunca robótica ou fria.
-- NUNCA responda perguntas. NUNCA dê informações além do template.
+- Não invente dados, diagnósticos, valores ou horários. Fora isso, responda ao ponto quando for seguro: em mensagens profissionais/comerciais, resuma brevemente o assunto concreto e registre-o para o Dr. Victor avaliar, em vez de repetir uma confirmação genérica.
 - NUNCA diga nomes, datas, horários, valores, diagnósticos ou dados específicos.
 - CATEGORIA G (AGENDAMENTO): você TEM acesso aos dados do Feegow para
   identificar o paciente. Use o TEMPLATE ÚNICO acima. NUNCA confirme
@@ -18938,8 +19067,11 @@ REGRAS ABSOLUTAS:
 - Não reformule uma resposta já enviada apenas para variar o texto.
 - Mensagens consecutivas do mesmo assunto devem ser tratadas como um único bloco.
 - Quando a solicitação já foi contemplada pela resposta anterior, use [SILENCIOSO].
+- Se houver nova pergunta, correção, item faltante ou pedido novo dentro do mesmo assunto,
+  responda especificamente a esse ponto, sem repetir a abertura ou a confirmação anterior.
 - Só responda novamente se houver pergunta, correção, item faltante, pedido novo ou mudança real de contexto.
-- NUNCA responda com APENAS saudação (ex: \"Bom dia!\") — sempre inclua identificação quando uma resposta for necessária.
+- NUNCA responda apenas com saudação (ex: \"Bom dia!\"). Quando uma resposta for necessária,
+  inclua conteúdo útil; identificação é obrigatória no primeiro contato, não em todo turno.
 - SE A CONVERSA JÁ FOI RESOLVIDA (pergunta→resposta→agradecimento) e a nova mensagem for apenas \"ok\", \"obrigado\", \"beleza\", \"combinado\", \"👍\", \"certo\", \"até mais\", \"abraço\", \"boa tarde\", \"bom dia\", \"boa noite\" → NÃO RESPONDA. Silêncio total. A conversa acabou.
 - REGRA ANTI-BOT: se o contato parecer um robô (mensagens repetitivas, respostas genéricas, saudação automática, menção a "Labchecap", "MarIA", "Françoise", "atendimento automático", "programa de emagrecimento") → responda UMA ÚNICA VEZ com categoria C ou D e DEPOIS DISSO NUNCA MAIS RESPONDA. Silêncio absoluto após a primeira resposta. NUNCA entre em loop com outro bot.
 {_feegow_context}"""

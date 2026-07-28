@@ -2284,6 +2284,25 @@ class SessionStore:
                 )
             except Exception as e:
                 logger.debug("Session DB operation failed: %s", e)
+
+    def replace_latest_assistant_content(
+        self,
+        session_id: str,
+        previous_content: str,
+        replacement_content: str,
+    ) -> bool:
+        """Keep the canonical transcript aligned with an outbound rewrite."""
+        if not self._db:
+            return False
+        try:
+            return self._db.replace_latest_assistant_content(
+                session_id,
+                previous_content,
+                replacement_content,
+            )
+        except Exception as e:
+            logger.debug("Session DB response rewrite failed: %s", e)
+            return False
     
     def has_platform_message_id(
         self, session_id: str, platform_message_id: str

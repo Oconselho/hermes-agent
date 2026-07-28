@@ -3512,6 +3512,47 @@ class SessionDB:
 
         return self._execute_write(_do)
 
+    def replace_latest_assistant_content(
+        self,
+        session_id: str,
+        previous_content: str,
+        replacement_content: str,
+    ) -> bool:
+        """Replace the latest active assistant body after outbound rewriting.
+
+        Gateway delivery filters can make a final safety/context adjustment after
+        the agent has flushed its turn. Updating only the matching latest row
+        keeps SQLite aligned with the text that was actually delivered without
+        rewriting the rest of the transcript.
+        """
+        previous_stored = self._encode_content(previous_content)
+        replacement_stored = self._encode_content(replacement_content)
+
+        def _do(conn):
+            row = conn.execute(
+                """SELECT id, content FROM messages
+                   WHERE session_id = ? AND role = 'assistant' AND active = 1
+                   ORDER BY id DESC LIMIT 1""",
+                (session_id,),
+            ).fetchone()
+            if row is None or row["content"] != previous_stored:
+                return False
+            cursor = conn.execute(
+                "UPDATE messages SET content = ? WHERE id = ?",
+                (replacement_stored, row["id"]),
+            )
+            return cursor.rowcount == 1
+
+        try:
+            return bool(self._execute_write(_do))
+        except Exception:
+            logger.debug(
+                "Failed to replace latest assistant content in session %s",
+                session_id,
+                exc_info=True,
+            )
+            return False
+
     def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
         """Insert *messages* as fresh active rows for *session_id*.
 
