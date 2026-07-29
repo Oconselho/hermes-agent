@@ -30,9 +30,71 @@ _SCIENCE_TERMS = re.compile(
     re.IGNORECASE,
 )
 _TEXT_SUFFIXES = {".txt", ".md", ".csv", ".json", ".xml", ".yaml", ".yml", ".html"}
+_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"}
 _MAX_ATTACHMENT_TEXT = 20_000
 _MAX_ITEM_TEXT = 12_000
 _MAX_PROMPT_TEXT = 65_000
+_SECTION_HEADING_RE = re.compile(
+    r"(?im)^\s*(?:[•·*-]\s*)?(?:(?:\d+(?:\.\d+)*|[ivx]+)[.)\s-]+)?"
+    r"(abstract|resumo|discussion|discuss[aã]o|discussao|conclusions?|"
+    r"conclus(?:ão|ões|ao|oes)|results?|resultados?|interpretation|interpretação|"
+    r"implications?|implicações?|new frameworks|novos modelos|clinical complications|"
+    r"complicações clínicas|clinical practice|prática clínica)\b.*$"
+)
+
+
+def _focus_scientific_sections(text: str) -> str:
+    """Keep title/abstract plus discussion, relevant interpretation and conclusion."""
+    text = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not text.strip():
+        return ""
+
+    chunks = [text[:4_000]]
+    matches = list(_SECTION_HEADING_RE.finditer(text))
+    if matches:
+        labels = [match.group(1).lower() for match in matches]
+        abstract_matches = [m for m, label in zip(matches, labels) if label in {"abstract", "resumo"}]
+        discussion_matches = [
+            m for m, label in zip(matches, labels)
+            if label in {"discussion", "discussão", "discussao", "interpretation", "interpretação"}
+        ]
+        conclusion_matches = [
+            m for m, label in zip(matches, labels)
+            if label.startswith("conclusion") or label.startswith("conclus")
+        ]
+        chosen = []
+        if abstract_matches:
+            chosen.append(abstract_matches[0])
+        if discussion_matches:
+            chosen.append(discussion_matches[-1])
+        else:
+            relevant_matches = [
+                m for m, label in zip(matches, labels)
+                if label not in {"abstract", "resumo"}
+                and not label.startswith("conclusion")
+                and not label.startswith("conclus")
+            ]
+            if relevant_matches:
+                chosen.append(relevant_matches[-1])
+        if conclusion_matches:
+            chosen.append(conclusion_matches[-1])
+        else:
+            chunks.append(text[-4_000:])
+        for match in sorted(set(chosen), key=lambda item: item.start()):
+            following = [item.start() for item in matches if item.start() > match.start()]
+            end = min(following[0] if following else len(text), match.start() + 4_000)
+            chunks.append(text[match.start():end])
+
+    result = []
+    seen = set()
+    for chunk in chunks:
+        compact = " ".join(chunk.split())
+        key = compact[:300]
+        if compact and key not in seen:
+            seen.add(key)
+            result.append(compact)
+    return "\n\n".join(result)[:_MAX_ATTACHMENT_TEXT]
+
 
 
 def canonical_session_jid(session_dir: str | os.PathLike[str] | Path) -> str:
@@ -70,17 +132,29 @@ def _extract_attachment_text(path: str) -> str:
     suffix = file_path.suffix.lower()
     try:
         if suffix in _TEXT_SUFFIXES:
-            return file_path.read_text(encoding="utf-8", errors="replace")[:_MAX_ATTACHMENT_TEXT]
-        if suffix == ".pdf":
+            return _focus_scientific_sections(
+                file_path.read_text(encoding="utf-8", errors="replace")
+            )
+        if suffix in _IMAGE_SUFFIXES:
             result = subprocess.run(
-                ["pdftotext", "-layout", str(file_path), "-"],
+                ["tesseract", str(file_path), "stdout", "-l", "por+eng", "--psm", "6"],
                 capture_output=True,
                 text=True,
                 timeout=60,
                 check=False,
             )
             if result.returncode == 0:
-                return result.stdout[:_MAX_ATTACHMENT_TEXT]
+                return _focus_scientific_sections(result.stdout)
+        if suffix == ".pdf":
+            result = subprocess.run(
+                ["pdftotext", "-layout", str(file_path), "-"],
+                capture_output=True,
+                text=True,
+                timeout=90,
+                check=False,
+            )
+            if result.returncode == 0:
+                return _focus_scientific_sections(result.stdout)
         if suffix in {".doc", ".docx", ".odt", ".rtf"}:
             with tempfile.TemporaryDirectory(prefix="endonews-doc-") as tmp:
                 result = subprocess.run(
@@ -100,7 +174,9 @@ def _extract_attachment_text(path: str) -> str:
                 )
                 converted = Path(tmp) / f"{file_path.stem}.txt"
                 if result.returncode == 0 and converted.is_file():
-                    return converted.read_text(encoding="utf-8", errors="replace")[:_MAX_ATTACHMENT_TEXT]
+                    return _focus_scientific_sections(
+                        converted.read_text(encoding="utf-8", errors="replace")
+                    )
     except (OSError, subprocess.SubprocessError):
         return ""
     return ""
@@ -113,9 +189,11 @@ def _enrich_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         media = list(item.get("media") or [])
         attachment_text = []
         for media_item in media:
+            name = str(media_item.get("name", "arquivo"))
+            mime = str(media_item.get("mime", ""))
             text = _extract_attachment_text(str(media_item.get("path", "")))
             if text.strip():
-                attachment_text.append(text.strip())
+                attachment_text.append(f"Anexo: {name} ({mime})\n{text.strip()}")
         item["attachment_text"] = "\n\n".join(attachment_text)[:_MAX_ATTACHMENT_TEXT]
         item["score"] = scientific_score(
             f"{item.get('text', '')} {item['attachment_text']}",
@@ -129,10 +207,17 @@ def _enrich_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _item_source_text(row: dict[str, Any]) -> str:
     body = str(row.get("text", "") or "").strip()
     attachment = str(row.get("attachment_text", "") or "").strip()
+    media = list(row.get("media") or [])
     links = " ".join(_URL_RE.findall(body))
     pieces = [body]
+    if media:
+        received = "; ".join(
+            f"{item.get('name', 'arquivo')} ({item.get('mime', 'mídia')})"
+            for item in media
+        )
+        pieces.append(f"Anexos recebidos: {received}")
     if attachment:
-        pieces.append(f"Texto extraído do anexo:\n{attachment}")
+        pieces.append(f"Texto/OCR extraído dos anexos:\n{attachment}")
     if links:
         pieces.append(f"Links: {links}")
     return "\n".join(piece for piece in pieces if piece).strip()[:_MAX_ITEM_TEXT]
@@ -160,18 +245,29 @@ def build_digest_prompt(rows: list[dict[str, Any]], now_timestamp: int | None = 
 Use exclusivamente os dados delimitados abaixo. Não invente resultados, autores, números, conclusões ou links.
 Se um item não tiver informação suficiente, diga explicitamente que a informação é insuficiente.
 Priorize endocrinologia, diabetes, obesidade, tireoide, metabolismo, saúde pública e evidência clínica.
-Agrupe mensagens repetidas sobre o mesmo artigo. Para cada item relevante, informe: título/tema,
-principal achado ou pergunta, tipo de evidência/método quando disponível, limitações e link original.
-Separe claramente artigo científico de opinião ou comentário. Seja conciso, com no máximo 10 itens.
+Agrupe mensagens e anexos repetidos sobre o mesmo artigo; nunca crie um segundo item apenas porque existe uma tradução.
+Quando houver um paper original e uma tradução rápida, trate o paper original como fonte principal.
+Identifique o original preferindo periódico/editora, DOI, autores e texto integral; use a tradução somente como apoio
+para compreensão e sinalize quando não for possível confirmar qual versão é a original.
+
+Para cada paper, baseie o resumo objetivamente e nesta ordem de prioridade em:
+1. resumo inicial/abstract/resumo e objetivo/método;
+2. discussão/discussão dos resultados e interpretação;
+3. conclusão/conclusões e implicações clínicas.
+Não substitua a leitura do paper original por uma tradução ou por uma legenda de imagem.
+Para cada item relevante, informe: título/tema, pergunta ou principal achado, tipo de evidência/método,
+discussão/interpretação, conclusão, limitações e link original quando disponível.
+Separe claramente artigo científico de opinião, divulgação, convite ou comentário. Seja conciso, com no máximo 10 itens.
 
 Formato:
 Resumo científico — {date_label}
 
 1. Tema/título
-   - O que foi compartilhado:
-   - Evidência/método:
+   - Resumo/objetivo e método:
+   - Discussão/interpretação:
+   - Conclusão/implicação:
    - Limitações:
-   - Fonte:
+   - Fonte original:
 
 No final, inclua uma seção curta "Itens não classificados" se houver conteúdo insuficiente ou não científico.
 
@@ -296,7 +392,20 @@ def run_digest(*, dry_run: bool = False, now_timestamp: int | None = None) -> st
     send_result = send_to_bridge(destination, summary)
     if not send_result.get("success"):
         raise RuntimeError(f"bridge rejected digest: {send_result}")
+
+    # Keep only idempotency metadata; never persist the summary body itself.
     store.record_digest(digest_key, now, hashlib.sha256(summary.encode("utf-8")).hexdigest())
-    retention = int(monitor.get("retention_days", 30))
-    store.cleanup(now - max(retention, 1) * 24 * 60 * 60)
-    return f"digest sent: {send_result.get('messageId', '')}"
+    retention = int(monitor.get("retention_days", 0))
+    if retention <= 0:
+        purged_messages = store.purge_window(start, now + 1)
+        purged_stale = store.cleanup(start)
+    else:
+        purged_messages = store.purge_window(start, now + 1)
+        purged_stale = store.cleanup(now - retention * 24 * 60 * 60)
+    purged_orphans = store.remove_orphan_attachments()
+    message_id = send_result.get("messageId", "")
+    return (
+        f"digest sent: {message_id}; "
+        f"purged_messages={purged_messages}; "
+        f"purged_stale={purged_stale}; purged_orphans={purged_orphans}"
+    )

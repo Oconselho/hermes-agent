@@ -3,11 +3,13 @@ import io
 import urllib.error
 
 from gateway.endonews_digest import (
+    _focus_scientific_sections,
     build_digest_prompt,
     canonical_session_jid,
     scientific_score,
     send_to_bridge,
 )
+from gateway.whatsapp_passive_monitor import PassiveMessageStore
 
 
 def test_scientific_score_prefers_papers_and_scientific_terms():
@@ -30,6 +32,64 @@ def test_digest_prompt_contains_source_boundaries_and_links():
     assert "Não invente" in prompt
     assert "Novo ensaio clínico" in prompt
     assert "[FIM DOS DADOS DO GRUPO]" in prompt
+
+
+def test_scientific_focus_keeps_abstract_discussion_and_conclusion():
+    source = "Título\nAbstract\nResumo inicial.\nDiscussion\nInterpretação dos resultados.\nConclusion\nConclusão clínica."
+    focused = _focus_scientific_sections(source)
+    assert "Resumo inicial" in focused
+    assert "Interpretação dos resultados" in focused
+    assert "Conclusão clínica" in focused
+
+
+def test_digest_prompt_marks_attachments_and_translation_policy():
+    prompt = build_digest_prompt(
+        [
+            {
+                "message_id": "paper-1",
+                "timestamp": 1784671200,
+                "sender_name": "Autor",
+                "text": "",
+                "media": [
+                    {
+                        "name": "paper-original.pdf",
+                        "mime": "application/pdf",
+                        "path": "/does/not/exist/paper-original.pdf",
+                    }
+                ],
+            }
+        ],
+        now_timestamp=1784674800,
+    )
+    assert "paper-original.pdf" in prompt
+    assert "paper original como fonte principal" in prompt
+    assert "Discussão/interpretação" in prompt
+    assert "Conclusão/implicação" in prompt
+
+
+def test_passive_store_purge_all_removes_messages_and_private_media(tmp_path):
+    store = PassiveMessageStore(tmp_path)
+    attachment = store.attachments_dir / "paper.pdf"
+    attachment.write_bytes(b"pdf")
+    with store._connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO messages
+                (message_id, chat_id, timestamp, sender_name, text, media_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "m1",
+                "group@g.us",
+                100,
+                "Autor",
+                "paper",
+                '[{"path":"' + str(attachment) + '","mime":"application/pdf","name":"paper.pdf"}]',
+            ),
+        )
+    assert store.purge_all() == 1
+    assert not attachment.exists()
+    assert store.list_messages(0, 200) == []
 
 
 def test_send_to_bridge_refuses_group_destination():

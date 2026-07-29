@@ -231,13 +231,13 @@ class PassiveMessageStore:
                 (digest_key, int(sent_at), str(content_hash)),
             )
 
-    def cleanup(self, before_timestamp: int) -> int:
+    def _purge_where(self, predicate: str, params: tuple[Any, ...]) -> int:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT media_json FROM messages WHERE timestamp < ?", (int(before_timestamp),)
+                f"SELECT media_json FROM messages WHERE {predicate}", params
             ).fetchall()
             removed = conn.execute(
-                "DELETE FROM messages WHERE timestamp < ?", (int(before_timestamp),)
+                f"DELETE FROM messages WHERE {predicate}", params
             ).rowcount
         for row in rows:
             try:
@@ -252,3 +252,50 @@ class PassiveMessageStore:
                 except (OSError, ValueError, AttributeError):
                     pass
         return int(removed or 0)
+
+    def purge_window(self, start_timestamp: int, end_timestamp: int) -> int:
+        """Delete consumed messages and their private media for one digest window."""
+        return self._purge_where(
+            "timestamp >= ? AND timestamp < ?",
+            (int(start_timestamp), int(end_timestamp)),
+        )
+
+    def purge_all(self) -> int:
+        """Delete all stored message bodies and copied media after a successful send."""
+        return self._purge_where("1 = 1", ())
+
+    def remove_orphan_attachments(self) -> int:
+        """Remove attachment files no longer referenced by the SQLite inbox."""
+        referenced: set[Path] = set()
+        with self._connect() as conn:
+            rows = conn.execute("SELECT media_json FROM messages").fetchall()
+        for row in rows:
+            try:
+                media = json.loads(row[0])
+            except (TypeError, ValueError):
+                media = []
+            for item in media:
+                try:
+                    path = Path(item.get("path", "")).resolve()
+                    if path.is_relative_to(self.attachments_dir):
+                        referenced.add(path)
+                except (OSError, ValueError, AttributeError):
+                    pass
+
+        removed = 0
+        try:
+            candidates = list(self.attachments_dir.iterdir())
+        except OSError:
+            return 0
+        for path in candidates:
+            try:
+                if path.is_file() and path.resolve() not in referenced:
+                    path.unlink()
+                    removed += 1
+            except OSError:
+                pass
+        return removed
+
+    def cleanup(self, before_timestamp: int) -> int:
+        """Backward-compatible age-based cleanup for configured retention."""
+        return self._purge_where("timestamp < ?", (int(before_timestamp),))
