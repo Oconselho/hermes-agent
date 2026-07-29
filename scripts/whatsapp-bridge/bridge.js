@@ -248,12 +248,41 @@ const MAX_RECENT_IDS = 50;
 
 let sock = null;
 let connectionState = 'disconnected';
+// Only one Baileys socket and one pending reconnect may exist at a time.
+// Without this guard, every stale socket emitted `connection.update: close`
+// and scheduled another socket, creating a reconnect storm (405s) that kept
+// the bridge unavailable for hours.
+let socketGeneration = 0;
+let socketStartInFlight = false;
+let reconnectTimer = null;
+
+function scheduleReconnect(delayMs) {
+  if (reconnectTimer !== null) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    startSocket();
+  }, delayMs);
+}
 
 async function startSocket() {
-  const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
-  const { version } = await fetchLatestBaileysVersion();
+  if (socketStartInFlight || reconnectTimer !== null) return;
+  socketStartInFlight = true;
 
-  sock = makeWASocket({
+  let state;
+  let saveCreds;
+  let version;
+  try {
+    ({ state, saveCreds } = await useMultiFileAuthState(SESSION_DIR));
+    ({ version } = await fetchLatestBaileysVersion());
+  } catch (err) {
+    socketStartInFlight = false;
+    connectionState = 'disconnected';
+    console.error('[bridge] Failed to initialize WhatsApp socket:', err?.message || err);
+    scheduleReconnect(3000);
+    return;
+  }
+
+  const currentSocket = makeWASocket({
     version,
     auth: state,
     logger,
@@ -270,9 +299,14 @@ async function startSocket() {
     },
   });
 
-  sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
+  const generation = ++socketGeneration;
+  sock = currentSocket;
+  socketStartInFlight = false;
 
-  sock.ev.on('connection.update', (update) => {
+  currentSocket.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
+
+  currentSocket.ev.on('connection.update', (update) => {
+    if (generation !== socketGeneration || sock !== currentSocket) return;
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
@@ -284,6 +318,7 @@ async function startSocket() {
     if (connection === 'close') {
       const reason = new Boom(lastDisconnect?.error)?.output?.statusCode;
       connectionState = 'disconnected';
+      sock = null;
 
       if (reason === DisconnectReason.loggedOut) {
         console.log('❌ Logged out. Delete session and restart to re-authenticate.');
@@ -295,7 +330,7 @@ async function startSocket() {
         } else {
           console.log(`⚠️  Connection closed (reason: ${reason}). Reconnecting in 3s...`);
         }
-        setTimeout(startSocket, reason === 515 ? 1000 : 3000);
+        scheduleReconnect(reason === 515 ? 1000 : 3000);
       }
     } else if (connection === 'open') {
       connectionState = 'connected';
@@ -308,7 +343,8 @@ async function startSocket() {
     }
   });
 
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+  currentSocket.ev.on('messages.upsert', async ({ messages, type }) => {
+    if (generation !== socketGeneration || sock !== currentSocket) return;
     // In self-chat mode, your own messages commonly arrive as 'append' rather
     // than 'notify'. Accept both and filter agent echo-backs below.
     if (type !== 'notify' && type !== 'append') return;

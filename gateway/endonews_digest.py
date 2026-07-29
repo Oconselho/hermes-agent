@@ -19,6 +19,8 @@ from zoneinfo import ZoneInfo
 from gateway.whatsapp_passive_monitor import PassiveMessageStore, normalize_destination_jid
 
 _BRT = ZoneInfo("America/Sao_Paulo")
+_TRANSIENT_BRIDGE_HTTP_CODES = frozenset({502, 503, 504})
+_BRIDGE_RETRY_DELAYS = (2.0, 4.0, 8.0, 16.0, 30.0)
 _URL_RE = re.compile(r"https?://[^\s<>\]]+", re.IGNORECASE)
 _SCIENCE_TERMS = re.compile(
     r"\b(artigo|estudo|ensaio|cl[ií]nico|randomizado|coorte|metan[aá]lise|revis[aã]o\s+sistem[aá]tica|"
@@ -225,6 +227,8 @@ def send_to_bridge(
     *,
     bridge_url: str = "http://127.0.0.1:3000/send",
     opener: Callable[..., Any] | None = None,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    retry_delays: tuple[float, ...] = _BRIDGE_RETRY_DELAYS,
 ) -> dict[str, Any]:
     destination = normalize_destination_jid(destination_jid)
     if destination.endswith("@g.us"):
@@ -237,14 +241,23 @@ def send_to_bridge(
         method="POST",
     )
     opener = opener or urllib.request.urlopen
-    try:
-        with opener(request, timeout=60) as response:
-            body = response.read().decode("utf-8", errors="replace")
-            if getattr(response, "status", 200) != 200:
-                raise RuntimeError(f"bridge send failed: HTTP {response.status}: {body[:500]}")
-            return json.loads(body or "{}")
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"bridge send failed: HTTP {exc.code}") from exc
+    for attempt in range(len(retry_delays) + 1):
+        try:
+            with opener(request, timeout=60) as response:
+                body = response.read().decode("utf-8", errors="replace")
+                status = getattr(response, "status", 200)
+                if status != 200:
+                    if status in _TRANSIENT_BRIDGE_HTTP_CODES and attempt < len(retry_delays):
+                        sleep_fn(retry_delays[attempt])
+                        continue
+                    raise RuntimeError(f"bridge send failed: HTTP {status}: {body[:500]}")
+                return json.loads(body or "{}")
+        except urllib.error.HTTPError as exc:
+            if exc.code in _TRANSIENT_BRIDGE_HTTP_CODES and attempt < len(retry_delays):
+                sleep_fn(retry_delays[attempt])
+                continue
+            raise RuntimeError(f"bridge send failed: HTTP {exc.code}") from exc
+    raise RuntimeError("bridge send failed: retry loop exhausted")
 
 
 def run_digest(*, dry_run: bool = False, now_timestamp: int | None = None) -> str:
