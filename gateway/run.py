@@ -149,6 +149,112 @@ _WHATSAPP_ACK_RE = re.compile(
     r"joia|👍|até mais|ate mais|abraço|abraco|bom dia|boa tarde|boa noite)[!. ]*$",
     re.IGNORECASE,
 )
+_WHATSAPP_SOCIAL_GREETING_WORDS = frozenset({
+    "oi", "ola", "bom", "dia", "boa", "tarde", "noite", "tudo", "bem",
+    "otimo", "otima", "como", "vai", "voce", "esta", "e", "ai", "velho",
+    "amigo", "amiga", "meu", "minha", "querido", "querida", "beleza", "joia",
+})
+_WHATSAPP_SOCIAL_GREETING_ANCHORS = frozenset({
+    "oi", "ola", "bom", "boa", "tudo", "como", "ai", "beleza", "joia",
+})
+_WHATSAPP_NO_ACTION_UPDATE_RE = re.compile(
+    r"\b(?:ainda\s+(?:estou|esta|fico|vou)|estou\s+em\b|"
+    r"nao\s+vou\s+conseguir(?:\s+chegar)?|nao\s+consigo\s+chegar|"
+    r"vou\s+conseguir\s+chegar|vou\s+chegar|cheg(?:o|arei)\s+(?:so|mais)|"
+    r"estou\s+(?:indo|saindo|chegando)|fiquei\s+em\b)",
+    re.IGNORECASE,
+)
+_WHATSAPP_HUMANIZED_RESPONSE_RE = re.compile(
+    r"(?:\btudo\s+(?:bem|ótim[oa]|otim[oa])\b|\bestou\s+(?:bem|ótim[oa]|otim[oa])\b|"
+    r"\bque\s+bom\b|\bum\s+abra[cç]o\b|\babra[cç]os?\b|"
+    r"\bbeijo(?:s|inho)?\b|\bbj(?:s)?\b|\bat[eé]\s+mais\b|"
+    r"\bse\s+cuida\b|\bsaudad(?:e|es)\b)",
+    re.IGNORECASE,
+)
+_WHATSAPP_INSTITUTIONAL_IDENTITY_RE = re.compile(
+    r"\b(?:atendimento\s+automatizado|secretaria(?:\s+(?:virtual|automatizada))?|"
+    r"assistente\s+virtual)\b",
+    re.IGNORECASE,
+)
+
+
+def _whatsapp_is_social_greeting(text: Any) -> bool:
+    """Return True for a social greeting with no operational request.
+
+    These messages are intentionally silent.  A WhatsApp secretary must not
+    simulate a personal relationship by answering well-being questions or
+    exchanging familiar greetings.
+    """
+    raw = unicodedata.normalize("NFKD", str(text or ""))
+    raw = "".join(ch for ch in raw if not unicodedata.combining(ch)).lower()
+    raw_for_request = raw.replace("?", " ")
+    if not raw.strip() or _WHATSAPP_NEW_REQUEST_RE.search(raw_for_request):
+        return False
+    words = re.findall(r"[a-z0-9]+", raw)
+    if not words or len(words) > 12:
+        return False
+    return bool(
+        _WHATSAPP_SOCIAL_GREETING_ANCHORS.intersection(words)
+        and set(words).issubset(_WHATSAPP_SOCIAL_GREETING_WORDS)
+    )
+
+
+def _whatsapp_is_no_action_update(text: Any) -> bool:
+    """Return True for a status update that does not ask the secretary to act."""
+    raw = unicodedata.normalize("NFKD", str(text or ""))
+    raw = "".join(ch for ch in raw if not unicodedata.combining(ch)).lower()
+    if not raw.strip() or _WHATSAPP_NEW_REQUEST_RE.search(raw):
+        return False
+    return bool(_WHATSAPP_NO_ACTION_UPDATE_RE.search(raw))
+
+
+def _whatsapp_history_has_institutional_identity(history: List[Dict[str, Any]]) -> bool:
+    return any(
+        message.get("role") == "assistant"
+        and _WHATSAPP_INSTITUTIONAL_IDENTITY_RE.search(_whatsapp_history_text(message))
+        for message in history
+        if isinstance(message, dict)
+    )
+
+
+def _whatsapp_finalize_secretary_response(
+    candidate: Any,
+    history: List[Dict[str, Any]],
+    *,
+    current_text: Any = "",
+) -> Optional[str]:
+    """Apply fail-closed identity and anti-humanization rules to WhatsApp text."""
+    text = re.sub(r"\s+", " ", str(candidate or "")).strip()
+    if not text:
+        return None
+
+    # Remove prohibited personal/social language rather than allowing the model
+    # to make the automated service sound like Dr. Victor or a personal friend.
+    humanized = bool(_WHATSAPP_HUMANIZED_RESPONSE_RE.search(text))
+    text = _WHATSAPP_HUMANIZED_RESPONSE_RE.sub(" ", text)
+    text = re.sub(r"\s+([,.!?])", r"\1", text)
+    text = re.sub(r"[ ]{2,}", " ", text).strip(" .,!?:;-\")('")
+    if not text:
+        text = "A mensagem foi recebida e será encaminhada para avaliação."
+
+    has_identity = bool(_WHATSAPP_INSTITUTIONAL_IDENTITY_RE.search(text))
+    if not has_identity and not _whatsapp_history_has_institutional_identity(history):
+        greeting_match = re.match(r"^(Bom dia|Boa tarde|Boa noite)[!,.: ]*(.*)$", text, re.IGNORECASE)
+        identity = "Aqui é o atendimento automatizado da secretaria do Dr. Victor Almeida."
+        if greeting_match:
+            greeting = greeting_match.group(1)
+            remainder = greeting_match.group(2).strip()
+            text = f"{greeting}. {identity}"
+            if remainder:
+                text = f"{text} {remainder}"
+        else:
+            text = f"{identity} {text}"
+
+    # If a model response consisted only of forbidden social filler, fail closed
+    # to one institutional acknowledgement; never send the filler itself.
+    if humanized and not re.search(r"\b(?:mensagem|solicita|pedido|agend|recep|dr\.?\s+victor|avali|receb)\w*\b", text, re.IGNORECASE):
+        return "Atendimento automatizado da secretaria do Dr. Victor Almeida. A mensagem foi recebida."
+    return text
 
 
 def _whatsapp_dedup_text(text: Any) -> str:
@@ -348,6 +454,12 @@ def _should_suppress_whatsapp_followup(
         return False
     if current_timestamp - assistant_timestamp > window:
         return False
+
+    # A status update without a question or operational request does not need a
+    # second acknowledgement. This covers rapid conversational bursts such as
+    # "Ainda estou em Feira" and "Não vou conseguir chegar...".
+    if _whatsapp_is_no_action_update(current_normalized):
+        return True
 
     # A question, correction, new request, or urgent context must always reach
     # the agent, even when its normalized text overlaps the prior user turn.
@@ -11555,6 +11667,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Load conversation history from transcript
         history = self.session_store.load_transcript(session_entry.session_id)
 
+        # Social greetings and well-being exchanges are not service requests.
+        # Stay silent instead of impersonating a personal acquaintance.
+        if (
+            getattr(source.platform, "value", source.platform) == "whatsapp"
+            and not str(event.text or "").lstrip().startswith("/")
+            and _whatsapp_is_social_greeting(event.text)
+        ):
+            logger.info(
+                "[WhatsApp] Suppressing social greeting without operational request "
+                "for session %s",
+                session_key,
+            )
+            return ""
+
         # Suppress a repeated attachment/caption/confirmation only when the
         # recent visible secretary reply already covered the same request.
         # Explicit questions, corrections, new requests, and urgency pass
@@ -12361,6 +12487,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         getattr(source, "chat_id", "?"),
                     )
                     return None
+
+                if source.platform and source.platform.value == "whatsapp" and response:
+                    _institutional_response = _whatsapp_finalize_secretary_response(
+                        response,
+                        history,
+                        current_text=message_text,
+                    )
+                    if _institutional_response is None:
+                        logger.info(
+                            "[WhatsApp] Suppressing non-institutional/social-only response for %s",
+                            getattr(source, "chat_id", "?"),
+                        )
+                        return None
+                    response = _institutional_response
 
                 if source.platform and source.platform.value == "whatsapp" and response:
                     _original_response = response
@@ -19039,26 +19179,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             except Exception as _notif_err:
                                 logger.debug("Failed to schedule fallback notification: %s", _notif_err)
 
-                combined_ephemeral = f"""Você é a secretária do Dr. Victor Almeida, endocrinologista (CRM-BA 22.586, RQE 13.396).
+                combined_ephemeral = f"""Você é o atendimento automatizado da secretaria do Dr. Victor Almeida, endocrinologista (CRM-BA 22.586, RQE 13.396).
 Agora são {_brt_str} em Salvador/BA (UTC-3).
 
-TOM DA SECRETÁRIA — você é uma pessoa real, calorosa e educada:
-- Seja SEMPRE gentil, acolhedora e humana. Nada de linguagem robótica ou fria.
-- Use um tom de voz natural, como se estivesse conversando pessoalmente.
-- Varie suas palavras apenas quando houver uma nova resposta necessária — nunca soe como uma máquina repetindo o mesmo texto.
-- Demonstre empatia: as pessoas que entram em contato merecem respeito e atenção.
-- Seja breve mas calorosa. Uma mensagem curta pode ser acolhedora ao mesmo tempo.
-- Pense em como uma secretária humana de verdade responderia: educada, prestativa, direta.
-
-SAUDAÇÃO — no primeiro contato, comece com o cumprimento correto e se identifique:
-- Se o horário atual for antes de 12:00 → comece com "Bom dia"
-- Se for entre 12:00 e 18:00 → comece com "Boa tarde"
-- Se for após 18:00 → comece com "Boa noite"
-- No primeiro contato, identifique-se de forma natural. Nos turnos seguintes, não repita automaticamente a identificação:
-  "Aqui é a secretária do Dr. Victor Almeida."
-  "Sou a secretária do Dr. Victor Almeida."
-  "Aqui é a assistente do Dr. Victor."
-  "Sou a assistente do Dr. Victor Almeida."
+TOM E IDENTIDADE DO ATENDIMENTO — você é um atendimento automatizado da secretaria do Dr. Victor Almeida:
+- Nunca finja ser uma pessoa, o Dr. Victor ou um amigo do contato.
+- Nunca diga ou sugira que está bem, ótima, feliz, com saudade ou pessoalmente disponível.
+- Nunca use linguagem de amizade ou intimidade. Não use "um abraço", "abraço", "beijo", "beijos", "bjs", "saudades", "até mais" ou "se cuida".
+- Não responda a cumprimentos sociais ou perguntas de bem-estar sem pedido operacional; nesses casos, use [SILENCIOSO].
+- Quando uma resposta for necessária, seja objetiva, profissional e breve, sem repetir a resposta anterior.
+- Atualizações de localização, atraso ou mudança de plano sem pedido explícito de ação/remarcação devem usar [SILENCIOSO].
+- Em uma sequência de mensagens sobre o mesmo assunto, aguarde/considere o conteúdo já recebido e envie no máximo uma resposta; complemente apenas se houver novo pedido concreto.
+- Use somente "Bom dia", "Boa tarde" ou "Boa noite" como saudação de horário, conforme Salvador/BA.
+- Na primeira resposta necessária de uma conversa, identifique-se claramente: "Aqui é o atendimento automatizado da secretaria do Dr. Victor Almeida."
+- Depois que a identificação já tiver sido enviada, não a repita sem necessidade.
 - Não varie uma resposta apenas para parecer diferente. Quando houver novo conteúdo, responda ao ponto concreto da mensagem atual.
 Endereço: CEO Salvador Shopping, Torre Londres, Sala 1616.
 Recepção: WhatsApp 71996691002.
@@ -19094,12 +19228,11 @@ A) PACIENTE — o remetente é o próprio paciente, ou familiar/representante
       Varie o encerramento: "...ajudar com todas as informações." /
       "... ajudar com o que precisar." / "...dar todas as orientações."
 
-B) PRÓXIMO — apelido, "meu irmão", "cunhado", "tio", "primo", "amigo",
-   "saudade", "abraço", "beijo", tom familiar, "e aí" + nome, referência a contexto pessoal íntimo.
-   ⚠️ Se houver dúvida entre B e D, escolha D (mais seguro).
-   ➤ TEMPLATE (tom caloroso e pessoal, como quem conhece):
-      "[Saudação]! [Identificação]. Obrigada pela mensagem. O Dr. Victor vai ver pessoalmente.
-      [Um abraço/Até mais/Tenha um bom dia]!"
+B) CONTATO SOCIAL / PRÓXIMO — apelido, "meu irmão", "cunhado", "tio", "primo", "amigo",
+   "saudade", "abraço", "beijo", tom familiar ou cumprimento sem pedido operacional.
+   ⚠️ Isso não autoriza intimidade nem resposta social. Se não houver pergunta,
+   solicitação, correção ou necessidade operacional, use [SILENCIOSO].
+   ⚠️ Nunca responda "tudo bem", "tudo ótimo", "que bom", "um abraço" ou equivalente.
 
 C) SPAM / PROPAGANDA — oferta NÃO solicitada de produto/serviço, "oportunidade de negócio",
    "solução empresarial", "parceria", "mentoria", "consultoria", "aumentar seu faturamento",
@@ -19216,9 +19349,9 @@ REGRAS ABSOLUTAS:
 - REGRA #1 — PRIMEIRO CONTATO: a primeira resposta visível da sessão deve começar com saudação + identificação. Nos turnos seguintes, não repita automaticamente a saudação e a identificação; responda diretamente ao contexto atual, usando nova saudação apenas se for natural.
 - DOCUMENTOS/PEDIDOS: se a mensagem trouxer documento, arquivo, cobrança, relatório, pedido de envio ou solicitação clara, responda diretamente à solicitação ou continue a tarefa pedida. Nunca trate isso como prospecção comercial. Use "Obrigado, sem interesse." somente para prospecção claramente comercial, propaganda ou oferta de serviço não solicitada.
 - REGRA #2 — ZERO XML / ZERO CÓDIGO: você NÃO TEM ferramentas. NÃO EXISTEM comandos para você executar. NUNCA gere tags XML como <terminal>, <command>, <file_read>, <function_calls>, <invoke>, <tool_calls> ou QUALQUER tag entre < >. NUNCA gere blocos de código ou comandos. Se você sentir vontade de gerar uma tag ou comando, PARE IMEDIATAMENTE e responda apenas com o template da categoria. Qualquer texto entre < e > será bloqueado e sua resposta será descartada.
-- REGRA #3 — PROIBIDO MENCIONAR FERRAMENTAS: nunca diga "vou listar", "vou executar", "vou ler o arquivo", "vou buscar", "terminal", "comando", "python3", "script", "arquivo de código", "gateway/run.py", "métodos da classe", "status_message", "send_message" ou QUALQUER termo técnico de programação. Você é uma secretária, não uma engenheira de software.
+- REGRA #3 — PROIBIDO MENCIONAR FERRAMENTAS: nunca diga "vou listar", "vou executar", "vou ler o arquivo", "vou buscar", "terminal", "comando", "python3", "script", "arquivo de código", "gateway/run.py", "métodos da classe", "status_message", "send_message" ou QUALQUER termo técnico de programação. Você é um atendimento automatizado institucional, não uma engenheira de software.
 - Quando usar uma saudação, use a forma correta baseada no horário de Salvador ({_brt_str}, UTC-3).
-- Seja SEMPRE calorosa, humana e natural — nunca robótica ou fria.
+- Mantenha identidade institucional e linguagem profissional; nunca tente parecer humana, íntima ou pessoal.
 - Não invente dados, diagnósticos, valores ou horários. Fora isso, responda ao ponto quando for seguro: em mensagens profissionais/comerciais, resuma brevemente o assunto concreto e registre-o para o Dr. Victor avaliar, em vez de repetir uma confirmação genérica.
 - NUNCA revele nome de paciente, datas, horários, valores, diagnósticos ou outros dados específicos. É permitido usar apenas o nome do remetente quando ele estiver declarado na mensagem ou for um nome pessoal confiável do contato; nunca invente nome.
 - CATEGORIA G (AGENDAMENTO): você TEM acesso aos dados do Feegow para

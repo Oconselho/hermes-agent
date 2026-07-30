@@ -11,12 +11,15 @@ from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.run import (
     _sanitize_gateway_final_response,
+    _should_suppress_whatsapp_followup,
     _whatsapp_blocklist_match,
     _whatsapp_blocklist_status,
     _whatsapp_contact_context,
     _whatsapp_contact_is_organization,
     _whatsapp_declared_person_name,
+    _whatsapp_finalize_secretary_response,
     _whatsapp_has_scheduling_intent,
+    _whatsapp_is_social_greeting,
 )
 
 
@@ -107,9 +110,50 @@ def test_explicit_booking_request_is_scheduling():
     assert _whatsapp_has_scheduling_intent("Gostaria de marcar uma consulta e saber os horários disponíveis.")
 
 
+def test_social_greeting_is_silenced_but_real_request_is_not():
+    assert _whatsapp_is_social_greeting("Oi velho Tudo bem?")
+    assert _whatsapp_is_social_greeting("Tudo ótimo")
+    assert not _whatsapp_is_social_greeting("Bom dia, quero agendar uma consulta.")
+
+
+def test_status_update_without_request_is_suppressed_after_recent_reply():
+    history = [
+        {"role": "user", "content": "Oi", "timestamp": 90},
+        {
+            "role": "assistant",
+            "content": "A secretaria recebeu sua mensagem. O Dr. Victor avaliará.",
+            "timestamp": 100,
+        },
+    ]
+    assert _should_suppress_whatsapp_followup("Ainda estou em Feira", history, now=110)
+    assert _should_suppress_whatsapp_followup("Não vou conseguir chegar pra 17:00", history, now=111)
+
+
+def test_secretary_response_cannot_claim_human_identity_or_use_human_signoff():
+    result = _whatsapp_finalize_secretary_response(
+        "Tudo ótimo! O Dr. Victor está sabendo. Um abraço!",
+        [],
+        current_text="Oi velho Tudo bem?",
+    )
+    lowered = result.lower()
+    assert "atendimento automatizado" in lowered
+    assert "secretaria do dr. victor almeida" in lowered
+    assert "tudo ótimo" not in lowered
+    assert "abraço" not in lowered
+
+
+def test_first_substantive_reply_identifies_automated_secretary():
+    result = _whatsapp_finalize_secretary_response(
+        "Boa tarde. Para agendamento, fale com a recepção.",
+        [],
+        current_text="Boa tarde, quero agendar uma consulta.",
+    )
+    assert result.lower().startswith("boa tarde. aqui é o atendimento automatizado")
+
+
 #
-# Incident 20/jul/2026: the model returned "\u200b\u200b" (zero-width spaces).
-# The sanitizer let it through; the WhatsApp transport stripped the
+# Incident 20/jul/2026: the model returned "\\u200b\\u200b" (zero-width spaces).
+
 # invisible chars, the bridge rejected the empty message
 # ("chatId and message are required"), and the upstream plain-text
 # fallback re-sent the content prefixed with the technical marker
