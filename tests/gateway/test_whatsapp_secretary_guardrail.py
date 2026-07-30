@@ -13,6 +13,10 @@ from gateway.run import (
     _sanitize_gateway_final_response,
     _whatsapp_blocklist_match,
     _whatsapp_blocklist_status,
+    _whatsapp_contact_context,
+    _whatsapp_contact_is_organization,
+    _whatsapp_declared_person_name,
+    _whatsapp_has_scheduling_intent,
 )
 
 
@@ -78,7 +82,31 @@ def test_blocklist_status_allows_sender_not_in_list(tmp_path, monkeypatch):
     assert reason == "not_matched"
 
 
-# ── Sanitizer: effectively-empty replies must be silenced (20/jul/2026) ──
+def test_rapidoc_partner_context_keeps_sender_separate_from_patient():
+    source = SimpleNamespace(
+        chat_name="Rapidoc Telemedicina",
+        user_name="Rapidoc Telemedicina",
+    )
+    message = "*Grazi*\nA paciente foi atendida pela plataforma e precisa de orientação sobre a receita."
+
+    context = _whatsapp_contact_context(source, message)
+
+    assert _whatsapp_contact_is_organization(source)
+    assert _whatsapp_declared_person_name(message) == "Grazi"
+    assert context["role"] == "empresa/plataforma parceira de telemedicina"
+    assert context["declared_name"] == "Grazi"
+    assert context["organization"] == "true"
+
+
+def test_medical_context_with_consulta_is_not_scheduling_by_itself():
+    message = "A paciente teve uma nova consulta e precisa avaliar a receita emitida."
+    assert not _whatsapp_has_scheduling_intent(message)
+
+
+def test_explicit_booking_request_is_scheduling():
+    assert _whatsapp_has_scheduling_intent("Gostaria de marcar uma consulta e saber os horários disponíveis.")
+
+
 #
 # Incident 20/jul/2026: the model returned "\u200b\u200b" (zero-width spaces).
 # The sanitizer let it through; the WhatsApp transport stripped the
