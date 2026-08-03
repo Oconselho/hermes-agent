@@ -4,18 +4,22 @@ Feegow API Client — Integração com o prontuário eletrônico Feegow.
 API baseada em DocPlanner / Feegow Clinic.
 Autenticação via JWT no header ``x-access-token``.
 
-Endpoints documentados (base: https://api.feegow.com/v1/api):
+Endpoints documentados utilizados por esta integração (base: ``https://api.feegow.com/v1/api``):
 
-    POST /patients/search     — buscar paciente por CPF, nome, telefone ou email
-    POST /patients/create     — cadastrar novo paciente
-    GET  /company/list-unity  — listar unidades da clínica
-    GET  /specialties/list    — listar especialidades (params: unidade_id)
-    GET  /professional/list   — listar profissionais (params: unidade_id, especialidade_id)
-    GET  /professional/info-specialties — info detalhada do profissional (params: profissional_id)
-    GET  /procedures/list     — listar procedimentos (params: unidade_id, especialidade_id, profissional_id)
-    GET  /appoints/search     — consultar agenda (params: data_start, data_end no formato DD-MM-AAAA)
-    POST /appoints/create     — criar agendamento
-    GET  /appoints/list-channel — listar canais de agendamento
+    GET  /patient/search             — buscar paciente por CPF, nome, telefone ou e-mail
+    POST /patient/edit               — cadastrar/editar paciente
+    GET  /company/list-unity         — listar unidades da clínica
+    GET  /specialties/list            — listar especialidades (params: unidade_id)
+    GET  /professional/list           — listar profissionais
+    GET  /professional/info-specialties — detalhes do profissional
+    GET  /procedures/list             — listar procedimentos
+    GET  /appoints/search             — consultar agendamentos
+    GET  /appoints/available-schedule — consultar vagas filtradas
+    POST /appoints/new-appoint        — criar agendamento em status 1
+    POST /appoints/statusUpdate       — atualizar status
+    POST /appoints/cancel-appoint     — desmarcar consulta
+    POST /appoints/reschedule         — remarcar consulta
+    GET  /appoints/list-channel       — listar canais de agendamento
 
 Limitação conhecida (2026-06-22):
     Tokens com audience "publicapi" recebem HTTP 403 em endpoints GET.
@@ -31,6 +35,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import requests
@@ -79,6 +84,18 @@ class FeegowValidationError(FeegowAPIError):
     pass
 
 
+class FeegowConflictError(FeegowAPIError):
+    """Conflito explícito (HTTP 409), que exige reconciliação por leitura."""
+
+
+class FeegowWriteDisabledError(FeegowAPIError):
+    """Uma mutação foi recusada porque o cliente está em modo somente leitura."""
+
+
+class FeegowAmbiguousResultError(FeegowAPIError):
+    """O transporte falhou depois do envio e o resultado deve ser reconciliado."""
+
+
 class FeegowClient:
     """Cliente para a API pública do prontuário eletrônico Feegow.
 
@@ -100,17 +117,18 @@ class FeegowClient:
         token: str,
         base_url: str = DEFAULT_BASE_URL,
         timeout: int = DEFAULT_TIMEOUT,
+        *,
+        write_enabled: bool = False,
     ):
-        """Inicializa o cliente Feegow.
+        """Inicializa o cliente Feegow em modo somente leitura por padrão.
 
-        Args:
-            token: JWT de autenticação (obtido no painel Feegow).
-            base_url: URL base da API. O padrão é https://api.feegow.com/v1/api.
-            timeout: Timeout em segundos para cada requisição HTTP.
+        ``write_enabled`` precisa ser habilitado explicitamente; todos os
+        mutadores também validam esse gate imediatamente antes do POST.
         """
         self.token = token
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.write_enabled = bool(write_enabled)
 
         # Cache interno: {cache_key: (timestamp, data)}
         self._cache: Dict[str, Tuple[float, Any]] = {}
@@ -134,30 +152,22 @@ class FeegowClient:
         params: Optional[Dict] = None,
         json_data: Optional[Dict] = None,
         timeout: Optional[int] = None,
+        *,
+        max_attempts: int = MAX_RETRIES,
+        ambiguous_on_transport: bool = False,
     ) -> Dict[str, Any]:
-        """Faz uma requisição HTTP com retry e backoff exponencial.
+        """Perform an HTTP request.
 
-        Args:
-            method: "GET" ou "POST".
-            endpoint: Caminho relativo (ex: "patients/search").
-            params: Parâmetros de query string (para GET).
-            json_data: Corpo JSON (para POST).
-            timeout: Timeout em segundos (usa self.timeout se não informado).
-
-        Returns:
-            Dicionário com a resposta JSON da API.
-
-        Raises:
-            FeegowAPIError: Em caso de erro irrecuperável após todos os retries.
-            FeegowAuthError: Se o token for inválido ou expirado.
-            FeegowNotFoundError: Se o recurso não for encontrado.
-            FeegowValidationError: Se parâmetros obrigatórios estiverem faltando.
+        Reads may retry transient transport failures. Mutators call this with a
+        single attempt and ``ambiguous_on_transport=True`` because replaying a
+        timed-out POST can create duplicate appointments.
         """
         url = f"{self.base_url}/{endpoint.lstrip('/')}"
         timeout = timeout or self.timeout
+        attempts = max(1, int(max_attempts))
         last_error: Optional[Exception] = None
 
-        for attempt in range(1, MAX_RETRIES + 1):
+        for attempt in range(1, attempts + 1):
             try:
                 response = self.session.request(
                     method=method,
@@ -166,94 +176,87 @@ class FeegowClient:
                     json=json_data,
                     timeout=timeout,
                 )
-
-                # Sucesso
                 if 200 <= response.status_code < 300:
                     try:
                         return response.json()
                     except ValueError:
                         return {"success": True, "raw": response.text}
-
-                # Autenticação
-                if response.status_code == 401:
+                body = self._safe_json(response)
+                if response.status_code in {401, 403}:
                     raise FeegowAuthError(
-                        "Token de acesso inválido ou expirado. Verifique o JWT.",
-                        status_code=401,
-                        response_body=self._safe_json(response),
+                        "Token inválido, expirado ou sem permissão.",
+                        status_code=response.status_code,
+                        response_body=body,
                     )
-
-                # Permissão negada (ex: token publicapi em endpoints GET)
-                if response.status_code == 403:
-                    raise FeegowAuthError(
-                        "Acesso negado. Seu token pode ter permissões limitadas "
-                        "(audience: publicapi). Contate o suporte Feegow para "
-                        "obter um token com acesso completo.",
-                        status_code=403,
-                        response_body=self._safe_json(response),
-                    )
-
-                # Não encontrado
                 if response.status_code == 404:
                     raise FeegowNotFoundError(
                         "Recurso não encontrado na API Feegow.",
                         status_code=404,
-                        response_body=self._safe_json(response),
+                        response_body=body,
                     )
-
-                # Erro de validação (422)
+                if response.status_code == 409:
+                    raise FeegowConflictError(
+                        "Conflito informado pela API Feegow.",
+                        status_code=409,
+                        response_body=body,
+                    )
                 if response.status_code == 422:
-                    body = self._safe_json(response)
-                    msg = body.get("message", "") if isinstance(body, dict) else ""
+                    message = body.get("message", "") if isinstance(body, dict) else ""
                     raise FeegowValidationError(
-                        f"Parâmetros inválidos ou faltando: {msg}".strip(),
+                        f"Parâmetros inválidos ou faltando: {message}".strip(),
                         status_code=422,
                         response_body=body,
                     )
-
-                # Outro erro HTTP
                 raise FeegowAPIError(
                     f"Erro HTTP {response.status_code}",
                     status_code=response.status_code,
-                    response_body=self._safe_json(response),
+                    response_body=body,
                 )
-
             except FeegowAPIError:
-                # Não retentar erros da API (4xx) — são erros do cliente
                 raise
-            except requests.Timeout:
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                if ambiguous_on_transport:
+                    raise FeegowAmbiguousResultError(
+                        "Resultado ambíguo após falha de transporte; reconcile por leitura."
+                    ) from exc
                 last_error = FeegowAPIError(
-                    f"Timeout após {timeout}s (tentativa {attempt}/{MAX_RETRIES})"
+                    f"Falha de transporte (tentativa {attempt}/{attempts})"
                 )
-                if attempt < MAX_RETRIES:
-                    wait = BACKOFF_FACTOR ** attempt
-                    logger.warning(
-                        "Feegow API timeout (attempt %d/%d), retrying in %.1fs",
-                        attempt, MAX_RETRIES, wait,
-                    )
-                    time.sleep(wait)
-            except requests.ConnectionError as e:
-                last_error = FeegowAPIError(
-                    f"Erro de conexão: {e} (tentativa {attempt}/{MAX_RETRIES})"
-                )
-                if attempt < MAX_RETRIES:
-                    wait = BACKOFF_FACTOR ** attempt
-                    logger.warning(
-                        "Feegow API connection error (attempt %d/%d), retrying in %.1fs",
-                        attempt, MAX_RETRIES, wait,
-                    )
-                    time.sleep(wait)
-            except Exception as e:
-                last_error = FeegowAPIError(f"Erro inesperado: {e}")
-                if attempt < MAX_RETRIES:
-                    wait = BACKOFF_FACTOR ** attempt
-                    logger.warning(
-                        "Feegow API unexpected error (attempt %d/%d): %s, retrying in %.1fs",
-                        attempt, MAX_RETRIES, e, wait,
-                    )
-                    time.sleep(wait)
+            except Exception as exc:
+                if ambiguous_on_transport:
+                    raise FeegowAmbiguousResultError(
+                        "Resultado ambíguo após falha de transporte; reconcile por leitura."
+                    ) from exc
+                last_error = FeegowAPIError(f"Erro inesperado: {exc}")
 
-        # Esgotou os retries
+            if attempt < attempts:
+                wait = BACKOFF_FACTOR ** attempt
+                logger.warning(
+                    "Feegow API transient failure (attempt %d/%d), retrying in %.1fs",
+                    attempt,
+                    attempts,
+                    wait,
+                )
+                time.sleep(wait)
+
         raise last_error if last_error else FeegowAPIError("Erro desconhecido")
+
+    def _require_write_enabled(self) -> None:
+        if not self.write_enabled:
+            raise FeegowWriteDisabledError(
+                "Escritas Feegow estão desabilitadas; habilite write_enabled explicitamente."
+            )
+
+    def _mutating_post(self, endpoint: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute exactly one mutation attempt and surface ambiguous outcomes."""
+        self._require_write_enabled()
+        return self._request(
+            "POST",
+            endpoint,
+            json_data=body,
+            max_attempts=1,
+            ambiguous_on_transport=True,
+        )
 
     @staticmethod
     def _safe_json(response: requests.Response) -> Any:
@@ -262,6 +265,27 @@ class FeegowClient:
             return response.json()
         except ValueError:
             return response.text[:500]
+
+    @staticmethod
+    def _collection_content(result: Any) -> List[Dict[str, Any]]:
+        """Unwrap Feegow's ``success/content`` read envelope."""
+        if isinstance(result, (list, tuple)):
+            return [item for item in result if isinstance(item, dict)]
+        if not isinstance(result, dict) or result.get("success") is False or result.get("error"):
+            return []
+        for key in (
+            "content", "data", "results", "items", "slots", "agendamentos",
+            "appointments", "pacientes", "horarios",
+        ):
+            if key not in result:
+                continue
+            value = result[key]
+            if isinstance(value, (list, tuple)):
+                return [item for item in value if isinstance(item, dict)]
+            if isinstance(value, dict):
+                nested = FeegowClient._collection_content(value)
+                return nested or [value]
+        return [result] if result else []
 
     def _cached(
         self,
@@ -338,25 +362,11 @@ class FeegowClient:
         nome: Optional[str] = None,
         telefone: Optional[str] = None,
         email: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Busca pacientes na base Feegow.
+    ) -> List[Dict[str, Any]]:
+        """Busca pacientes na base Feegow e normaliza o envelope em uma lista.
 
         Usa o endpoint ``patient/search`` (singular, GET).
         Parâmetros em português: ``paciente_cpf``, ``paciente_nome``.
-
-        Retorna 409 (\"Paciente não encontrado\") quando o CPF não existe —
-        tratado como resposta normal (paciente não cadastrado).
-
-        Pelo menos um dos parâmetros deve ser informado.
-
-        Args:
-            cpf: CPF do paciente (apenas números, 11 dígitos).
-            nome: Nome completo ou parcial do paciente.
-            telefone: Telefone com DDD (ex: \"71999999999\").
-            email: Email do paciente.
-
-        Returns:
-            Dicionário com a resposta da API.
         """
         params: Dict[str, str] = {}
         if cpf:
@@ -375,7 +385,10 @@ class FeegowClient:
 
         logger.info("Feegow: searching patients with %s", list(params.keys()))
         return self._safe_call(
-            lambda: self._request("GET", "patient/search", params=params),
+            lambda: self._collection_content(
+                self._request("GET", "patient/search", params=params)
+            ),
+            fallback=[],
         )
 
     def create_patient(
@@ -388,26 +401,7 @@ class FeegowClient:
         sexo: str = "M",
         **kwargs,
     ) -> Dict[str, Any]:
-        """Cadastra um novo paciente na base Feegow.
-
-        Usa o endpoint ``patient/create`` (singular, POST).
-        Campos em português: ``nome_completo``, ``nome_paciente``.
-        Data de nascimento no formato YYYY-MM-DD.
-
-        Args:
-            nome: Nome completo do paciente.
-            cpf: CPF (apenas números, 11 dígitos, deve ser válido).
-            data_nascimento: Data no formato YYYY-MM-DD (ex: "1990-01-01").
-            telefone: Telefone com DDD (ex: "71999999999").
-            email: Email do paciente (opcional).
-            sexo: "M" para masculino, "F" para feminino.
-            **kwargs: Campos adicionais (endereco, numero, complemento, bairro,
-                      cidade, estado, cep).
-
-        Returns:
-            Dicionário com a resposta da API. Em caso de sucesso, contém
-            ``content.paciente_id`` com o ID do paciente criado.
-        """
+        """Create a patient through the current ``patient/edit`` endpoint."""
         body: Dict[str, Any] = {
             "nome_completo": nome,
             "nome_paciente": nome,
@@ -418,12 +412,25 @@ class FeegowClient:
             "sexo": sexo,
             **kwargs,
         }
+        result = self._mutating_post("patient/edit", body)
+        if result.get("success"):
+            self._clear_cache("patients:")
+        return result
 
-        logger.info("Feegow: creating patient %s (CPF: %s)", nome, cpf)
-        result = self._safe_call(
-            lambda: self._request("POST", "patient/create", json_data=body),
-        )
-        # Se criou paciente, invalidar cache de busca
+    def edit_patient(self, paciente_id: int, **changes: Any) -> Dict[str, Any]:
+        """Edit explicitly supplied patient fields; never infer or overwrite blanks."""
+        if not paciente_id:
+            raise FeegowValidationError("paciente_id é obrigatório")
+        allowed = {
+            "nome_completo", "nome_paciente", "cpf", "data_nascimento",
+            "telefone", "email", "sexo", "endereco", "numero",
+            "complemento", "bairro", "cidade", "estado", "cep",
+        }
+        body = {key: value for key, value in changes.items() if key in allowed}
+        if not body:
+            raise FeegowValidationError("Informe ao menos um campo permitido para editar")
+        body["paciente_id"] = int(paciente_id)
+        result = self._mutating_post("patient/edit", body)
         if result.get("success"):
             self._clear_cache("patients:")
         return result
@@ -448,7 +455,9 @@ class FeegowClient:
         return self._safe_call(
             lambda: self._cached(
                 "units:all",
-                lambda: self._request("GET", "company/list-unity"),
+                lambda: self._collection_content(
+                    self._request("GET", "company/list-unity")
+                ),
             ),
             fallback=[],
         )
@@ -479,7 +488,9 @@ class FeegowClient:
         return self._safe_call(
             lambda: self._cached(
                 cache_key,
-                lambda: self._request("GET", "specialties/list", params=params),
+                lambda: self._collection_content(
+                    self._request("GET", "specialties/list", params=params)
+                ),
             ),
             fallback=[],
         )
@@ -517,8 +528,10 @@ class FeegowClient:
         return self._safe_call(
             lambda: self._cached(
                 cache_key,
-                lambda: self._request(
-                    "GET", "professional/list", params=params,
+                lambda: self._collection_content(
+                    self._request(
+                        "GET", "professional/list", params=params
+                    )
                 ),
             ),
             fallback=[],
@@ -584,8 +597,10 @@ class FeegowClient:
         return self._safe_call(
             lambda: self._cached(
                 cache_key,
-                lambda: self._request(
-                    "GET", "procedures/list", params=params,
+                lambda: self._collection_content(
+                    self._request(
+                        "GET", "procedures/list", params=params
+                    )
                 ),
             ),
             fallback=[],
@@ -624,11 +639,80 @@ class FeegowClient:
             data_start, data_end,
         )
         return self._safe_call(
-            lambda: self._request(
-                "GET", "appoints/search", params=params,
+            lambda: self._collection_content(
+                self._request("GET", "appoints/search", params=params)
             ),
             fallback=[],
         )
+
+    def list_available_slots(
+        self,
+        *,
+        procedure_id: int,
+        professional_id: int,
+        specialty_id: int,
+        local_id: int,
+        start_date: str,
+        end_date: str,
+    ) -> List[Dict[str, Any]]:
+        """Read real agenda slots with all identifiers required by the flow."""
+        params = {
+            "data_start": start_date,
+            "data_end": end_date,
+            "procedimento_id": int(procedure_id),
+            "profissional_id": int(professional_id),
+            "especialidade_id": int(specialty_id),
+            "local_id": int(local_id),
+        }
+        return self._safe_call(
+            lambda: self._collection_content(
+                self._request("GET", "appoints/available-schedule", params=params)
+            ),
+            fallback=[],
+        )
+
+    def find_patient_by_cpf(self, cpf: str) -> List[Dict[str, Any]]:
+        """Return exact CPF candidates for the deterministic identity gate."""
+        digits = "".join(ch for ch in str(cpf) if ch.isdigit())
+        return [
+            patient
+            for patient in self.search_patients(cpf=digits)
+            if "".join(ch for ch in str(patient.get("cpf", "")) if ch.isdigit()) == digits
+        ]
+
+    def find_duplicate_appointments(
+        self,
+        *,
+        paciente_id: Optional[int],
+        cpf: str,
+        data: str,
+        horario: str,
+        profissional_id: int,
+    ) -> List[Dict[str, Any]]:
+        """Read before create/remarcar; ambiguity fails closed in the caller."""
+        day = datetime.strptime(
+            data,
+            "%Y-%m-%d" if len(str(data).split("-", 1)[0]) == 4 else "%d-%m-%Y",
+        ).strftime("%d-%m-%Y")
+        rows = self.search_appointments(day, day)
+        duplicates: List[Dict[str, Any]] = []
+        for row in rows:
+            same_patient = paciente_id is not None and str(
+                row.get("paciente_id", row.get("patient_id", ""))
+            ) == str(paciente_id)
+            same_cpf = "".join(
+                ch for ch in str(row.get("cpf", "")) if ch.isdigit()
+            ) == "".join(ch for ch in str(cpf) if ch.isdigit())
+            same_time = str(row.get("horario", row.get("time", "")))[:5] == str(horario)[:5]
+            raw_professional = row.get(
+                "profissional_id", row.get("professional_id")
+            )
+            same_professional = raw_professional in (None, "") or str(
+                raw_professional
+            ) == str(profissional_id)
+            if (same_patient or same_cpf) and same_time and same_professional:
+                duplicates.append(row)
+        return duplicates
 
     def create_appointment(
         self,
@@ -645,54 +729,65 @@ class FeegowClient:
         observacoes: str = "",
         **kwargs,
     ) -> Dict[str, Any]:
-        """Cria um agendamento (consulta) para um paciente.
-
-        Args:
-            paciente_id: ID do paciente na base Feegow.
-            profissional_id: ID do profissional (médico).
-            unidade_id: ID da unidade (clínica/consultório).
-            especialidade_id: ID da especialidade.
-            data: Data da consulta no formato DD-MM-AAAA.
-            horario: Horário no formato HH:MM ou HH:MM:SS.
-            procedimento_id: ID do procedimento (opcional).
-            canal_id: ID do canal de agendamento (opcional).
-            convenio_id: ID do convênio (opcional).
-            plano_id: ID do plano do convênio (opcional).
-            observacoes: Observações para o agendamento (opcional).
-            **kwargs: Campos adicionais aceitos pela API.
-
-        Returns:
-            Dicionário com a resposta da API. Em caso de sucesso, contém
-            os dados do agendamento criado.
-        """
+        """Create an appointment in status 1 using the current endpoint."""
         body: Dict[str, Any] = {
-            "paciente_id": paciente_id,
-            "profissional_id": profissional_id,
-            "unidade_id": unidade_id,
-            "especialidade_id": especialidade_id,
+            "paciente_id": int(paciente_id),
+            "profissional_id": int(profissional_id),
+            "local_id": int(kwargs.pop("local_id", unidade_id)),
+            "especialidade_id": int(especialidade_id),
             "data": data,
             "horario": horario,
+            "status_id": 1,
         }
-        if procedimento_id is not None:
-            body["procedimento_id"] = procedimento_id
-        if canal_id is not None:
-            body["canal_id"] = canal_id
-        if convenio_id is not None:
-            body["convenio_id"] = convenio_id
-        if plano_id is not None:
-            body["plano_id"] = plano_id
-        if observacoes:
-            body["observacoes"] = observacoes
-        body.update(kwargs)
+        optional = {
+            "procedimento_id": procedimento_id,
+            "canal_id": canal_id,
+            "convenio_id": convenio_id,
+            "plano_id": plano_id,
+            "notas": observacoes or kwargs.pop("notas", None),
+            "valor": kwargs.pop("valor", None),
+            "enviar_confirmacao": kwargs.pop("enviar_confirmacao", None),
+            "encaixe": kwargs.pop("encaixe", None),
+        }
+        body.update({key: value for key, value in optional.items() if value is not None})
+        # A caller cannot smuggle a second status through kwargs.
+        body.update({key: value for key, value in kwargs.items() if key != "status_id"})
+        return self._mutating_post("appoints/new-appoint", body)
 
-        logger.info(
-            "Feegow: creating appointment — paciente=%d, profissional=%d, data=%s %s",
-            paciente_id, profissional_id, data, horario,
+    def update_appointment_status(
+        self, appointment_id: int, status_id: int
+    ) -> Dict[str, Any]:
+        """Update status, except status 7 which is forbidden by policy."""
+        if int(status_id) == 7:
+            raise FeegowValidationError("status 7 é proibido por política de segurança")
+        return self._mutating_post(
+            "appoints/statusUpdate",
+            {"agendamento_id": int(appointment_id), "status_id": int(status_id)},
         )
-        result = self._safe_call(
-            lambda: self._request("POST", "appoints/create", json_data=body),
+
+    def cancel_appointment(
+        self, appointment_id: int, motivo_id: int
+    ) -> Dict[str, Any]:
+        if not motivo_id:
+            raise FeegowValidationError("motivo_id é obrigatório para cancelamento")
+        return self._mutating_post(
+            "appoints/cancel-appoint",
+            {"agendamento_id": int(appointment_id), "motivo_id": int(motivo_id)},
         )
-        return result
+
+    def reschedule_appointment(
+        self, appointment_id: int, data: str, horario: str
+    ) -> Dict[str, Any]:
+        return self._mutating_post(
+            "appoints/reschedule",
+            {"agendamento_id": int(appointment_id), "data": data, "horario": horario},
+        )
+
+    def get_appointment(self, appointment_id: int) -> Dict[str, Any]:
+        """Read one exact appointment for mandatory post-write reconciliation."""
+        return self._request(
+            "GET", "appoints/search", params={"agendamento_id": int(appointment_id)}
+        )
 
     def list_channels(self) -> List[Dict[str, Any]]:
         """Lista os canais de agendamento disponíveis.
@@ -705,7 +800,9 @@ class FeegowClient:
         return self._safe_call(
             lambda: self._cached(
                 "channels:all",
-                lambda: self._request("GET", "appoints/list-channel"),
+                lambda: self._collection_content(
+                    self._request("GET", "appoints/list-channel")
+                ),
             ),
             fallback=[],
         )
@@ -738,16 +835,8 @@ class FeegowClient:
         except Exception:
             logger.warning("Feegow find_patient_for_secretary: search failed")
             return None
-        if not isinstance(result, dict):
-            logger.warning("Feegow find_patient: unexpected response type %s", type(result))
-            return None
-        if result.get("error"):
-            return None
-        content_data = result.get("content", result.get("data", []))
-        if isinstance(content_data, dict) and not content_data.get("error"):
-            return content_data
-        if isinstance(content_data, list) and content_data:
-            return content_data[0]
+        if isinstance(result, list) and result:
+            return result[0] if isinstance(result[0], dict) else None
         return None
 
     def get_available_slots_text(

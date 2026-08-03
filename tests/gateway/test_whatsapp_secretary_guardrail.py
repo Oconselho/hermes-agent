@@ -151,6 +151,18 @@ def test_first_substantive_reply_identifies_automated_secretary():
     assert result.lower().startswith("boa tarde. aqui é o atendimento automatizado")
 
 
+def test_only_time_based_greeting_is_allowed_outbound():
+    result = _whatsapp_finalize_secretary_response(
+        "Olá! A secretaria recebeu sua mensagem. Tenha um bom dia.",
+        [],
+        current_text="Preciso de uma informação.",
+    )
+    lowered = result.lower()
+    assert not lowered.startswith("olá")
+    assert "tenha um bom dia" not in lowered
+    assert "atendimento automatizado" in lowered
+
+
 #
 # Incident 20/jul/2026: the model returned "\\u200b\\u200b" (zero-width spaces).
 

@@ -164,6 +164,10 @@ _WHATSAPP_NO_ACTION_UPDATE_RE = re.compile(
     r"estou\s+(?:indo|saindo|chegando)|fiquei\s+em\b)",
     re.IGNORECASE,
 )
+_WHATSAPP_NON_TIME_GREETING_RE = re.compile(
+    r"^(?:oi|ol[aá]|ola|hey|e\s+ai|e\s+a[ií])[!,.: ]+",
+    re.IGNORECASE,
+)
 _WHATSAPP_HUMANIZED_RESPONSE_RE = re.compile(
     r"(?:\btudo\s+(?:bem|ótim[oa]|otim[oa])\b|\bestou\s+(?:bem|ótim[oa]|otim[oa])\b|"
     r"\bque\s+bom\b|\bum\s+abra[cç]o\b|\babra[cç]os?\b|"
@@ -228,6 +232,11 @@ def _whatsapp_finalize_secretary_response(
     if not text:
         return None
 
+    # Only time-based greetings are allowed in an outbound secretary message.
+    text = _WHATSAPP_NON_TIME_GREETING_RE.sub("", text).strip()
+    text = re.sub(r"\btenha\s+um\s+(?:bom\s+dia|boa\s+tarde|boa\s+noite)\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip()
+
     # Remove prohibited personal/social language rather than allowing the model
     # to make the automated service sound like Dr. Victor or a personal friend.
     humanized = bool(_WHATSAPP_HUMANIZED_RESPONSE_RE.search(text))
@@ -237,7 +246,14 @@ def _whatsapp_finalize_secretary_response(
     if not text:
         text = "A mensagem foi recebida e será encaminhada para avaliação."
 
-    has_identity = bool(_WHATSAPP_INSTITUTIONAL_IDENTITY_RE.search(text))
+    # The first substantive reply must explicitly identify automation. A bare
+    # mention of "secretaria" describes the service but does not satisfy that
+    # disclosure requirement.
+    has_identity = bool(re.search(
+        r"\b(?:atendimento\s+automatizado|secretaria\s+(?:virtual|automatizada)|assistente\s+virtual)\b",
+        text,
+        re.IGNORECASE,
+    ))
     if not has_identity and not _whatsapp_history_has_institutional_identity(history):
         greeting_match = re.match(r"^(Bom dia|Boa tarde|Boa noite)[!,.: ]*(.*)$", text, re.IGNORECASE)
         identity = "Aqui é o atendimento automatizado da secretaria do Dr. Victor Almeida."
@@ -3912,6 +3928,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+
+        # Deterministic WhatsApp-appointments handler cache. Built once (see
+        # ``_get_appointment_handler``) and shared by the per-message hook
+        # and the periodic outbox/retention watcher so they never open
+        # independent SQLite handles under separate in-process instances.
+        self._appointment_handler = None
+        self._appointment_handler_ready = False
+        self._appointment_watcher_task = None
 
         # scale-to-zero (Phase 0, F13): gateway-scoped "last inbound seen" clock.
         # There is no such clock today (only a per-agent _last_activity_ts), so the
@@ -8096,9 +8120,127 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # engages drain on the first tick.
         asyncio.create_task(self._drain_control_watcher())
 
+        # Start the WhatsApp-appointments outbox/retention watcher exactly
+        # once, only after the WhatsApp adapter itself is actually
+        # connected (``self.adapters`` only holds adapters that finished
+        # ``connect()`` successfully) and only when the deterministic flow
+        # is configured. A disabled/unconfigured deployment never builds a
+        # handler, so this makes zero extra calls.
+        appointment_handler = self._get_appointment_handler()
+        if (
+            Platform.WHATSAPP in self.adapters
+            and appointment_handler is not None
+            and appointment_handler.watcher_enabled
+        ):
+            _appointment_task = asyncio.create_task(self._appointment_outbox_watcher())
+            self._background_tasks.add(_appointment_task)
+            _appointment_task.add_done_callback(self._background_tasks.discard)
+            self._appointment_watcher_task = _appointment_task
+
         logger.info("Press Ctrl+C to stop")
-        
+
         return True
+
+    def _get_appointment_handler(self):
+        """Build the WhatsApp-appointments handler once and cache it.
+
+        Returns ``None`` (cached) when the feature is disabled or the
+        Feegow token is unavailable, so both the per-message hook and the
+        watcher stay no-ops without re-attempting construction every call.
+        """
+        if getattr(self, "_appointment_handler_ready", False):
+            return self._appointment_handler
+        self._appointment_handler_ready = True
+        self._appointment_handler = None
+        try:
+            appointment_cfg = (
+                (self.config.get("platforms", {}) or {})
+                .get("whatsapp", {})
+                .get("secretary_appointments", {})
+            )
+            if not isinstance(appointment_cfg, dict) or appointment_cfg.get("enabled") is not True:
+                return None
+            from gateway.platforms.feegow_api import FeegowClient
+            from gateway.platforms.whatsapp_appointments import WhatsAppAppointmentsHandler
+
+            appointment_token = ""
+            for token_path in (
+                os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                    "feegow_token.txt",
+                ),
+                os.path.join(os.path.expanduser("~/.hermes"), "feegow_token.txt"),
+            ):
+                try:
+                    with open(token_path, "r", encoding="utf-8") as token_file:
+                        appointment_token = token_file.read().strip()
+                    if appointment_token:
+                        break
+                except OSError:
+                    continue
+            if not appointment_token:
+                return None
+            appointment_home = Path(
+                os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
+            )
+            self._appointment_handler = WhatsAppAppointmentsHandler(
+                appointment_cfg,
+                db_path=appointment_home / "state" / "appointments.sqlite3",
+                feegow_client=FeegowClient(
+                    token=appointment_token,
+                    write_enabled=appointment_cfg.get("write_enabled") is True,
+                ),
+            )
+        except Exception:
+            logger.exception("WhatsApp appointment handler failed to initialize; staying closed")
+            self._appointment_handler = None
+        return self._appointment_handler
+
+    async def _deterministic_appointment_response(self, event, source):
+        """Return the deterministic appointment reply, or ``None`` for legacy.
+
+        ``None`` is the contract that keeps the existing model pipeline
+        running exactly once and completely unchanged — it is what every
+        institutional/partner/out-of-scope contact gets. Extracted from
+        ``_handle_message`` so this ownership boundary is unit-testable
+        without a running gateway, like ``run_appointment_watcher``.
+        """
+        platform = getattr(source, "platform", None)
+        if not (platform and getattr(platform, "value", None) == "whatsapp"):
+            return None
+        try:
+            handler = self._get_appointment_handler()
+            if handler is None:
+                return None
+            return await asyncio.to_thread(handler.handle, event)
+        except Exception:
+            # Fail open to the legacy pipeline: a broken deterministic
+            # layer must never swallow a message. The handler itself fails
+            # closed to reception once it owns an active flow.
+            logger.exception("WhatsApp appointment workflow failed closed")
+            return None
+
+    async def _appointment_outbox_watcher(self, interval: float = 30.0) -> None:
+        """Thin wrapper: delegate every tick to the testable module loop.
+
+        All delivery/claim/retention logic lives in
+        ``gateway.platforms.whatsapp_appointments.run_appointment_watcher``
+        so it is unit-testable without a running gateway; this method only
+        supplies the cached handler, the live WhatsApp adapter lookup, and
+        this process's shutdown signal.
+        """
+        handler = getattr(self, "_appointment_handler", None)
+        if handler is None:
+            return
+        from gateway.platforms.whatsapp_appointments import run_appointment_watcher
+
+        await run_appointment_watcher(
+            handler,
+            lambda: self.adapters.get(Platform.WHATSAPP),
+            self._shutdown_event,
+            interval=interval,
+            worker_id=f"gateway-{os.getpid()}",
+        )
 
     async def _handoff_watcher(self, interval: float = 2.0) -> None:
         """Background task that processes pending CLI→gateway session handoffs.
@@ -8939,6 +9081,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await self._cleanup_agent_resources_off_loop(
                         _agent, context="shutdown idle-cache"
                     )
+
+            # Cancel and await the appointments watcher explicitly, and
+            # before adapters disconnect below — it calls adapter.send()
+            # each tick, so it must stop before its adapter is torn down.
+            # ``getattr`` defends test doubles that build a bare instance
+            # without running the real ``__init__``.
+            _appointment_watcher_task = getattr(self, "_appointment_watcher_task", None)
+            if _appointment_watcher_task is not None and not _appointment_watcher_task.done():
+                _appointment_watcher_task.cancel()
+                try:
+                    await asyncio.wait_for(_appointment_watcher_task, timeout=5.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+                except Exception:
+                    logger.debug(
+                        "appointment watcher task raised during shutdown", exc_info=True
+                    )
+            if hasattr(self, "_appointment_watcher_task"):
+                self._appointment_watcher_task = None
 
             for platform, adapter in list(self.adapters.items()):
                 await self._bounded_adapter_teardown(adapter, platform)
@@ -12377,21 +12538,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     pass
 
-            # Run the agent
-            agent_result = await self._run_agent(
-                message=message_text,
-                context_prompt=context_prompt,
-                history=history,
-                source=source,
-                session_id=_run_start_session_id,
-                session_key=session_key,
-                run_generation=run_generation,
-                event_message_id=self._reply_anchor_for_event(event),
-                channel_prompt=event.channel_prompt,
-                moa_config=getattr(event, "_moa_config", None),
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
+            # Deterministic patient workflow. ``None`` preserves the complete
+            # existing model pipeline for non-patients and institutional
+            # contacts. The handler is built once and cached (see
+            # ``_get_appointment_handler``); the watcher started at startup
+            # shares this exact instance.
+            _appointment_response = await self._deterministic_appointment_response(
+                event, source
             )
+
+            if _appointment_response is not None:
+                agent_result = {
+                    "final_response": _appointment_response,
+                    "messages": [],
+                    "api_calls": 0,
+                }
+            else:
+                agent_result = await self._run_agent(
+                    message=message_text,
+                    context_prompt=context_prompt,
+                    history=history,
+                    source=source,
+                    session_id=_run_start_session_id,
+                    session_key=session_key,
+                    run_generation=run_generation,
+                    event_message_id=self._reply_anchor_for_event(event),
+                    channel_prompt=event.channel_prompt,
+                    moa_config=getattr(event, "_moa_config", None),
+                    persist_user_message=persist_user_message,
+                    persist_user_timestamp=persist_user_timestamp,
+                )
 
             # Stop persistent typing indicator now that the agent is done
             try:
@@ -19003,7 +19179,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "lid-mapping-[0-9]*.json"
                             )):
                                 if "_reverse" not in _mf:
-                                    with open(_mf) as _mfh:
+                                    with open(_mf, encoding="utf-8") as _mfh:
                                         _mapped_lid = _mfh.read().strip().strip('"')
                                     if _mapped_lid and _mapped_lid in _wa_sender_digits:
                                         _wa_phone_resolved = os.path.basename(_mf).replace("lid-mapping-", "").replace(".json", "")
