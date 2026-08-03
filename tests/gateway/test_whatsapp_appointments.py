@@ -197,7 +197,8 @@ def test_existing_patient_completes_proc1_with_preflight_status1_and_readback(tm
 
     greeting = handler.handle(event("Quero agendar uma consulta", message_id="p1-1"))
     assert "1 - Agendar" in greeting
-    assert "assistente virtual do Dr. Victor Almeida" in greeting
+    assert "assistente do Dr. Victor Almeida" in greeting
+    assert "assistente virtual" not in greeting.lower()
     service_menu = handler.handle(event("1", message_id="p1-2"))
     assert "R$" not in service_menu
     assert "05/08/2026" in handler.handle(event("1", message_id="p1-3"))

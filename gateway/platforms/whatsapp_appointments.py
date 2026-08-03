@@ -256,7 +256,7 @@ _RECONCILIATION_SUBJECT = {
 
 _INITIAL_STATE = FlowState.AWAITING_APPOINTMENT_ACTION.value
 _INITIAL_MENU = (
-    "Olá, sou a assistente virtual do Dr. Victor Almeida. "
+    "Olá, sou a assistente do Dr. Victor Almeida. "
     "Como posso ajudar com o seu agendamento?\n"
     "1 - Agendar uma consulta\n"
     "2 - Consultar ou remarcar um agendamento\n"
