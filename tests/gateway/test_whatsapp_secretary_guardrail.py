@@ -18,6 +18,7 @@ from gateway.run import (
     _whatsapp_contact_is_organization,
     _whatsapp_declared_person_name,
     _whatsapp_finalize_secretary_response,
+    _whatsapp_greeting_response,
     _whatsapp_has_scheduling_intent,
     _whatsapp_is_social_greeting,
 )
@@ -110,10 +111,18 @@ def test_explicit_booking_request_is_scheduling():
     assert _whatsapp_has_scheduling_intent("Gostaria de marcar uma consulta e saber os horários disponíveis.")
 
 
-def test_social_greeting_is_silenced_but_real_request_is_not():
+def test_social_greeting_is_classified_without_operational_request():
     assert _whatsapp_is_social_greeting("Oi velho Tudo bem?")
     assert _whatsapp_is_social_greeting("Tudo ótimo")
     assert not _whatsapp_is_social_greeting("Bom dia, quero agendar uma consulta.")
+
+
+def test_initial_social_greeting_gets_safe_secretary_reply():
+    result = _whatsapp_greeting_response("Oi")
+    assert result == (
+        "Olá, sou a assistente do Dr. Victor. Ele está ocupado no momento. "
+        "Posso anotar seu recado?"
+    )
 
 
 def test_status_update_without_request_is_suppressed_after_recent_reply():

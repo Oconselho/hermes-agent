@@ -177,7 +177,7 @@ _WHATSAPP_HUMANIZED_RESPONSE_RE = re.compile(
 )
 _WHATSAPP_INSTITUTIONAL_IDENTITY_RE = re.compile(
     r"\b(?:atendimento\s+automatizado|secretaria(?:\s+(?:virtual|automatizada))?|"
-    r"assistente\s+virtual)\b",
+    r"assistente\s+(?:virtual|do\s+dr\.?\s+victor))\b",
     re.IGNORECASE,
 )
 
@@ -200,6 +200,14 @@ def _whatsapp_is_social_greeting(text: Any) -> bool:
     return bool(
         _WHATSAPP_SOCIAL_GREETING_ANCHORS.intersection(words)
         and set(words).issubset(_WHATSAPP_SOCIAL_GREETING_WORDS)
+    )
+
+
+def _whatsapp_greeting_response(text: Any) -> str:
+    """Return the deterministic first-contact reply for a bare greeting."""
+    return (
+        "Olá, sou a assistente do Dr. Victor. Ele está ocupado no momento. "
+        "Posso anotar seu recado?"
     )
 
 
@@ -11828,19 +11836,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Load conversation history from transcript
         history = self.session_store.load_transcript(session_entry.session_id)
 
-        # Social greetings and well-being exchanges are not service requests.
-        # Stay silent instead of impersonating a personal acquaintance.
+        # A bare greeting gets one deterministic secretary introduction. Once
+        # that introduction is already visible in the transcript, suppress
+        # repeated social greetings to avoid a personal back-and-forth.
         if (
             getattr(source.platform, "value", source.platform) == "whatsapp"
             and not str(event.text or "").lstrip().startswith("/")
             and _whatsapp_is_social_greeting(event.text)
         ):
+            if _whatsapp_history_has_institutional_identity(history):
+                logger.info(
+                    "[WhatsApp] Suppressing repeated social greeting after "
+                    "secretary introduction for session %s",
+                    session_key,
+                )
+                return ""
             logger.info(
-                "[WhatsApp] Suppressing social greeting without operational request "
+                "[WhatsApp] Sending deterministic secretary introduction for "
+                "social greeting "
                 "for session %s",
                 session_key,
             )
-            return ""
+            return _whatsapp_greeting_response(event.text)
 
         # Suppress a repeated attachment/caption/confirmation only when the
         # recent visible secretary reply already covered the same request.
