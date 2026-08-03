@@ -143,3 +143,54 @@ def test_feature_gate_is_closed_unless_enabled_is_exactly_true(block):
     runner._appointment_handler_ready = False
 
     assert runner._get_appointment_handler() is None
+
+
+def _real_gateway_config(block=None):
+    extra = {} if block is None else {"secretary_appointments": block}
+    return SimpleNamespace(
+        platforms={
+            gateway_run.Platform.WHATSAPP: SimpleNamespace(extra=extra),
+        }
+    )
+
+
+def _write_fake_feegow_token(monkeypatch, tmp_path):
+    (tmp_path / "feegow_token.txt").write_text("fake-feegow-token", encoding="utf-8")
+    monkeypatch.setattr(
+        gateway_run.os.path,
+        "abspath",
+        lambda _path: str(tmp_path / "gateway" / "run.py"),
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+
+
+def test_real_gateway_config_reads_enabled_appointments_from_platform_extra(
+    monkeypatch, tmp_path
+):
+    """Production GatewayConfig shape must build the deterministic handler."""
+    _write_fake_feegow_token(monkeypatch, tmp_path)
+    runner = gateway_run.GatewayRunner.__new__(gateway_run.GatewayRunner)
+    runner.config = _real_gateway_config({"enabled": True})
+    runner._appointment_handler = None
+    runner._appointment_handler_ready = False
+
+    assert runner._get_appointment_handler() is not None
+
+
+def test_real_gateway_config_without_appointments_extra_fails_closed():
+    runner = gateway_run.GatewayRunner.__new__(gateway_run.GatewayRunner)
+    runner.config = _real_gateway_config()
+    runner._appointment_handler = None
+    runner._appointment_handler_ready = False
+
+    assert runner._get_appointment_handler() is None
+
+
+@pytest.mark.parametrize("enabled", [False, "true", 1, None])
+def test_real_gateway_config_requires_enabled_to_be_exactly_true(enabled):
+    runner = gateway_run.GatewayRunner.__new__(gateway_run.GatewayRunner)
+    runner.config = _real_gateway_config({"enabled": enabled})
+    runner._appointment_handler = None
+    runner._appointment_handler_ready = False
+
+    assert runner._get_appointment_handler() is None

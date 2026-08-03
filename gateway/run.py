@@ -8161,11 +8161,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._appointment_handler_ready = True
         self._appointment_handler = None
         try:
-            appointment_cfg = (
-                (self.config.get("platforms", {}) or {})
-                .get("whatsapp", {})
-                .get("secretary_appointments", {})
-            )
+            appointment_cfg = {}
+            platforms = getattr(self.config, "platforms", None)
+            if isinstance(platforms, dict):
+                whatsapp_config = platforms.get(Platform.WHATSAPP)
+                extra = getattr(whatsapp_config, "extra", None)
+                if isinstance(extra, dict):
+                    appointment_cfg = extra.get("secretary_appointments", {})
+            elif isinstance(self.config, dict):
+                appointment_cfg = (
+                    (self.config.get("platforms", {}) or {})
+                    .get("whatsapp", {})
+                    .get("secretary_appointments", {})
+                )
             if not isinstance(appointment_cfg, dict) or appointment_cfg.get("enabled") is not True:
                 return None
             from gateway.platforms.feegow_api import FeegowClient
