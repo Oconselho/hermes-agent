@@ -1395,18 +1395,34 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             # Determine message type
             msg_type = MessageType.TEXT
             media_type = str(data.get("mediaType", "") or "")
-            if media_type in {"location", "live_location"}:
+            media_type_lower = media_type.lower()
+            native_type = str(data.get("nativeType") or "").strip().lower()
+            native_metadata = data.get("nativeMetadata")
+            native_audio = (
+                native_metadata.get("audio")
+                if isinstance(native_metadata, dict)
+                else None
+            )
+            is_voice_note = (
+                "ptt" in media_type_lower
+                or native_type == "pttmessage"
+                or (
+                    isinstance(native_audio, dict)
+                    and bool(native_audio.get("ptt"))
+                )
+            )
+            if media_type_lower in {"location", "live_location"}:
                 msg_type = MessageType.LOCATION
-            elif media_type == "sticker":
+            elif media_type_lower == "sticker":
                 msg_type = MessageType.STICKER
             elif data.get("hasMedia"):
-                if "image" in media_type:
+                if "image" in media_type_lower:
                     msg_type = MessageType.PHOTO
-                elif "video" in media_type:
+                elif "video" in media_type_lower:
                     msg_type = MessageType.VIDEO
-                elif "ptt" in media_type:  # ptt = WhatsApp voice note
+                elif is_voice_note:  # WhatsApp voice note / push-to-talk audio
                     msg_type = MessageType.VOICE
-                elif "audio" in media_type:
+                elif "audio" in media_type_lower:
                     msg_type = MessageType.AUDIO
                 else:
                     msg_type = MessageType.DOCUMENT

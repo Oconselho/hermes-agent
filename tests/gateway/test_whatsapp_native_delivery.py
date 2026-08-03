@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.platforms.base import MessageType
 from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
 from tests.gateway.test_whatsapp_formatting import _AsyncCM, _make_adapter
 
@@ -119,3 +120,89 @@ async def test_whatsapp_reply_context_is_structured_not_prerendered():
     assert event.reply_to_message_id == "quoted-123"
     assert event.reply_to_text == "the gateway should not inject reply context twice"
     assert not event.text.startswith("[Replying to:")
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_ptt_native_marker_routes_audio_as_voice():
+    """A native WhatsApp PTT marker must trigger the STT path even if mediaType is audio."""
+    adapter = WhatsAppAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"session_name": "test", "dm_policy": "allowlist", "allow_from": ["*"]},
+        )
+    )
+
+    event = await adapter._build_message_event(
+        {
+            "body": "",
+            "chatId": "15551234567@s.whatsapp.net",
+            "senderId": "15551234567@s.whatsapp.net",
+            "isGroup": False,
+            "hasMedia": True,
+            "mediaType": "audio",
+            "mime": "audio/ogg",
+            "nativeType": "pttMessage",
+            "mediaUrls": [],
+        }
+    )
+
+    assert event is not None
+    assert event.message_type is MessageType.VOICE
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_ptt_native_metadata_routes_audio_as_voice():
+    """The bridge's native audio.ptt metadata must also select the STT path."""
+    adapter = WhatsAppAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"session_name": "test", "dm_policy": "allowlist", "allow_from": ["*"]},
+        )
+    )
+
+    event = await adapter._build_message_event(
+        {
+            "body": "",
+            "chatId": "15551234567@s.whatsapp.net",
+            "senderId": "15551234567@s.whatsapp.net",
+            "isGroup": False,
+            "hasMedia": True,
+            "mediaType": "audio",
+            "mime": "audio/ogg",
+            "nativeType": "audioMessage",
+            "nativeMetadata": {"audio": {"ptt": True}},
+            "mediaUrls": [],
+        }
+    )
+
+    assert event is not None
+    assert event.message_type is MessageType.VOICE
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_regular_audio_attachment_stays_audio():
+    """A normal audio attachment must remain outside the automatic STT path."""
+    adapter = WhatsAppAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"session_name": "test", "dm_policy": "allowlist", "allow_from": ["*"]},
+        )
+    )
+
+    event = await adapter._build_message_event(
+        {
+            "body": "",
+            "chatId": "15551234567@s.whatsapp.net",
+            "senderId": "15551234567@s.whatsapp.net",
+            "isGroup": False,
+            "hasMedia": True,
+            "mediaType": "audio",
+            "mime": "audio/mpeg",
+            "nativeType": "audioMessage",
+            "nativeMetadata": {"audio": {"ptt": False}},
+            "mediaUrls": [],
+        }
+    )
+
+    assert event is not None
+    assert event.message_type is MessageType.AUDIO
