@@ -30,7 +30,7 @@ import { execSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
-import { resolveOutboundChatId, sendTextChunks } from './bridge_helpers.js';
+import { resolveOutboundChatId, sendTextChunks, audioMediaType } from './bridge_helpers.js';
 
 // Parse CLI args
 const args = process.argv.slice(2);
@@ -500,7 +500,7 @@ async function startSocket() {
         }
       } else if (messageContent.audioMessage || messageContent.pttMessage) {
         hasMedia = true;
-        mediaType = messageContent.pttMessage ? 'ptt' : 'audio';
+        mediaType = audioMediaType(messageContent);
         try {
           const audioMsg = messageContent.pttMessage || messageContent.audioMessage;
           const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });

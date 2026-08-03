@@ -17,6 +17,7 @@ import {
   buildTextSendPayload,
   createBoundedMessageStore,
   appendMediaFailureNote,
+  audioMediaType,
   extractBridgeEvent,
   mediaPayloadForFile,
   pollCreationMessageFromPayload,
@@ -118,6 +119,15 @@ import {
   assert.deepEqual(content, { text: 'plain text' });
   assert.deepEqual(options, {});
   console.log('  ✓ unresolved replyTo falls back to plain text');
+}
+
+// -- audio voice-note classification ---------------------------------------
+{
+  assert.equal(audioMediaType({ audioMessage: { ptt: true } }), 'ptt');
+  assert.equal(audioMediaType({ audioMessage: { ptt: false } }), 'audio');
+  assert.equal(audioMediaType({ audioMessage: {} }), 'audio');
+  assert.equal(audioMediaType({ pttMessage: { mimetype: 'audio/ogg' } }), 'ptt');
+  console.log('  ✓ audioMessage.ptt and pttMessage are classified as voice notes');
 }
 
 // -- inbound quote/media/native metadata --------------------------------

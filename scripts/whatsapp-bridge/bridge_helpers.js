@@ -345,6 +345,16 @@ export function appendMediaFailureNote(content, failures) {
   return content ? `${content}\n${note}` : note;
 }
 
+/**
+ * Classify a WhatsApp audio payload as a voice note or regular audio file.
+ * Baileys commonly represents voice notes as audioMessage.ptt=true rather
+ * than using a separate pttMessage key.
+ */
+export function audioMediaType(messageContent = {}) {
+  const audioMessage = messageContent.audioMessage;
+  return messageContent.pttMessage || audioMessage?.ptt === true ? 'ptt' : 'audio';
+}
+
 export async function extractBridgeEvent({
   msg,
   chatId,
@@ -424,7 +434,7 @@ export async function extractBridgeEvent({
   } else if (messageContent.audioMessage || messageContent.pttMessage) {
     const item = messageContent.pttMessage || messageContent.audioMessage;
     hasMedia = true;
-    mediaType = item.ptt || messageContent.pttMessage ? 'ptt' : 'audio';
+    mediaType = audioMediaType(messageContent);
     nativeType = messageContent.pttMessage ? 'pttMessage' : 'audioMessage';
     mime = item.mimetype || 'audio/ogg';
     nativeMetadata.audio = { ptt: mediaType === 'ptt' };
