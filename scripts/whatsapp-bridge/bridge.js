@@ -90,6 +90,24 @@ const ownerReplyTimestamps = loadOwnerReplyTimestamps();  // key: chatId, value:
 // which pins the bridge's HTTP handler until the upstream aiohttp timeout
 // fires. Fail fast instead so the gateway can surface a real error and retry.
 const SEND_TIMEOUT_MS = parseInt(process.env.WHATSAPP_SEND_TIMEOUT_MS || '60000', 10);
+const _configuredInboundMediaBytes = Number.parseInt(
+  process.env.WHATSAPP_MAX_INBOUND_MEDIA_BYTES || '20971520',
+  10,
+);
+const MAX_INBOUND_MEDIA_BYTES = Number.isFinite(_configuredInboundMediaBytes)
+  && _configuredInboundMediaBytes > 0
+  ? _configuredInboundMediaBytes
+  : 20 * 1024 * 1024;
+
+function assertInboundMediaSize(media, label, buffer = null) {
+  const declaredBytes = Number(media?.fileLength);
+  if (Number.isFinite(declaredBytes) && declaredBytes > MAX_INBOUND_MEDIA_BYTES) {
+    throw new Error(`${label} exceeds the inbound media size limit`);
+  }
+  if (buffer && Number.isFinite(buffer.length) && buffer.length > MAX_INBOUND_MEDIA_BYTES) {
+    throw new Error(`${label} exceeds the inbound media size limit`);
+  }
+}
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -472,7 +490,9 @@ async function startSocket() {
         hasMedia = true;
         mediaType = 'image';
         try {
+          assertInboundMediaSize(messageContent.imageMessage, 'image');
           const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+          assertInboundMediaSize(messageContent.imageMessage, 'image', buf);
           const mime = messageContent.imageMessage.mimetype || 'image/jpeg';
           const extMap = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'image/gif': '.gif' };
           const ext = extMap[mime] || '.jpg';
@@ -481,6 +501,9 @@ async function startSocket() {
           writeFileSync(filePath, buf);
           mediaUrls.push(filePath);
         } catch (err) {
+          if (String(err?.message || '').includes('size limit')) {
+            body = '[image exceeds the configured size limit]';
+          }
           console.error('[bridge] Failed to download image:', err.message);
         }
       } else if (messageContent.videoMessage) {
@@ -488,7 +511,9 @@ async function startSocket() {
         hasMedia = true;
         mediaType = 'video';
         try {
+          assertInboundMediaSize(messageContent.videoMessage, 'video');
           const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+          assertInboundMediaSize(messageContent.videoMessage, 'video', buf);
           const mime = messageContent.videoMessage.mimetype || 'video/mp4';
           const ext = mime.includes('mp4') ? '.mp4' : '.mkv';
           mkdirSync(DOCUMENT_CACHE_DIR, { recursive: true });
@@ -496,6 +521,9 @@ async function startSocket() {
           writeFileSync(filePath, buf);
           mediaUrls.push(filePath);
         } catch (err) {
+          if (String(err?.message || '').includes('size limit')) {
+            body = '[video exceeds the configured size limit]';
+          }
           console.error('[bridge] Failed to download video:', err.message);
         }
       } else if (messageContent.audioMessage || messageContent.pttMessage) {
@@ -503,7 +531,9 @@ async function startSocket() {
         mediaType = audioMediaType(messageContent);
         try {
           const audioMsg = messageContent.pttMessage || messageContent.audioMessage;
+          assertInboundMediaSize(audioMsg, 'audio');
           const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+          assertInboundMediaSize(audioMsg, 'audio', buf);
           const mime = audioMsg.mimetype || 'audio/ogg';
           const ext = mime.includes('ogg') ? '.ogg' : mime.includes('mp4') ? '.m4a' : '.ogg';
           mkdirSync(AUDIO_CACHE_DIR, { recursive: true });
@@ -511,6 +541,9 @@ async function startSocket() {
           writeFileSync(filePath, buf);
           mediaUrls.push(filePath);
         } catch (err) {
+          if (String(err?.message || '').includes('size limit')) {
+            body = '[audio exceeds the configured size limit]';
+          }
           console.error('[bridge] Failed to download audio:', err.message);
         }
       } else if (messageContent.documentMessage) {
@@ -519,13 +552,18 @@ async function startSocket() {
         mediaType = 'document';
         const fileName = messageContent.documentMessage.fileName || 'document';
         try {
+          assertInboundMediaSize(messageContent.documentMessage, 'document');
           const buf = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+          assertInboundMediaSize(messageContent.documentMessage, 'document', buf);
           mkdirSync(DOCUMENT_CACHE_DIR, { recursive: true });
           const safeFileName = path.basename(fileName).replace(/[^a-zA-Z0-9._-]/g, '_');
           const filePath = path.join(DOCUMENT_CACHE_DIR, `doc_${randomBytes(6).toString('hex')}_${safeFileName}`);
           writeFileSync(filePath, buf);
           mediaUrls.push(filePath);
         } catch (err) {
+          if (String(err?.message || '').includes('size limit')) {
+            body = '[document exceeds the configured size limit]';
+          }
           console.error('[bridge] Failed to download document:', err.message);
         }
       }
