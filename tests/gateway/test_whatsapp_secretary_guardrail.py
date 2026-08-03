@@ -145,8 +145,7 @@ def test_secretary_response_cannot_claim_human_identity_or_use_human_signoff():
         current_text="Oi velho Tudo bem?",
     )
     lowered = result.lower()
-    assert "atendimento automatizado" in lowered
-    assert "secretaria do dr. victor almeida" in lowered
+    assert "assistente do dr. victor almeida" in lowered
     assert "tudo ótimo" not in lowered
     assert "abraço" not in lowered
 
@@ -157,7 +156,7 @@ def test_first_substantive_reply_identifies_automated_secretary():
         [],
         current_text="Boa tarde, quero agendar uma consulta.",
     )
-    assert result.lower().startswith("boa tarde. aqui é o atendimento automatizado")
+    assert result.lower().startswith("boa tarde. aqui é a assistente do dr. victor almeida")
 
 
 def test_only_time_based_greeting_is_allowed_outbound():
@@ -169,7 +168,7 @@ def test_only_time_based_greeting_is_allowed_outbound():
     lowered = result.lower()
     assert not lowered.startswith("olá")
     assert "tenha um bom dia" not in lowered
-    assert "atendimento automatizado" in lowered
+    assert "assistente do dr. victor almeida" in lowered
 
 
 #

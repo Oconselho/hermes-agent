@@ -132,7 +132,7 @@ def test_attended_base_inside_the_window_grants_one_free_return(
     assert "R$ 0" in summary
     result = handler.handle(event("CONFIRMAR", message_id=f"ret-{modality}-8"))
 
-    assert "status 1" in result
+    assert "criado" in result
     assert len(feegow.created_appointments) == 1
     assert feegow.created_appointments[0]["valor"] == 0
     assert feegow.created_appointments[0]["procedimento_id"] == RETURN_PROC
@@ -380,7 +380,7 @@ def test_cancellation_at_exactly_twenty_four_hours_is_allowed(tmp_path):
     assert "CONFIRMAR" in summary
     result = handler.handle(event("CONFIRMAR", message_id="edge24-7"))
 
-    assert "status 11" in result.lower()
+    assert "desmarcado" in result.lower()
     assert feegow.cancelled_appointments == [(701, 1)]
 
 
@@ -403,7 +403,7 @@ def test_cancelling_a_linked_return_reopens_its_base_entitlement(tmp_path):
     handler.handle(event("1", message_id="linked-6"))
     result = handler.handle(event("CONFIRMAR", message_id="linked-7"))
 
-    assert "status 11" in result.lower()
+    assert "desmarcado" in result.lower()
     state, return_id, modality = _ledger_state(db_path)
     assert state == "OPEN"
     assert return_id is None and modality is None

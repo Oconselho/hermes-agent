@@ -196,7 +196,7 @@ def test_existing_patient_completes_proc1_with_preflight_status1_and_readback(tm
     )
 
     greeting = handler.handle(event("Quero agendar uma consulta", message_id="p1-1"))
-    assert "1 - Agendar" in greeting
+    assert "[1] Agendar" in greeting
     assert "assistente do Dr. Victor Almeida" in greeting
     assert "assistente virtual" not in greeting.lower()
     service_menu = handler.handle(event("1", message_id="p1-2"))
@@ -210,7 +210,8 @@ def test_existing_patient_completes_proc1_with_preflight_status1_and_readback(tm
 
     result = handler.handle(event("CONFIRMAR", message_id="p1-8"))
 
-    assert "status 1" in result.lower()
+    assert "criado" in result.lower()
+    assert "status" not in result.lower()
     assert len(feegow.created_patients) == 0
     assert len(feegow.created_appointments) == 1
     assert feegow.created_appointments[0]["procedimento_id"] == 1
@@ -265,7 +266,7 @@ def test_action_2_authenticates_and_lists_only_three_unambiguous_future_appointm
     assert "06/08/2026" in result
     assert "12/08/2026" in result
     assert "13/08/2026" not in result
-    assert result.count("Agendamento ") == 3
+    assert "[1]" in result and "[2]" in result and "[3]" in result
     assert [name for name, _ in feegow.calls].count("search_appointments") == 1
 
 
@@ -309,8 +310,8 @@ def test_action_3_cancels_once_with_reason_1_and_requires_status_11_readback(tmp
     result = handler.handle(event("CONFIRMAR", message_id="cancel-7"))
     replay = handler.handle(event("CONFIRMAR", message_id="cancel-8"))
 
-    assert "status 11" in result.lower()
-    assert "status 11" in replay.lower()
+    assert "desmarcado" in result.lower()
+    assert "desmarcado" in replay.lower()
     assert feegow.cancelled_appointments == [(701, 1)]
     call_names = [name for name, _ in feegow.calls]
     assert call_names.count("cancel_appointment") == 1
@@ -362,8 +363,8 @@ def test_action_2_reschedules_same_procedure_after_fresh_slot_and_duplicate_chec
     result = handler.handle(event("CONFIRMAR", message_id="move-8"))
     replay = handler.handle(event("CONFIRMAR", message_id="move-9"))
 
-    assert "status 15" in result.lower()
-    assert "status 15" in replay.lower()
+    assert "remarcado" in result.lower()
+    assert "remarcado" in replay.lower()
     assert feegow.rescheduled_appointments == [
         {"appointment_id": 801, "data": "2026-08-06", "horario": "15:00"}
     ]
@@ -466,7 +467,7 @@ def test_teleconsultation_creates_proc3_status1_with_absolute_payment_deadline(
         event("CONFIRMAR", message_id=f"deadline-{expected_hours}-8")
     )
 
-    assert "status 1" in result.lower()
+    assert "criado" in result.lower()
     assert "comprovante" in result.lower()
     assert len(feegow.created_appointments) == 1
     created = feegow.created_appointments[0]
@@ -1116,7 +1117,7 @@ def test_new_patient_requires_independent_exact_readback_before_appointment(tmp_
     assert "novo cadastro de paciente" in summary.lower()
     response = handler.handle(event("CONFIRMAR", message_id="new-11"))
 
-    assert "status 1" in response
+    assert "criado" in response
     assert len(feegow.created_patients) == 1
     assert len(feegow.created_appointments) == 1
     assert sum(name == "find_patient_by_cpf" for name, _ in feegow.calls) >= 2
@@ -1183,7 +1184,7 @@ def test_public_flow_exposes_reconciliation_after_ambiguous_authorized_operation
 
     second = handler.handle(event("RECONCILIAR", message_id="public-reconcile-12"))
 
-    assert "status 1" in second
+    assert "criado" in second
     assert len(calls) == 2
     with sqlite3.connect(db_path) as connection:
         consumed_at = connection.execute(
@@ -1457,7 +1458,7 @@ def test_free_return_full_flow_consumes_controlled_ledger_at_zero_price(tmp_path
     assert "R$ 0" in summary
     response = handler.handle(event("CONFIRMAR", message_id="return-8"))
 
-    assert "status 1" in response
+    assert "criado" in response
     assert feegow.created_appointments[0]["procedimento_id"] == 2
     assert feegow.created_appointments[0]["valor"] == 0
     with sqlite3.connect(db_path) as connection:

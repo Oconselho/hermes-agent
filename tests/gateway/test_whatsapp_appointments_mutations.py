@@ -456,7 +456,7 @@ def test_cancel_readback_divergence_is_publicly_reconciled_without_a_second_post
     feegow.readbacks[701]["status_id"] = 11
     second = handler.handle(event("RECONCILIAR", message_id="cdiv-12"))
 
-    assert "status 11" in second.lower()
+    assert "desmarcado" in second.lower()
     assert feegow.cancelled_appointments == [(701, 1)]
     assert _flow_state(db_path) == "COMPLETED"
     assert _authorizations(db_path)[0][4] is not None
@@ -538,7 +538,7 @@ def test_reschedule_readback_divergence_is_publicly_reconciled(tmp_path):
     feegow.readbacks[801].update({"data": "2026-08-06", "horario": "15:00"})
     done = handler.handle(event("RECONCILIAR", message_id="rdiv-13"))
 
-    assert "status 15" in done.lower()
+    assert "remarcado" in done.lower()
     assert len(feegow.rescheduled_appointments) == 1
     assert _authorizations(db_path)[0][4] is not None
 
@@ -607,7 +607,7 @@ def test_create_result_without_an_exact_id_requires_reconciliation(tmp_path):
     feegow.duplicates = [{"agendamento_id": 901}]
     done = handler.handle(event("RECONCILIAR", message_id="noid-12"))
 
-    assert "status 1" in done
+    assert "criado" in done
     assert len(feegow.created_appointments) == 1
 
 

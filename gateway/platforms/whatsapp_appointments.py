@@ -256,19 +256,22 @@ _RECONCILIATION_SUBJECT = {
 
 _INITIAL_STATE = FlowState.AWAITING_APPOINTMENT_ACTION.value
 _INITIAL_MENU = (
-    "Olá, sou a assistente do Dr. Victor Almeida. "
-    "Como posso ajudar com o seu agendamento?\n"
-    "1 - Agendar uma consulta\n"
-    "2 - Consultar ou remarcar um agendamento\n"
-    "3 - Desmarcar uma consulta\n"
-    "4 - Verificar retorno gratuito do pacote\n"
-    "5 - Atualizar telefone ou e-mail cadastrado"
+    "Sou a assistente do Dr. Victor Almeida. Como posso ajudar com o seu "
+    "agendamento?\n"
+    "\n"
+    "[1] Agendar uma consulta\n"
+    "[2] Consultar ou remarcar um agendamento\n"
+    "[3] Desmarcar uma consulta\n"
+    "[4] Verificar retorno gratuito do pacote\n"
+    "[5] Atualizar telefone ou e-mail cadastrado"
 )
 _SERVICE_MENU = (
     "Escolha o serviço:\n"
-    "1 - Consulta presencial\n"
-    "2 - Consulta presencial + 1 retorno\n"
-    "3 - Teleconsulta\n"
+    "\n"
+    "[1] Consulta presencial\n"
+    "[2] Consulta presencial + 1 retorno\n"
+    "[3] Teleconsulta\n"
+    "\n"
     "Para saber os valores, pergunte \"quanto custa\"."
 )
 
@@ -2133,14 +2136,15 @@ class WhatsAppAppointmentsHandler:
         data["reconcile_kind"] = kind
         if retry:
             response = (
-                "A reconciliação ainda não pôde ser concluída sem risco de "
-                "duplicidade. Responda RECONCILIAR novamente ou fale com a recepção."
+                f"Ainda não consegui confirmar o resultado "
+                f"{_RECONCILIATION_SUBJECT.get(kind, 'da operação')} com segurança. "
+                "Responda RECONCILIAR novamente ou fale com a recepção."
             )
         else:
             response = (
-                f"O resultado {_RECONCILIATION_SUBJECT.get(kind, 'da operação')} "
-                "ficou pendente de validação. Responda RECONCILIAR para "
-                "consultar o Feegow sem repetir a escrita."
+                f"Ainda estou confirmando o resultado "
+                f"{_RECONCILIATION_SUBJECT.get(kind, 'da operação')} com o sistema. "
+                "Responda RECONCILIAR para eu verificar, sem duplicar o pedido."
             )
         return self._respond(
             store,
@@ -2198,13 +2202,13 @@ class WhatsAppAppointmentsHandler:
         )
         if kind == "CANCEL":
             completed = {"appointment_id": appointment_id, "completion_kind": "CANCEL"}
-            response = f"Agendamento {appointment_id} desmarcado em status 11."
+            response = f"Agendamento {appointment_id} desmarcado."
         elif kind == "RESCHEDULE":
             completed = {
                 "appointment_id": appointment_id,
                 "completion_kind": "RESCHEDULE",
             }
-            response = f"Agendamento {appointment_id} remarcado em status 15."
+            response = f"Agendamento {appointment_id} remarcado."
         else:
             completed = {"completion_kind": "EDIT"}
             label = "telefone" if data["edit_field"] == "telefone" else "e-mail"
@@ -2676,8 +2680,10 @@ class WhatsAppAppointmentsHandler:
                     message_id,
                     chat_key,
                     (
-                        "O resultado do agendamento ficou pendente de validação. "
-                        "Responda RECONCILIAR para consultar o Feegow sem repetir a escrita."
+                        f"Ainda estou confirmando o resultado "
+                        f"{_RECONCILIATION_SUBJECT.get(data.get('reconcile_kind'), 'da operação')} "
+                        "com o sistema. Responda RECONCILIAR para eu verificar, sem duplicar "
+                        "o pedido."
                     ),
                     FlowState.RECONCILIATION_REQUIRED,
                     data,
@@ -2721,17 +2727,17 @@ class WhatsAppAppointmentsHandler:
         if state == FlowState.COMPLETED.value:
             if data.get("completion_kind") == "CANCEL":
                 response = (
-                    f"Agendamento {data['appointment_id']} desmarcado em status 11."
+                    f"Agendamento {data['appointment_id']} desmarcado."
                 )
             elif data.get("completion_kind") == "RESCHEDULE":
                 response = (
-                    f"Agendamento {data['appointment_id']} remarcado em status 15."
+                    f"Agendamento {data['appointment_id']} remarcado."
                 )
             elif data.get("completion_kind") == "EDIT":
                 response = "Cadastro já atualizado. Nenhuma alteração adicional foi feita."
             else:
                 response = (
-                    "Seu pedido já foi registrado em status 1 e será confirmado pela recepção."
+                    "Seu pedido já foi registrado e será confirmado pela recepção."
                 )
             return self._respond(
                 store,
@@ -2815,9 +2821,9 @@ class WhatsAppAppointmentsHandler:
                 "service_label": service["label"],
                 "slots": slots,
             }
-            lines = ["Escolha uma das vagas disponíveis (horário de Brasília):"]
+            lines = ["Escolha uma das vagas disponíveis (horário de Brasília):", ""]
             lines.extend(
-                f"{index} - {slot['display_date']} às {slot['time']}"
+                f"[{index}] {slot['display_date']} às {slot['time']}"
                 for index, slot in enumerate(slots, 1)
             )
             return self._respond(
@@ -3022,10 +3028,11 @@ class WhatsAppAppointmentsHandler:
                 data["slots"] = slots
                 data.pop("appointments", None)
                 lines = [
-                    "Escolha a nova vaga para o mesmo procedimento (horário de Brasília):"
+                    "Escolha a nova vaga para o mesmo procedimento (horário de Brasília):",
+                    "",
                 ]
                 lines.extend(
-                    f"{slot_index} - {slot['display_date']} às {slot['time']}"
+                    f"[{slot_index}] {slot['display_date']} às {slot['time']}"
                     for slot_index, slot in enumerate(slots, 1)
                 )
                 return self._respond(
@@ -3287,9 +3294,9 @@ class WhatsAppAppointmentsHandler:
             )
             data["return_modality"] = modality
             data["slots"] = slots
-            lines = ["Escolha uma das vagas disponíveis (horário de Brasília):"]
+            lines = ["Escolha uma das vagas disponíveis (horário de Brasília):", ""]
             lines.extend(
-                f"{index} - {slot['display_date']} às {slot['time']}"
+                f"[{index}] {slot['display_date']} às {slot['time']}"
                 for index, slot in enumerate(slots, 1)
             )
             return self._respond(
@@ -3640,10 +3647,10 @@ class WhatsAppAppointmentsHandler:
         if not appointments:
             raise RuntimeError("no unambiguous future appointment")
         data["appointments"] = appointments
-        lines = ["Agendamentos futuros encontrados:"]
+        lines = ["Agendamentos futuros encontrados:", ""]
         lines.extend(
             (
-                f"Agendamento {index} - {appointment['display_date']} "
+                f"[{index}] {appointment['display_date']} "
                 f"às {appointment['time']}"
             )
             for index, appointment in enumerate(appointments, 1)
@@ -3770,15 +3777,15 @@ class WhatsAppAppointmentsHandler:
             completed["payment_pending"] = True
             deadline_text = deadline_at.strftime("%d/%m/%Y %H:%M") + " (horário de Brasília)"
             response = (
-                f"Agendamento {appointment_id} criado em status 1.\n"
+                f"Agendamento {appointment_id} criado.\n"
                 f"Prazo para envio do comprovante: {deadline_text}.\n"
-                f"Beneficiário: {self._payment_beneficiary}\n"
-                f"Pagamento: {self._payment_instructions}\n"
+                f"*Beneficiário:* {self._payment_beneficiary}\n"
+                f"*Pagamento:* {self._payment_instructions}\n"
                 "Envie a imagem ou o PDF do comprovante até o prazo."
             )
         else:
             response = (
-                f"Agendamento {appointment_id} criado em status 1. "
+                f"Agendamento {appointment_id} criado. "
                 "A confirmação final será feita pela recepção."
             )
         return self._respond(
@@ -3847,9 +3854,9 @@ class WhatsAppAppointmentsHandler:
                 f"{data['service_label']} — R$ {data['price']}\n"
                 f"{selected['display_date']} às {selected['time']} (Brasília)\n"
                 f"{new_patient_notice}"
-                f"Beneficiário: {self._payment_beneficiary}\n"
-                f"Pagamento: {self._payment_instructions}\n"
-                "A reserva será criada em status 1. O prazo do comprovante expira "
+                f"*Beneficiário:* {self._payment_beneficiary}\n"
+                f"*Pagamento:* {self._payment_instructions}\n"
+                "A reserva será criada. O prazo do comprovante expira "
                 "automaticamente e, sem recebimento no prazo, a reserva será cancelada.\n"
                 "Responda CONFIRMAR para autorizar uma única vez ou ALTERAR."
             )
@@ -3859,7 +3866,7 @@ class WhatsAppAppointmentsHandler:
                 f"{data['service_label']} — R$ {data['price']}\n"
                 f"{selected['display_date']} às {selected['time']} (Brasília)\n"
                 f"{new_patient_notice}"
-                "Criação inicial em status 1; a recepção fará a confirmação final.\n"
+                "A recepção fará a confirmação final.\n"
                 "Responda CONFIRMAR para autorizar uma única vez ou ALTERAR."
             )
         return self._respond(
