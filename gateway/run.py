@@ -947,6 +947,52 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
 
 
+# Upstream failure phrasing that no clinic secretary would ever produce, so
+# it can be matched anywhere in the reply rather than only at the start.
+_WHATSAPP_PROVIDER_ERROR_PHRASE_RE = re.compile(
+    r"(?i)"
+    r"experiencing high demand"
+    r"|please try again later\.?\s*$"
+    r"|\brate[- ]?limit(?:ed|ing)?\b"
+    r"|\bquota\b.{0,40}\bexceed"
+    r"|\b(?:api|provider|upstream)\s+(?:call\s+)?(?:error|failed|failure)"
+    r"|\bservice\s+unavailable\b"
+    r"|\binternal\s+server\s+error\b"
+    r"|\btimed?\s*out\b.{0,30}\b(?:request|provider|upstream|model)\b"
+)
+
+# gRPC/Google status codes. Case-SENSITIVE on purpose: these are machine
+# tokens, and matching them case-insensitively would swallow ordinary
+# Portuguese prose containing "internal" or an accented near-miss.
+_WHATSAPP_PROVIDER_STATUS_TOKEN_RE = re.compile(
+    r"\b(?:UNAVAILABLE|RESOURCE_EXHAUSTED|PERMISSION_DENIED|INTERNAL"
+    r"|DEADLINE_EXCEEDED|UNAUTHENTICATED|FAILED_PRECONDITION)\b"
+)
+
+
+def _looks_like_whatsapp_provider_error(text: str) -> bool:
+    """Stricter provider-error test for the public WhatsApp line.
+
+    ``_looks_like_gateway_provider_error`` deliberately trades recall for
+    precision — it skips anything over 400 chars or 4 lines so an assistant
+    explaining an HTTP code isn't mistaken for a failure envelope. On a
+    clinic's public line that trade is inverted: the secretary discusses
+    appointments, never status codes, so a false positive costs one silent
+    turn while a false negative ships raw infrastructure text to a patient.
+
+    So: match the envelope shape at the start of the reply at ANY length,
+    plus unmistakable upstream phrasing anywhere in it.
+    """
+    if not text:
+        return False
+    body = str(text).strip()
+    if _GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body):
+        return True
+    if _WHATSAPP_PROVIDER_STATUS_TOKEN_RE.search(body):
+        return True
+    return bool(_WHATSAPP_PROVIDER_ERROR_PHRASE_RE.search(body))
+
+
 def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     """Sanitize final gateway replies before sending them to chat surfaces.
 
@@ -980,6 +1026,23 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
             return "Recebi sua mensagem. O Dr. Victor verificará assim que possível."
         # Block internal error messages — suppress entirely, no reply
         if re.search(r"(?i)no reply|empty content|after retries|fallback providers|all.*retries.*exhausted|⚠️ No reply|⚠️ Processing|response formatting failed", cleaned):
+            return None  # SILENCE: don't send anything to WhatsApp
+        # Block raw provider/API failure envelopes. The list above only names
+        # Hermes' own internal markers, so a verbatim upstream error —
+        # "HTTP 503: This model is currently experiencing high demand." —
+        # sailed through it and was delivered to patients (incident
+        # 06/ago/2026). Non-WhatsApp surfaces get these rewritten into a safe
+        # category further down; that rewrite is unreachable from here
+        # because this branch returns, so apply the same detector and stay
+        # silent. Silence is the right outcome for a public line: the contact
+        # is mid-conversation with a human-sounding secretary and an
+        # infrastructure notice tells them nothing they can act on. The
+        # message is preserved for the operator in the gateway log.
+        if _looks_like_whatsapp_provider_error(cleaned):
+            logger.warning(
+                "Suppressed provider-error envelope destined for WhatsApp: %s",
+                cleaned[:200].replace("\n", " "),
+            )
             return None  # SILENCE: don't send anything to WhatsApp
         # Block leaked XML tool call blocks (DeepSeek hallucination)
         # Tier 1: Hermes native tool XML wrappers
@@ -13549,6 +13612,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source.platform.value if source.platform else "?",
             source.user_id,
         )
+        # Second layer. The adapter should already have stripped command
+        # status from this message at ingestion (MessageEvent.commands_disabled),
+        # so reaching here on a public surface means something bypassed that —
+        # and the denial text below explains the admin/user tiers, which is
+        # itself information a stranger shouldn't get. Refuse silently.
+        if policy.public_surface:
+            logger.warning(
+                "Public-surface command /%s reached the dispatch gate; "
+                "refusing silently", canonical_cmd,
+            )
+            return ""
         allowed_preview = sorted(policy.user_allowed_commands)
         if allowed_preview:
             suffix = (
@@ -21488,7 +21562,16 @@ REGRAS ABSOLUTAS:
             # as user input.  The primary fix is in base.py (commands bypass the
             # active-session guard), but this catches edge cases where command
             # text leaks through the interrupt_message fallback.
-            if pending and pending.strip().startswith("/"):
+            # …but a sender who never had the command surface (a public
+            # WhatsApp contact) wasn't issuing a command in the first place —
+            # discarding here would silently swallow a patient's message
+            # because it happened to start with a slash. For them the text is
+            # ordinary input and must reach the agent like any other.
+            if (
+                pending
+                and pending.strip().startswith("/")
+                and not getattr(pending_event, "commands_disabled", False)
+            ):
                 _pending_parts = pending.strip().split(None, 1)
                 _pending_cmd_word = _pending_parts[0][1:].lower() if _pending_parts else ""
                 if _pending_cmd_word:

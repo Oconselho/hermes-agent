@@ -2096,6 +2096,25 @@ class AIAgent:
 
     @staticmethod
     def _summarize_api_error(error: Exception) -> str:
+        """Total wrapper around :meth:`_summarize_api_error_impl`.
+
+        Every caller is already inside an ``except`` block handling an API
+        failure. A raise from here surfaces as "during handling of the above
+        exception, another exception occurred" and destroys the retry path
+        that was about to recover the turn, so this must not be able to fail
+        — the summary is diagnostic text, never worth a lost conversation.
+        """
+        try:
+            return AIAgent._summarize_api_error_impl(error)
+        except Exception:
+            logger.debug("Failed to summarize API error", exc_info=True)
+            try:
+                return f"{type(error).__name__}"
+            except Exception:
+                return "unknown API error"
+
+    @staticmethod
+    def _summarize_api_error_impl(error: Exception) -> str:
         """Extract a human-readable one-liner from an API error.
 
         Handles Cloudflare HTML error pages (502, 503, etc.) by pulling the
@@ -2143,7 +2162,16 @@ class AIAgent:
         # widens exposure vs the old empty-body "HTTP 400" string).
         response = getattr(error, "response", None)
         if response is not None:
-            snippet = (getattr(response, "text", None) or "").strip()
+            # ``.text`` on an httpx response whose body was never read raises
+            # ResponseNotRead — and this function runs INSIDE the API-error
+            # handler, so the raise escaped as a second exception, destroying
+            # the retry/summarize path and taking the whole turn down with it
+            # (incident 06/ago/2026, streaming Gemini 503s). Summarizing an
+            # error must never itself be able to fail.
+            try:
+                snippet = (getattr(response, "text", None) or "").strip()
+            except Exception:
+                snippet = ""
             if snippet:
                 status_code = getattr(error, "status_code", None)
                 prefix = f"HTTP {status_code}: " if status_code else ""

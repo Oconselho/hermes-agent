@@ -20,6 +20,13 @@ Backward compatibility:
   slash command, exactly like before. This means existing installs are
   unaffected until an operator opts in by listing at least one admin.
 
+  EXCEPT on a public surface (``_PUBLIC_BY_DEFAULT_PLATFORMS``, or an
+  explicit ``public_surface: true``). There the sender pool is the general
+  public, so "unconfigured" cannot mean "unrestricted" — gating is on and
+  an empty admin list means nobody runs commands. Set
+  ``public_surface: false`` to restore the permissive rule for a platform
+  that is actually operator-only.
+
 The gate is applied at the slash command dispatch site in
 ``gateway/run.py`` so it covers BOTH built-in and plugin-registered
 commands via the live registry. Gating slash commands does not affect
@@ -65,6 +72,12 @@ class SlashAccessPolicy:
     enabled: bool                      # gating active for this scope?
     admin_user_ids: FrozenSet[str]
     user_allowed_commands: FrozenSet[str]
+    # Public-facing surface: the sender pool is the general public, not the
+    # operator's team. Suppresses the ``_ALWAYS_ALLOWED_FOR_USERS`` floor —
+    # ``/help`` and ``/whoami`` are a guest affordance among colleagues, but
+    # on a clinic's public line they only advertise that a command surface
+    # is on the other end.
+    public_surface: bool = False
 
     def is_admin(self, user_id: Optional[str]) -> bool:
         if not self.enabled:
@@ -83,12 +96,25 @@ class SlashAccessPolicy:
             return True
         if not canonical_cmd:
             return False
-        if canonical_cmd in _ALWAYS_ALLOWED_FOR_USERS:
+        if canonical_cmd in _ALWAYS_ALLOWED_FOR_USERS and not self.public_surface:
             return True
         return canonical_cmd in self.user_allowed_commands
 
 
 _DM_CHAT_TYPES = frozenset({"dm", "direct", "private", ""})
+
+
+# Platforms whose inbound traffic is, by default, the general public rather
+# than an operator's own team. On these the backward-compat "no admin list →
+# gating off" rule is exactly backwards: an unconfigured deployment hands
+# every stranger the full command registry. Listed platforms therefore
+# default to ``public_surface`` (fail closed), and an operator restores the
+# permissive legacy behaviour explicitly with ``public_surface: false``.
+#
+# WhatsApp is here because the secretary profile answers a clinic's public
+# line: on 06/ago/2026 a contact ran ``/reset`` there and got back the
+# session banner naming the active model and provider.
+_PUBLIC_BY_DEFAULT_PLATFORMS: FrozenSet[str] = frozenset({"whatsapp"})
 
 
 def _coerce_id_list(raw: Any) -> FrozenSet[str]:
@@ -137,6 +163,14 @@ def _coerce_command_list(raw: Any) -> FrozenSet[str]:
     return frozenset(out)
 
 
+def _platform_name(platform: Any) -> str:
+    """Normalize a Platform enum / string / None to a lowercase name."""
+    if platform is None:
+        return ""
+    value = getattr(platform, "value", platform)
+    return str(value).strip().lower()
+
+
 def _scope_for_chat_type(chat_type: Optional[str]) -> str:
     if chat_type and chat_type.lower() in _DM_CHAT_TYPES:
         return "dm"
@@ -167,7 +201,9 @@ def _keys_for_scope(scope: str) -> Tuple[str, str]:
     return ("allow_admin_from", "user_allowed_commands")
 
 
-def policy_from_extra(extra: dict, scope: str) -> SlashAccessPolicy:
+def policy_from_extra(
+    extra: dict, scope: str, platform: Optional[str] = None
+) -> SlashAccessPolicy:
     """Build a policy from a platform's ``extra`` dict for one scope.
 
     DM scope falls back to group scope keys ONLY for ``user_allowed_commands``
@@ -175,6 +211,13 @@ def policy_from_extra(extra: dict, scope: str) -> SlashAccessPolicy:
     (operator wants the same command set DM and group) ergonomic without
     forcing duplication. Admin lists are NOT cross-scope: an admin in
     DMs is not implicitly an admin in a group.
+
+    ``platform`` selects the default posture. On a public surface (see
+    ``_PUBLIC_BY_DEFAULT_PLATFORMS``, or an explicit ``public_surface: true``)
+    gating is on even with no admin list configured — an empty list then
+    means "nobody runs commands here", which is the safe reading for a
+    public line. Everywhere else the original backward-compatible rule
+    stands: no admin list → no gating.
     """
     admin_key, cmd_key = _keys_for_scope(scope)
     admin_ids = _coerce_id_list(extra.get(admin_key))
@@ -185,11 +228,18 @@ def policy_from_extra(extra: dict, scope: str) -> SlashAccessPolicy:
         # so operators only need to list it once if it's the same.
         cmds = _coerce_command_list(extra.get("group_user_allowed_commands"))
 
-    enabled = bool(admin_ids)
+    raw_public = extra.get("public_surface")
+    if raw_public is None:
+        public = str(platform or "").strip().lower() in _PUBLIC_BY_DEFAULT_PLATFORMS
+    else:
+        public = bool(raw_public)
+
+    enabled = bool(admin_ids) or public
     return SlashAccessPolicy(
         enabled=enabled,
         admin_user_ids=admin_ids,
         user_allowed_commands=cmds,
+        public_surface=public,
     )
 
 
@@ -204,12 +254,19 @@ def policy_for_source(gateway_config: Any, source: Any) -> SlashAccessPolicy:
     Callers should treat the returned policy as authoritative for slash
     command gating only. It does not gate plain chat messages.
     """
-    if gateway_config is None or source is None:
+    if source is None:
         return SlashAccessPolicy(
             enabled=False,
             admin_user_ids=frozenset(),
             user_allowed_commands=frozenset(),
         )
+    platform_name = _platform_name(getattr(source, "platform", None))
+    if gateway_config is None:
+        # No config to consult. A public-by-default platform must still fail
+        # closed here — this is the path taken when the gateway hasn't
+        # finished wiring config, and it is exactly when a stray command
+        # must not slip through.
+        return policy_from_extra({}, "dm", platform_name)
     platforms = getattr(gateway_config, "platforms", None)
     platform_config = None
     if platforms is not None:
@@ -219,11 +276,72 @@ def policy_for_source(gateway_config: Any, source: Any) -> SlashAccessPolicy:
             platform_config = None
     extra = _platform_extra(platform_config)
     scope = _scope_for_chat_type(getattr(source, "chat_type", None))
-    return policy_from_extra(extra, scope)
+    return policy_from_extra(extra, scope, platform_name)
+
+
+def policy_allows_command_surface(policy: SlashAccessPolicy, user_id: Optional[str]) -> bool:
+    """Whether ``user_id`` may have ``/…`` text treated as a command at all.
+
+    Callers use this at ingestion to decide ``MessageEvent.commands_disabled``.
+    False means the leading slash is just a character: the message goes to
+    the agent as ordinary text and no command handler — including pre-gate
+    ones like ``/status`` — ever sees it. That is deliberately different
+    from *denying* a command: a patient who types ``/agendar`` gets a normal
+    secretary reply rather than a refusal notice whose very wording reveals
+    that an admin command surface exists.
+
+    Only public surfaces can return False; everywhere else the policy is
+    disabled or non-public and this is always True, preserving behaviour.
+    """
+    if not policy.enabled or not policy.public_surface:
+        return True
+    if policy.is_admin(user_id):
+        return True
+    # A public non-admin still reaches the command layer if the operator
+    # explicitly published a command list for them.
+    return bool(policy.user_allowed_commands)
+
+
+def _fails_open(platform: Any) -> bool:
+    """Entitlement to assume when the policy cannot be resolved at all."""
+    return _platform_name(platform) not in _PUBLIC_BY_DEFAULT_PLATFORMS
+
+
+def sender_may_run_commands(gateway_config: Any, source: Any) -> bool:
+    """``policy_allows_command_surface`` resolved straight from a source."""
+    try:
+        policy = policy_for_source(gateway_config, source)
+    except Exception:
+        # An unresolvable policy must not silently re-open a public line.
+        return _fails_open(getattr(source, "platform", None))
+    return policy_allows_command_surface(policy, getattr(source, "user_id", None))
+
+
+def command_surface_open(platform_config: Any, platform: Any, source: Any) -> bool:
+    """Adapter-side entitlement, resolved from a platform's OWN config.
+
+    An adapter holds a ``PlatformConfig``, not the whole ``GatewayConfig``,
+    so it cannot use :func:`sender_may_run_commands`. Same decision, same
+    fail-closed posture, taken from what the adapter actually has.
+    """
+    try:
+        policy = policy_from_extra(
+            _platform_extra(platform_config),
+            _scope_for_chat_type(getattr(source, "chat_type", None)),
+            _platform_name(platform),
+        )
+        return policy_allows_command_surface(
+            policy, getattr(source, "user_id", None)
+        )
+    except Exception:
+        return _fails_open(platform)
 
 
 __all__ = [
     "SlashAccessPolicy",
     "policy_from_extra",
     "policy_for_source",
+    "policy_allows_command_surface",
+    "sender_may_run_commands",
+    "command_surface_open",
 ]

@@ -484,6 +484,7 @@ import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union
 from enum import Enum
 
@@ -1769,6 +1770,18 @@ class MessageEvent:
     # completion notifications) that must bypass user authorization checks.
     internal: bool = False
 
+    # Set when the sender is not entitled to run slash commands on this
+    # surface (see ``_apply_command_entitlement``).  A leading ``/`` then
+    # carries no special meaning: the message is ordinary conversation and
+    # flows to the agent like any other text.  This is the single choke
+    # point — ``is_command()`` is what every dispatch site consults, so
+    # neutralizing it here keeps command handling, the ``/status``
+    # pre-gate, and plaintext coercion consistently out of reach for
+    # public contacts (incident 06/ago/2026: a patient ran ``/reset`` on
+    # the clinic's WhatsApp line and received the session banner, which
+    # names the active model and provider).
+    commands_disabled: bool = False
+
     # Free-form per-event metadata.  Adapters may set platform-specific
     # signals here (e.g. WhatsApp sets ``whatsapp_from_owner=True`` when
     # the bridge is configured to forward owner-typed messages).  Plugins
@@ -1781,6 +1794,8 @@ class MessageEvent:
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
+        if self.commands_disabled:
+            return False
         return self.text.startswith("/")
     
     def get_command(self) -> Optional[str]:
@@ -1836,6 +1851,11 @@ def coerce_plaintext_gateway_command(event: "MessageEvent") -> None:
     """
     try:
         if event is None or event.message_type != MessageType.TEXT:
+            return
+        # Senders without the command surface must not be able to reach an
+        # admin command through the plaintext back door either — this rewrite
+        # targets /restart, which would bounce the live gateway.
+        if getattr(event, "commands_disabled", False):
             return
         text = (event.text or "").strip()
         if not text or text.startswith("/"):
@@ -4546,7 +4566,9 @@ class BasePlatformAdapter(ABC):
         thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
 
         try:
-            response = await self._message_handler(event)
+            response = self._normalize_handler_response(
+                await self._message_handler(event)
+            )
             _text, _eph_ttl = self._unwrap_ephemeral(response)
             # Send the response BEFORE cancelling the old task so the send
             # cannot be affected by task-cancellation side effects (race
@@ -4592,10 +4614,72 @@ class BasePlatformAdapter(ABC):
 
         await self._drain_pending_after_session_command(session_key, command_guard)
 
+    @staticmethod
+    def _normalize_handler_response(response: Any) -> Any:
+        """Reduce an agent-result mapping to the text the adapter delivers.
+
+        ``GatewayRunner._handle_message`` returns either a string or an
+        agent-result dict (``{"final_response": ..., "messages": [...], ...}``).
+        Every downstream step here — ``"[[as_document]]" in response``,
+        ``extract_media``, ``extract_images`` — assumes a string.
+
+        A dict slipped through because the guard in front of them is a bare
+        ``if response:`` and a populated dict is truthy: the silent shapes
+        (blocklisted WhatsApp contact, ``{"final_response": "SILENT"}``) sailed
+        past the empty check and then died in ``extract_media`` with
+        ``'dict' object has no attribute 'replace'``. The adapter caught that
+        at its exception boundary and, on WhatsApp, suppressed the reply — so
+        the contact got silence, message after message (incident 06/ago/2026,
+        chat 70282995859480@lid).
+
+        Returns ``None`` for intentional silence, so the caller's
+        ``if response:`` reaches the right conclusion on its own. Non-mapping
+        results (including ``EphemeralReply``) pass through untouched.
+        """
+        if not isinstance(response, Mapping):
+            return response
+        final = response.get("final_response")
+        if not isinstance(final, str) or not final.strip():
+            return None
+        try:
+            from gateway.response_filters import (
+                is_intentional_silence_agent_result,
+            )
+
+            if is_intentional_silence_agent_result(dict(response), final):
+                return None
+        except Exception:
+            logger.debug("silence-marker check failed", exc_info=True)
+        return final
+
+    def _apply_command_entitlement(self, event: MessageEvent) -> None:
+        """Mark ``event`` when its sender may not use the command surface.
+
+        Resolved from this adapter's own ``PlatformConfig.extra`` rather than
+        the gateway config, because that is what an adapter holds. Failure to
+        resolve is treated as "not entitled" on public-by-default platforms:
+        a broken policy must not re-open a public line.
+        """
+        if getattr(event, "internal", False):
+            return
+        from gateway.slash_access import command_surface_open
+
+        allowed = command_surface_open(
+            self.config, self.platform, getattr(event, "source", None)
+        )
+        if not allowed:
+            event.commands_disabled = True
+            if event.text.startswith("/"):
+                logger.info(
+                    "[%s] Command surface withheld for non-admin sender; "
+                    "message routed as ordinary text",
+                    self.name,
+                )
+
     async def handle_message(self, event: MessageEvent) -> None:
         """
         Process an incoming message.
-        
+
         This method returns quickly by spawning background tasks.
         This allows new messages to be processed even while an agent is running,
         enabling interruption support.
@@ -4603,6 +4687,11 @@ class BasePlatformAdapter(ABC):
         if not self._message_handler:
             return
 
+        # Decide once, at ingestion, whether this sender's ``/…`` text is a
+        # command at all. Doing it here (rather than at each dispatch site)
+        # means the pre-gate handlers — ``/status``, and the plaintext
+        # coercion just below — are covered by the same decision.
+        self._apply_command_entitlement(event)
         coerce_plaintext_gateway_command(event)
 
         # Rewrite ``event.source.thread_id`` via the installed recovery hook
@@ -4665,7 +4754,9 @@ class BasePlatformAdapter(ABC):
                 )
                 try:
                     _thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
-                    response = await self._message_handler(event)
+                    response = self._normalize_handler_response(
+                        await self._message_handler(event)
+                    )
                     _text, _eph_ttl = self._unwrap_ephemeral(response)
                     if _text:
                         _r = await self._send_with_retry(
@@ -4718,7 +4809,9 @@ class BasePlatformAdapter(ABC):
                         _thread_meta = _thread_metadata_for_source(
                             event.source, _reply_anchor_for_event(event)
                         )
-                        response = await self._message_handler(event)
+                        response = self._normalize_handler_response(
+                            await self._message_handler(event)
+                        )
                         _text, _eph_ttl = self._unwrap_ephemeral(response)
                         if _text:
                             _r = await self._send_with_retry(
@@ -4866,7 +4959,9 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook("on_processing_start", event)
 
             # Call the handler (this can take a while with tool calls)
-            response = await self._message_handler(event)
+            response = self._normalize_handler_response(
+                await self._message_handler(event)
+            )
             is_ephemeral_response = isinstance(response, EphemeralReply)
 
             # Slash-command handlers may return an EphemeralReply sentinel to
