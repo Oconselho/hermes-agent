@@ -1142,6 +1142,43 @@ class AppointmentStore:
             )
         return {"id": outbox_id, "chat_key": reception_chat_id, "body": body}
 
+    def enqueue_reception_booking(
+        self,
+        appointment_id: int | str,
+        reception_chat_id: str,
+        *,
+        now: datetime,
+    ) -> dict[str, str] | None:
+        """Tell reception a booking was made and still needs confirming.
+
+        Fires for appointments completed WITHOUT a payment hold — today the
+        in-person ones, where the patient pays on site. Reception would
+        otherwise only learn of the booking by watching Feegow.
+
+        Same privacy contract as :meth:`enqueue_reception_receipt`: the body
+        carries the Feegow appointment id and nothing else. No name, CPF,
+        phone, or email — reception looks the id up in Feegow, which already
+        holds that data under its own access control.
+        """
+
+        identifier = str(appointment_id)
+        idempotency_key = _opaque_id("reception-booking", identifier)
+        outbox_id = _opaque_id("outbox", idempotency_key)
+        body = (
+            f"Novo agendamento {identifier} feito pelo WhatsApp. "
+            "Pagamento presencial. Confirmar na Feegow."
+        )
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO outbox_events
+                    (id, idempotency_key, chat_key, body, state, created_at, sent_at)
+                VALUES (?, ?, ?, ?, 'PENDING', ?, NULL)
+                """,
+                (outbox_id, idempotency_key, reception_chat_id, body, now.isoformat()),
+            )
+        return {"id": outbox_id, "chat_key": reception_chat_id, "body": body}
+
     def claim_expiration(
         self,
         appointment_id: int | str,
@@ -3816,6 +3853,24 @@ class WhatsAppAppointmentsHandler:
                 "Envie a imagem ou o PDF do comprovante até o prazo."
             )
         else:
+            # No payment hold: the patient pays on site, so nothing later in
+            # the flow would ever tell reception this booking exists. Queue
+            # the notice on the same outbox the payment-proof notice uses —
+            # it is idempotent by appointment id and retried by the watcher,
+            # so a delivery failure here cannot lose the booking or the
+            # patient's confirmation below.
+            if self._reception_chat_id:
+                try:
+                    store.enqueue_reception_booking(
+                        appointment_id,
+                        self._reception_chat_id,
+                        now=self._now(),
+                    )
+                except Exception:
+                    logger.warning(
+                        "reception booking notice could not be queued",
+                        exc_info=True,
+                    )
             response = (
                 f"Agendamento {appointment_id} criado. "
                 "A confirmação final será feita pela recepção."
