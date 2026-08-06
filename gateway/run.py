@@ -229,6 +229,28 @@ def _whatsapp_history_has_institutional_identity(history: List[Dict[str, Any]]) 
     )
 
 
+def _whatsapp_collapse_horizontal_space(value: Any) -> str:
+    """Normalize spacing WITHOUT destroying line structure.
+
+    This used to be ``re.sub(r"\\s+", " ", …)``, which also ate newlines —
+    so every menu the deterministic appointment flow emits arrived as one
+    unreadable paragraph no matter how it was written at the source. That
+    is why formatting the menu at ``_INITIAL_MENU`` never appeared to take
+    effect: the layout was being flattened downstream, not ignored.
+
+    Runs of spaces/tabs still collapse (the reason the normalization exists
+    — it keeps the identity/humanization regexes below matching across
+    model whitespace noise), and 3+ consecutive newlines collapse to a
+    blank line, but a single ``\\n`` is preserved.
+    """
+    text = str(value or "")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[^\S\n]+", " ", text)     # spaces/tabs, never newlines
+    text = re.sub(r" *\n *", "\n", text)      # trim each line's edges
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
 def _whatsapp_finalize_secretary_response(
     candidate: Any,
     history: List[Dict[str, Any]],
@@ -236,21 +258,30 @@ def _whatsapp_finalize_secretary_response(
     current_text: Any = "",
 ) -> Optional[str]:
     """Apply fail-closed identity and anti-humanization rules to WhatsApp text."""
-    text = re.sub(r"\s+", " ", str(candidate or "")).strip()
+    text = _whatsapp_collapse_horizontal_space(candidate)
     if not text:
         return None
 
     # Only time-based greetings are allowed in an outbound secretary message.
     text = _WHATSAPP_NON_TIME_GREETING_RE.sub("", text).strip()
     text = re.sub(r"\btenha\s+um\s+(?:bom\s+dia|boa\s+tarde|boa\s+noite)\b", " ", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s+", " ", text).strip()
+    text = _whatsapp_collapse_horizontal_space(text)
 
     # Remove prohibited personal/social language rather than allowing the model
     # to make the automated service sound like Dr. Victor or a personal friend.
     humanized = bool(_WHATSAPP_HUMANIZED_RESPONSE_RE.search(text))
     text = _WHATSAPP_HUMANIZED_RESPONSE_RE.sub(" ", text)
-    text = re.sub(r"\s+([,.!?])", r"\1", text)
-    text = re.sub(r"[ ]{2,}", " ", text).strip(" .,!?:;-\")('")
+    # ``[^\S\n]`` so tightening space-before-punctuation cannot pull a line
+    # up into the one above it and undo the layout.
+    text = re.sub(r"[^\S\n]+([,.!?])", r"\1", text)
+    text = _whatsapp_collapse_horizontal_space(text)
+    # Trim punctuation left dangling by the filler removal above — but only
+    # what can never legitimately END a sentence. The old symmetric strip
+    # included ``.`` and ``"``, which chewed the tail off correct text:
+    # 'pergunte "quanto custa".' arrived as 'pergunte "quanto custa' with the
+    # quote left hanging open.
+    text = text.lstrip(" .,!?:;-\")('")
+    text = text.rstrip(" ,;:-('")
     if not text:
         text = "A mensagem foi recebida e será encaminhada para avaliação."
 
@@ -970,6 +1001,33 @@ _WHATSAPP_PROVIDER_STATUS_TOKEN_RE = re.compile(
 )
 
 
+def _whatsapp_normalize_emphasis(text: str) -> str:
+    """Drop stray asterisks while leaving real Markdown emphasis alone.
+
+    The old rule deleted every ``*``, which stopped Markdown leaking into
+    chat by making emphasis impossible — including in the deterministic
+    menus, where it is deliberate and helps a patient scan the options.
+
+    Note what this deliberately does NOT do: convert to WhatsApp's syntax.
+    That is ``WhatsAppBehaviorMixin.format_message``'s job at send time, and
+    it reads its input as Markdown (``**b**`` → ``*b*`` bold, ``*i*`` → ``_i_``
+    italic). Converting here too would double-convert — a menu written
+    ``*1*`` for "bold" arrives as ``_1_``, italic. So emphasis stays Markdown
+    all the way to the transport, and only the junk is removed here.
+    """
+    if not text or "*" not in text:
+        return text
+    # A leading ``* `` is a Markdown bullet, not emphasis — WhatsApp has no
+    # bullet syntax, so render it as one before the cleanup below sees it.
+    text = re.sub(r"(?m)^[ \t]*\*[ \t]+", "• ", text)
+    # Keep balanced ``**bold**`` and ``*italic*`` spans; drop the leftovers.
+    kept: list[str] = []
+    parts = re.split(r"(\*\*[^*\n]+\*\*|\*[^*\n]+\*)", text)
+    for index, part in enumerate(parts):
+        kept.append(part if index % 2 else part.replace("*", ""))
+    return "".join(kept)
+
+
 def _looks_like_whatsapp_provider_error(text: str) -> bool:
     """Stricter provider-error test for the public WhatsApp line.
 
@@ -993,8 +1051,28 @@ def _looks_like_whatsapp_provider_error(text: str) -> bool:
     return bool(_WHATSAPP_PROVIDER_ERROR_PHRASE_RE.search(body))
 
 
-def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
+def _sanitize_gateway_final_response(
+    platform: Any, text: str, *, trusted_source: bool = False
+) -> str:
     """Sanitize final gateway replies before sending them to chat surfaces.
+
+    ``trusted_source`` marks text the gateway composed itself — today only the
+    deterministic Feegow appointment flow, whose wording is a literal in
+    ``whatsapp_appointments.py`` and whose numbers come from the hardcoded
+    ``_SERVICES`` table and Feegow's own API, never from a model.
+
+    Two guards below exist to stop a *model* from inventing money and
+    appointments. They were written in jun/2026, when the secretary was
+    LLM-only; the deterministic flow arrived in ago/2026 and inherited them,
+    which broke the funnel at both moments that matter: "R$ 600" made every
+    price list and booking summary come back as "Obrigado. O Dr. Victor
+    verificará sua mensagem pessoalmente.", and "Agendamento confirmado" did
+    the same to the confirmation. A patient could walk the whole chain and
+    never be told the price or that anything had been booked.
+
+    So those two are skipped for trusted text. Everything else — tool-name
+    leaks, XML, internal reasoning, provider errors — still applies: they cost
+    nothing here and keep this a single hardening path.
 
     Every human-facing chat surface (Telegram, WhatsApp, Discord, Slack,
     Signal, Matrix, plugin platforms, etc.) should receive concise, safe
@@ -1141,7 +1219,7 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
             r"|\b(amanh[aã]|hoje)\b"
             r"))"
         )
-        if _fake_appt_re.search(cleaned):
+        if not trusted_source and _fake_appt_re.search(cleaned):
             return "Obrigado. O Dr. Victor verificará sua mensagem pessoalmente."
 
         # ── Block any currency/price disclosure ──
@@ -1152,13 +1230,14 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
             r"|\b\d{1,6}[.,]\d{2}\b"
             r"|(?:\b(custa|pre[cç]o|valor|pagamento|parcela)\b.{0,40}?\b(\d[\d.,]*)\b)"
         )
-        if _price_disclosure_re.search(cleaned):
+        if not trusted_source and _price_disclosure_re.search(cleaned):
             return "Obrigado. O Dr. Victor verificará sua mensagem pessoalmente."
 
         if internal_reasoning_re.search(cleaned):
             return "Obrigado. O Dr. Victor verificará sua mensagem pessoalmente."
         cleaned = re.sub(r"```.*?```", "", cleaned, flags=re.S)
-        cleaned = cleaned.replace("`", "").replace("*", "").replace("!", ".")
+        cleaned = _whatsapp_normalize_emphasis(cleaned)
+        cleaned = cleaned.replace("`", "").replace("!", ".")
         cleaned = re.sub(r"[\U0001F300-\U0001FAFF\u2600-\u27BF]", "", cleaned)
         cleaned = re.sub(r"[ \t]+", " ", cleaned)
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
@@ -12778,7 +12857,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 response = _normalize_empty_agent_response(
                     agent_result, response, history_len=len(history),
                 )
-                response = _sanitize_gateway_final_response(source.platform, response)
+                response = _sanitize_gateway_final_response(
+                    source.platform,
+                    response,
+                    # Only the deterministic appointment handler earns this;
+                    # anything the model produced goes through every guard.
+                    trusted_source=_appointment_response is not None,
+                )
                 if response is None:
                     # Model returned [SILENCIOSO] — conversation already resolved,
                     # no message should be sent.

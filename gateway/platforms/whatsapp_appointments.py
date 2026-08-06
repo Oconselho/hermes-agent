@@ -255,23 +255,40 @@ _RECONCILIATION_SUBJECT = {
 }
 
 _INITIAL_STATE = FlowState.AWAITING_APPOINTMENT_ACTION.value
+# Menu layout note: one option per line, number emphasized. Author emphasis
+# as MARKDOWN (``**1**``) — never as WhatsApp's own ``*1*``. The transport's
+# ``WhatsAppBehaviorMixin.format_message`` reads this text as Markdown on the
+# way out and converts ``**b**`` → ``*b*`` (bold); a ``*1*`` written here is
+# read as Markdown *italic* and shipped as ``_1_`` instead.
+#
+# Both the line breaks and the emphasis used to be destroyed downstream —
+# ``_whatsapp_finalize_secretary_response`` collapsed every newline and the
+# sanitizer deleted every asterisk — so the menu reached patients as one
+# unreadable paragraph however it was written here. Fixed in gateway/run.py
+# (``_whatsapp_collapse_horizontal_space``, ``_whatsapp_normalize_emphasis``)
+# and pinned by tests/gateway/test_whatsapp_menu_formatting.py, which asserts
+# the bytes AFTER format_message. Keep the closing "responda com o número"
+# line: it is the prompt that keeps the funnel moving to the next step.
 _INITIAL_MENU = (
     "Sou a assistente do Dr. Victor Almeida. Como posso ajudar com o seu "
     "agendamento?\n"
     "\n"
-    "[1] Agendar uma consulta\n"
-    "[2] Consultar ou remarcar um agendamento\n"
-    "[3] Desmarcar uma consulta\n"
-    "[4] Verificar retorno gratuito do pacote\n"
-    "[5] Atualizar telefone ou e-mail cadastrado"
+    "**1** - Agendar uma consulta\n"
+    "**2** - Consultar ou remarcar um agendamento\n"
+    "**3** - Desmarcar uma consulta\n"
+    "**4** - Agendar consulta sequencial do pacote de atendimento\n"
+    "**5** - Atualizar telefone ou e-mail cadastrado\n"
+    "\n"
+    "Responda com o número da opção desejada."
 )
 _SERVICE_MENU = (
     "Escolha o serviço:\n"
     "\n"
-    "[1] Consulta presencial\n"
-    "[2] Consulta presencial + 1 retorno\n"
-    "[3] Teleconsulta\n"
+    "**1** - Consulta presencial\n"
+    "**2** - Consulta presencial + 1 consulta sequencial\n"
+    "**3** - Teleconsulta\n"
     "\n"
+    "Responda com o número da opção desejada.\n"
     "Para saber os valores, pergunte \"quanto custa\"."
 )
 
@@ -280,7 +297,11 @@ _SERVICES: dict[int, dict[str, Any]] = {
     2: {
         "procedure_id": 9,
         "price": 800,
-        "label": "Consulta presencial + 1 retorno",
+        # Patient-facing label (shows in the booking summary). "retorno
+        # gratuito" was wrong — the package includes a sequential
+        # consultation, nothing free. The Feegow-side preflight still matches
+        # on Feegow's OWN procedure name, which is untouched by this wording.
+        "label": "Consulta presencial + 1 consulta sequencial",
     },
     3: {"procedure_id": 3, "price": 300, "label": "Teleconsulta"},
 }
@@ -288,7 +309,7 @@ _SERVICES: dict[int, dict[str, Any]] = {
 _PRICE_LIST_TEXT = (
     "Os valores são:\n"
     "Consulta presencial — R$ 600\n"
-    "Consulta presencial + 1 retorno — R$ 800\n"
+    "Consulta presencial + 1 consulta sequencial — R$ 800\n"
     "Teleconsulta — R$ 300"
 )
 
@@ -321,7 +342,13 @@ _APPOINTMENT_PATTERNS = tuple(
         r"\b(?:consultar|ver|confirmar|verificar)\s+(?:(?:a|o|minha|meu)\s+)?(?:consulta|agendamento|retorno)\b",
         r"\btenho\s+(?:uma\s+)?consulta\s+(?:agendada|marcada)\b",
         r"\bverificar\s+(?:o\s+|meu\s+)?retorno\b",
+        # "retorno (gratuito)" stays recognized even though the menu no longer
+        # says it: patients keep using the old wording, and the funnel must
+        # still route them. "consulta sequencial" is the new phrasing the menu
+        # teaches, so it has to be recognized too.
         r"\bretorno\s+(?:gratuito|do\s+pacote|inclus[oa])\b",
+        r"\bconsulta\s+sequencial\b",
+        r"\bsequencial\s+do\s+pacote\b",
         r"\b(?:editar|atualizar|alterar)\s+(?:o\s+|meu\s+|minha\s+)?cadastro\b",
         r"\b(?:atualizar|alterar)\s+(?:meu\s+|minha\s+)?(?:telefone|celular|e-?mail)\b",
     )
@@ -2823,7 +2850,7 @@ class WhatsAppAppointmentsHandler:
             }
             lines = ["Escolha uma das vagas disponíveis (horário de Brasília):", ""]
             lines.extend(
-                f"[{index}] {slot['display_date']} às {slot['time']}"
+                f"**{index}** - {slot['display_date']} às {slot['time']}"
                 for index, slot in enumerate(slots, 1)
             )
             return self._respond(
@@ -3032,7 +3059,7 @@ class WhatsAppAppointmentsHandler:
                     "",
                 ]
                 lines.extend(
-                    f"[{slot_index}] {slot['display_date']} às {slot['time']}"
+                    f"**{slot_index}** - {slot['display_date']} às {slot['time']}"
                     for slot_index, slot in enumerate(slots, 1)
                 )
                 return self._respond(
@@ -3296,7 +3323,7 @@ class WhatsAppAppointmentsHandler:
             data["slots"] = slots
             lines = ["Escolha uma das vagas disponíveis (horário de Brasília):", ""]
             lines.extend(
-                f"[{index}] {slot['display_date']} às {slot['time']}"
+                f"**{index}** - {slot['display_date']} às {slot['time']}"
                 for index, slot in enumerate(slots, 1)
             )
             return self._respond(
@@ -3650,7 +3677,7 @@ class WhatsAppAppointmentsHandler:
         lines = ["Agendamentos futuros encontrados:", ""]
         lines.extend(
             (
-                f"[{index}] {appointment['display_date']} "
+                f"**{index}** - {appointment['display_date']} "
                 f"às {appointment['time']}"
             )
             for index, appointment in enumerate(appointments, 1)
@@ -3668,7 +3695,12 @@ class WhatsAppAppointmentsHandler:
     def _service_choice(normalized: str) -> int | None:
         if normalized in {"1", "600", "r$ 600", "consulta", "presencial"}:
             return 1
-        if normalized in {"2", "800", "r$ 800", "pacote", "retorno"}:
+        # "retorno" kept alongside the new wording — the menu changed, the
+        # vocabulary patients arrive with did not.
+        if normalized in {
+            "2", "800", "r$ 800", "pacote", "retorno", "sequencial",
+            "consulta sequencial",
+        }:
             return 2
         if normalized in {"3", "300", "r$ 300", "teleconsulta", "tele"}:
             return 3
@@ -3779,8 +3811,8 @@ class WhatsAppAppointmentsHandler:
             response = (
                 f"Agendamento {appointment_id} criado.\n"
                 f"Prazo para envio do comprovante: {deadline_text}.\n"
-                f"*Beneficiário:* {self._payment_beneficiary}\n"
-                f"*Pagamento:* {self._payment_instructions}\n"
+                f"**Beneficiário:** {self._payment_beneficiary}\n"
+                f"**Pagamento:** {self._payment_instructions}\n"
                 "Envie a imagem ou o PDF do comprovante até o prazo."
             )
         else:
@@ -3854,8 +3886,8 @@ class WhatsAppAppointmentsHandler:
                 f"{data['service_label']} — R$ {data['price']}\n"
                 f"{selected['display_date']} às {selected['time']} (Brasília)\n"
                 f"{new_patient_notice}"
-                f"*Beneficiário:* {self._payment_beneficiary}\n"
-                f"*Pagamento:* {self._payment_instructions}\n"
+                f"**Beneficiário:** {self._payment_beneficiary}\n"
+                f"**Pagamento:** {self._payment_instructions}\n"
                 "A reserva será criada. O prazo do comprovante expira "
                 "automaticamente e, sem recebimento no prazo, a reserva será cancelada.\n"
                 "Responda CONFIRMAR para autorizar uma única vez ou ALTERAR."

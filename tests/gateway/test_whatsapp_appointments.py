@@ -196,7 +196,9 @@ def test_existing_patient_completes_proc1_with_preflight_status1_and_readback(tm
     )
 
     greeting = handler.handle(event("Quero agendar uma consulta", message_id="p1-1"))
-    assert "[1] Agendar" in greeting
+    # Menu options are now one-per-line with the number in WhatsApp bold;
+    # layout itself is pinned in test_whatsapp_menu_formatting.py.
+    assert "**1** - Agendar" in greeting
     assert "assistente do Dr. Victor Almeida" in greeting
     assert "assistente virtual" not in greeting.lower()
     service_menu = handler.handle(event("1", message_id="p1-2"))
@@ -266,7 +268,9 @@ def test_action_2_authenticates_and_lists_only_three_unambiguous_future_appointm
     assert "06/08/2026" in result
     assert "12/08/2026" in result
     assert "13/08/2026" not in result
-    assert "[1]" in result and "[2]" in result and "[3]" in result
+    # Numbered lists across the flow now use the same one-per-line bold
+    # style as the menus (see test_whatsapp_menu_formatting.py).
+    assert "**1**" in result and "**2**" in result and "**3**" in result
     assert [name for name, _ in feegow.calls].count("search_appointments") == 1
 
 
