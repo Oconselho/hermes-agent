@@ -186,7 +186,7 @@ class TestGetSystemPromptForChannel:
 
 
 class TestResolveSessionAgentRuntimePriority:
-    """Model/runtime priority: session /model → channel_overrides → global."""
+    """Model/runtime priority: session /model → channel → platform → global."""
 
     def test_channel_override_beats_global(self):
         runner = object.__new__(GatewayRunner)
@@ -300,3 +300,44 @@ class TestResolveSessionAgentRuntimePriority:
              }):
             model, _runtime = runner._resolve_session_agent_runtime(source=source)
         assert model == "parent/model"
+
+    def test_platform_override_does_not_require_global_provider_runtime(self):
+        """WhatsApp must use its valid Luna/Codex override without resolving
+        the unavailable global Gemini runtime first."""
+        runner = object.__new__(GatewayRunner)
+        runner._session_model_overrides = {}
+        runner.config = GatewayConfig(platforms={})
+        source = SessionSource(
+            platform=Platform.WHATSAPP,
+            chat_id="chat_1",
+            user_id="u1",
+        )
+        with patch("gateway.run._resolve_gateway_model", return_value="gemini-3.5-flash"), \
+             patch(
+                 "gateway.run._resolve_runtime_agent_kwargs",
+                 side_effect=RuntimeError("global Gemini unavailable"),
+             ), \
+             patch(
+                 "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+                 return_value={
+                     "provider": "openai-codex",
+                     "api_key": "test-key",
+                     "base_url": "",
+                     "api_mode": "",
+                 },
+             ):
+            model, runtime = runner._resolve_session_agent_runtime(
+                source=source,
+                user_config={
+                    "model": {"default": "gemini-3.5-flash"},
+                    "platform_model_overrides": {
+                        "whatsapp": {
+                            "model": "gpt-5.6-luna",
+                            "provider": "openai-codex",
+                        },
+                    },
+                },
+            )
+
+        assert model == "gpt-5.6-luna"
+        assert runtime["provider"] == "openai-codex"

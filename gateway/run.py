@@ -4725,9 +4725,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session.
 
-        Priority (highest first): session ``/model`` → ``channel_overrides`` →
-        global config/env (``_resolve_gateway_model(user_config)`` and default
-        provider resolution).
+        Priority (highest first): session ``/model`` → channel override →
+        incoming-platform override → global config/env
+        (``_resolve_gateway_model(user_config)`` and default provider resolution).
         """
         resolved_session_key = session_key
         if not resolved_session_key and source is not None:
@@ -4774,7 +4774,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 list(self._session_model_overrides.keys())[:5] if self._session_model_overrides else "[]",
             )
 
-        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        # A platform-specific provider must be resolved before the global
+        # fallback. Otherwise a global provider outage (for example Gemini)
+        # blocks an independent WhatsApp Luna/Codex route.
+        platform_override: Optional[dict] = None
+        if source is not None and isinstance(user_config, dict):
+            platform_overrides = user_config.get("platform_model_overrides")
+            platform_name = getattr(source.platform, "value", source.platform)
+            if isinstance(platform_overrides, dict) and platform_name:
+                candidate = platform_overrides.get(str(platform_name))
+                if isinstance(candidate, dict):
+                    platform_override = candidate
+
+        platform_provider = None
+        if platform_override:
+            candidate_provider = platform_override.get("provider")
+            if isinstance(candidate_provider, str) and candidate_provider.strip():
+                platform_provider = candidate_provider.strip()
+
+        if platform_provider:
+            runtime_kwargs = _resolve_runtime_agent_kwargs_for_provider(platform_provider)
+        else:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
         runtime_model = runtime_kwargs.pop("model", None)
         if runtime_model:
             logger.info(
@@ -4783,6 +4804,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 runtime_model,
             )
             model = runtime_model
+
+        if platform_override:
+            platform_model = platform_override.get("model")
+            if isinstance(platform_model, str):
+                platform_model = platform_model.strip()
+            else:
+                platform_model = ""
+            if platform_model:
+                model = platform_model
+            # A bundled provider model only applies when the platform override
+            # leaves the model unspecified.
+            if runtime_model and not platform_model:
+                model = runtime_model
 
         cfg = getattr(self, "config", None)
         if cfg and source is not None:
@@ -11767,12 +11801,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _wa_block_reason,
                     source.chat_id or "unknown",
                 )
-                return {
-                    "final_response": "",
-                    "messages": [],
-                    "api_calls": 0,
-                    "silent": True,
-                }
+                return None
 
         # Get or create session
         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's

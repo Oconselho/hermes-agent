@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from gateway.config import Platform
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.run import (
+    GatewayRunner,
     _sanitize_gateway_final_response,
     _should_suppress_whatsapp_followup,
     _whatsapp_blocklist_match,
@@ -84,6 +85,28 @@ def test_blocklist_status_allows_sender_not_in_list(tmp_path, monkeypatch):
 
     assert not blocked
     assert reason == "not_matched"
+
+
+def test_blocklisted_message_returns_none_to_the_platform_adapter(monkeypatch):
+    """A denylisted WhatsApp contact is silently ignored, never returned as
+    an agent-result dict for BasePlatformAdapter to treat as response text."""
+    runner = object.__new__(GatewayRunner)
+    source = SimpleNamespace(
+        platform=Platform.WHATSAPP,
+        user_name=None,
+        user_id="5511998877665@s.whatsapp.net",
+        chat_id="5511998877665@s.whatsapp.net",
+    )
+    event = SimpleNamespace(text="Oi")
+    monkeypatch.setattr(
+        "gateway.run._whatsapp_blocklist_status", lambda _source: (True, "matched")
+    )
+
+    result = asyncio.run(
+        runner._handle_message_with_agent(event, source, "blocked-whatsapp", 1)
+    )
+
+    assert result is None
 
 
 def test_rapidoc_partner_context_keeps_sender_separate_from_patient():

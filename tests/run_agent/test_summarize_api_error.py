@@ -12,6 +12,8 @@ provider error. This is a diagnostic improvement and is platform-agnostic.
 
 from types import SimpleNamespace
 
+import httpx
+
 from run_agent import AIAgent
 
 
@@ -48,9 +50,36 @@ def test_empty_body_fallback_redacts_secrets(monkeypatch):
     redactor — a proxy echoing an API key in the error must not leak it into
     final_response/logs (the empty-body path previously hid it as bare HTTP 400)."""
     monkeypatch.setenv("HERMES_REDACT_SECRETS", "true")
+    synthetic_credential = "sk-proj-" + ("A" * 32)
     err = _make_empty_body_error(
-        '{"error": {"message": "bad key: sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdef"}}'
+        f'{{"error": {{"message": "bad key: {synthetic_credential}"}}}}'
     )
     summary = AIAgent._summarize_api_error(err)
-    assert "sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdef" not in summary
+    assert synthetic_credential not in summary
+
+
+class _UnreadStreamingResponse:
+    @property
+    def text(self):
+        raise httpx.ResponseNotRead()
+
+
+class _UnreadStreamingResponseError(Exception):
+    status_code = 503
+    body = {}
+    response = _UnreadStreamingResponse()
+
+
+def test_unread_streaming_response_falls_back_to_redacted_original_error():
+    """Unread streaming errors must not mask the provider failure or leak its
+    raw text, which may contain a credential echoed by an upstream proxy."""
+    synthetic_credential = "sk-proj-" + ("B" * 32)
+    err = _UnreadStreamingResponseError(
+        f"Gemini HTTP 503 (UNAVAILABLE): high demand; key={synthetic_credential}"
+    )
+
+    summary = AIAgent._summarize_api_error(err)
+
+    assert "Gemini HTTP 503" in summary
+    assert synthetic_credential not in summary
 

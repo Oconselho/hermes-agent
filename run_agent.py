@@ -2187,10 +2187,13 @@ class AIAgent:
                         return redact_sensitive_text(f"{prefix}{str(payload['message'])[:300]}")
                 return redact_sensitive_text(f"{prefix}{snippet[:300]}")
 
-        # Fallback: truncate the raw string but give more room than 200 chars
+        # Fallback: truncate the raw string but give more room than 200 chars.
+        # Provider errors can echo credentials, so redact this path as well.
         status_code = getattr(error, "status_code", None)
         prefix = f"HTTP {status_code}: " if status_code else ""
-        return AIAgent._decorate_xai_entitlement_error(f"{prefix}{raw[:500]}")
+        return AIAgent._decorate_xai_entitlement_error(
+            redact_sensitive_text(f"{prefix}{raw[:500]}")
+        )
 
     def _mask_api_key_for_logs(self, key: Any) -> Optional[str]:
         # Azure Foundry Entra ID bearer providers are callables — never
