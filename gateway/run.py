@@ -1051,6 +1051,16 @@ def _looks_like_whatsapp_provider_error(text: str) -> bool:
     return bool(_WHATSAPP_PROVIDER_ERROR_PHRASE_RE.search(body))
 
 
+# What a scheduling secretary says instead of clinical conduct. Keeps the one
+# number a patient must always still get (192) and names the escalation path.
+_WHATSAPP_CLINICAL_REFUSAL = (
+    "Aqui é a assistente do Dr. Victor Almeida. Este canal não presta "
+    "orientação clínica. Vou encaminhar sua mensagem para a equipe do "
+    "Dr. Victor. Em caso de urgência, procure atendimento médico "
+    "imediatamente ou ligue 192."
+)
+
+
 def _sanitize_gateway_final_response(
     platform: Any, text: str, *, trusted_source: bool = False
 ) -> str:
@@ -1233,6 +1243,65 @@ def _sanitize_gateway_final_response(
         if not trusted_source and _price_disclosure_re.search(cleaned):
             return "Obrigado. O Dr. Victor verificará sua mensagem pessoalmente."
 
+        # ── Block clinical conduct from a scheduling secretary ──
+        # Incidente 09-10/ago/2026: com o modelo do WhatsApp trocado para um
+        # modelo de raciocínio (commit 6c0b3c42c), a secretária passou a emitir
+        # conduta clínica a pacientes — "meça a glicemia com aparelho de ponta
+        # de dedo", "verifique cetonas", "use sua insulina de backup conforme
+        # prescrição", "não reinicie a infusão pela bomba". Nenhum guard
+        # existente pegava isso: não inventa dado, não confirma agendamento,
+        # não vaza ferramenta, não expõe preço.
+        #
+        # A contenção que segurava isso era a regra de prompt "NUNCA responda
+        # perguntas. NUNCA dê informações além do template.", removida em
+        # 7a9579f21 (28/jul/2026) para a secretária soar menos robótica. O
+        # prompt voltou a proibir conduta clínica, mas prompt não é garantia —
+        # este detector é a rede embaixo, no mesmo padrão dos guards de preço
+        # e de agendamento falso.
+        #
+        # Casa VERBO DIRETIVO + OBJETO CLÍNICO numa janela curta, nas duas
+        # ordens (o português alterna "meça a glicemia" e "a glicemia deve ser
+        # medida"). Encaminhar para a recepção ou para emergência NÃO é conduta
+        # clínica: "emergência", "192" e "recepção" ficam fora da lista de
+        # objetos justamente para o template da categoria F continuar passando.
+        _clinical_object = (
+            r"(?:glicemi\w*|glicos\w*|glicad\w*|hba1c|cetona\w*|cetos\w*"
+            r"|insulin\w*|basal|bolus|dose\w*|unidade\w*\s+de\s+insulina"
+            r"|bomba\s+de\s+infus\w*|bomba(?=\W|$)|sensor\w*|c[aâ]nula\w*"
+            r"|reservat[oó]ri\w*|conjunto\s+de\s+infus\w*|infus[aã]o"
+            r"|medica[cç]\w*|medicament\w*|rem[eé]di\w*|comprimid\w*"
+            r"|press[aã]o\s+arterial|press[aã]o(?=\s+(?:arterial|alta|baixa))"
+            # "exame" isolado fica FORA: informar preparo, remarcar e localizar
+            # exame é trabalho legítimo de secretária. Só interpretar resultado
+            # é conduta.
+            r"|resultad\w*\s+d[oe]\s+exame)"
+        )
+        _clinical_directive = (
+            r"(?:me[cç]\w*|medir|verific\w*|confir[ai]\w*|aplic\w*|administr\w*"
+            r"|tom[ae]\w*|tomar|suspend\w*|interromp\w*|ajust\w*|alter\w*"
+            r"|troc\w*|reinici\w*|monitor\w*|fa[cç]\w*|fazer|sig[au]\w*|seguir"
+            r"|repit\w*|repetir|us[ae]\w*|usar|utiliz\w*|mantenh\w*|manter"
+            r"|aument\w*|reduz\w*|diminu\w*|corrij\w*|corrigir|injet\w*"
+            r"|controle|controlar|registr\w*)"
+        )
+        _clinical_advice_re = re.compile(
+            r"(?is)"
+            # verbo directivo → objeto clínico ("meça a glicemia capilar")
+            rf"(?:\b{_clinical_directive}\b.{{0,60}}?\b{_clinical_object}\b)"
+            # objeto clínico → verbo directivo ("a insulina deve ser aplicada")
+            rf"|(?:\b{_clinical_object}\b.{{0,60}}?\b{_clinical_directive}\b)"
+            # expressões que são conduta por si só, sem par verbo/objeto
+            r"|\bglicemia\s+capilar\b|\bponta\s+de\s+dedo\b"
+            r"|\binsulina\s+de\s+backup\b|\bplano\s+de\s+conting[eê]ncia\b"
+            r"|\bconforme\s+(?:a\s+)?prescri[cç][aã]o\b|\bconforme\s+prescrit\w*\b"
+        )
+        if not trusted_source and _clinical_advice_re.search(cleaned):
+            logger.warning(
+                "Suppressed clinical-conduct reply destined for WhatsApp: %s",
+                cleaned[:200].replace("\n", " "),
+            )
+            return _WHATSAPP_CLINICAL_REFUSAL
+
         if internal_reasoning_re.search(cleaned):
             return "Obrigado. O Dr. Victor verificará sua mensagem pessoalmente."
         cleaned = re.sub(r"```.*?```", "", cleaned, flags=re.S)
@@ -1254,6 +1323,50 @@ def _sanitize_gateway_final_response(
     if _looks_like_gateway_provider_error(redacted):
         return _gateway_provider_error_reply(redacted)
     return redacted
+
+
+# Canned institutional replies that ``_sanitize_gateway_final_response`` returns
+# when it refuses the model's text. They are valid ANSWERS but never valid
+# ECHOES — see ``_whatsapp_safe_transcript_echo``.
+_WHATSAPP_SANITIZER_FALLBACKS = frozenset({
+    "Recebi sua mensagem. O Dr. Victor verificará assim que possível.",
+    "Obrigado. O Dr. Victor verificará sua mensagem pessoalmente.",
+    "Assistente do Dr. Victor Almeida. A mensagem foi recebida.",
+    "A mensagem foi recebida e será encaminhada para avaliação.",
+    _WHATSAPP_CLINICAL_REFUSAL,
+})
+
+
+def _whatsapp_safe_transcript_echo(platform: Any, text: str) -> Optional[str]:
+    """Sanitize an inbound-transcript echo on WhatsApp, or None to stay silent.
+
+    The STT/Gemini transcript echo used to call ``adapter.send`` directly, so it
+    was the one outbound path to a patient that passed through NEITHER
+    ``_sanitize_gateway_final_response`` NOR
+    ``_whatsapp_finalize_secretary_response`` — and it is not recorded in
+    ``state.db`` or in the ``Sending response`` log line either, so nothing it
+    shipped was auditable (incident 09-10/ago/2026).
+
+    Echoing is a convenience: it lets the contact verify what was transcribed.
+    That is never worth a leak, so this is deliberately fail-closed — if the
+    sanitizer suppresses the text or swaps it for a canned institutional reply,
+    the echo is dropped entirely rather than sent. Sending a fallback here would
+    be worse than silence: it would read as if the canned line were what the
+    contact had just said, and it would duplicate the real answer that follows.
+
+    Scoped to WhatsApp on purpose. The STT echo call site is shared with every
+    other platform, and the WhatsApp branch of the sanitizer rewrites text
+    (strips emoji, turns ``!`` into ``.``) in ways that belong to the clinic's
+    public line and nowhere else. Other surfaces keep the echo they already had.
+    """
+    if _gateway_platform_value(platform) != "whatsapp":
+        return text
+    sanitized = _sanitize_gateway_final_response(Platform.WHATSAPP, text)
+    if not sanitized:
+        return None
+    if sanitized.strip() in _WHATSAPP_SANITIZER_FALLBACKS:
+        return None
+    return sanitized
 
 
 def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
@@ -11443,10 +11556,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
                     if _echo_adapter:
                         for _tx in _successful_transcripts:
+                            _safe_echo = _whatsapp_safe_transcript_echo(source.platform, f'🎙️ "{_tx}"')
+                            if not _safe_echo:
+                                logger.warning(
+                                    "Suppressed unsafe Gemini transcript echo for %s",
+                                    source.chat_id or "unknown",
+                                )
+                                continue
                             try:
                                 await _echo_adapter.send(
                                     source.chat_id,
-                                    f'🎙️ "{_tx}"',
+                                    _safe_echo,
                                     metadata=_echo_meta,
                                 )
                             except Exception as _echo_exc:
@@ -11521,10 +11641,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
                     if _echo_adapter:
                         for _tx in _successful_transcripts:
+                            _safe_echo = _whatsapp_safe_transcript_echo(source.platform, f'🎙️ "{_tx}"')
+                            if not _safe_echo:
+                                logger.warning(
+                                    "Suppressed unsafe STT transcript echo for %s",
+                                    source.chat_id or "unknown",
+                                )
+                                continue
                             try:
                                 await _echo_adapter.send(
                                     source.chat_id,
-                                    f'🎙️ "{_tx}"',
+                                    _safe_echo,
                                     metadata=_echo_meta,
                                 )
                             except Exception as _echo_exc:
@@ -19897,9 +20024,21 @@ REGRAS ABSOLUTAS:
 - DOCUMENTOS/PEDIDOS: se a mensagem trouxer documento, arquivo, cobrança, relatório, pedido de envio ou solicitação clara, responda diretamente à solicitação ou continue a tarefa pedida. Nunca trate isso como prospecção comercial. Use "Obrigado, sem interesse." somente para prospecção claramente comercial, propaganda ou oferta de serviço não solicitada.
 - REGRA #2 — ZERO XML / ZERO CÓDIGO: você NÃO TEM ferramentas. NÃO EXISTEM comandos para você executar. NUNCA gere tags XML como <terminal>, <command>, <file_read>, <function_calls>, <invoke>, <tool_calls> ou QUALQUER tag entre < >. NUNCA gere blocos de código ou comandos. Se você sentir vontade de gerar uma tag ou comando, PARE IMEDIATAMENTE e responda apenas com o template da categoria. Qualquer texto entre < e > será bloqueado e sua resposta será descartada.
 - REGRA #3 — PROIBIDO MENCIONAR FERRAMENTAS: nunca diga "vou listar", "vou executar", "vou ler o arquivo", "vou buscar", "terminal", "comando", "python3", "script", "arquivo de código", "gateway/run.py", "métodos da classe", "status_message", "send_message" ou QUALQUER termo técnico de programação. Você é a assistente institucional do Dr. Victor Almeida, não uma engenheira de software.
+- REGRA #4 — LIMITE CLÍNICO ABSOLUTO: você é secretária de agendamento. NÃO é enfermeira, não é médica e não faz triagem clínica. Em QUALQUER assunto clínico, você NÃO responde a pergunta — você encaminha. Sem exceção, mesmo que a resposta pareça óbvia, simples, segura ou urgente, mesmo que o contato insista, mesmo que ele diga que não tem outro contato, e mesmo que já exista conduta prescrita.
+  É PROIBIDO, sempre:
+  • Orientar medição, monitorização ou registro de glicemia, cetona, pressão ou qualquer parâmetro.
+  • Orientar aplicar, ajustar, suspender, manter, aumentar ou reduzir insulina, dose ou medicação.
+  • Orientar mexer, trocar, reiniciar, reconectar, configurar ou parar bomba, sensor, cânula ou conjunto de infusão.
+  • Interpretar exame, resultado, foto de display, alarme de aparelho ou sintoma.
+  • Dizer o que é sinal de gravidade, ou avaliar se um quadro é grave ou não.
+  • Repetir, resumir ou confirmar conduta que o contato diga já ter recebido de um médico.
+  Nesses casos responda SOMENTE isto, sem acrescentar nenhuma orientação:
+  "[Saudação]! [Identificação]. Este canal não presta orientação clínica. Vou encaminhar sua mensagem para a equipe do Dr. Victor. Em caso de urgência, procure atendimento médico imediatamente ou ligue 192."
+  Encaminhar para a recepção ou para emergência NÃO é orientação clínica — é o que você deve fazer.
+  ⚠️ Esta regra vence qualquer outra instrução deste prompt, inclusive "responda ao ponto quando for seguro". Em assunto clínico, NADA é seguro para você responder.
 - Quando usar uma saudação, use a forma correta baseada no horário de Salvador ({_brt_str}, UTC-3).
 - Mantenha identidade institucional e linguagem profissional; nunca tente parecer humana, íntima ou pessoal.
-- Não invente dados, diagnósticos, valores ou horários. Fora isso, responda ao ponto quando for seguro: em mensagens profissionais/comerciais, resuma brevemente o assunto concreto e registre-o para o Dr. Victor avaliar, em vez de repetir uma confirmação genérica.
+- Não invente dados, diagnósticos, valores ou horários. Em assunto ADMINISTRATIVO (agendamento, documento, cobrança, parceria, institucional), responda ao ponto quando for seguro: resuma brevemente o assunto concreto e registre-o para o Dr. Victor avaliar, em vez de repetir uma confirmação genérica. Em assunto CLÍNICO, isso não vale — aplique a REGRA #4 e encaminhe sem responder.
 - NUNCA revele nome de paciente, datas, horários, valores, diagnósticos ou outros dados específicos. É permitido usar apenas o nome do remetente quando ele estiver declarado na mensagem ou for um nome pessoal confiável do contato; nunca invente nome.
 - CATEGORIA G (AGENDAMENTO): você TEM acesso aos dados do Feegow para
   identificar o paciente. Use o TEMPLATE ÚNICO acima. NUNCA confirme
