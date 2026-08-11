@@ -114,6 +114,41 @@ def _whatsapp_silent_agent_result() -> Dict[str, Any]:
     return {"final_response": "SILENT", "messages": [], "api_calls": 0}
 
 
+# The secretary prompt asks the model to answer with a bare ``[SILENCIOSO]``
+# when a message needs no reply. That marker is an instruction to the gateway,
+# never text for a patient, so recognizing it cannot depend on the model
+# reproducing one exact spelling.
+#
+# It did. The check was ``startswith("[SILENCIOSO]")``, and gpt-5.6-luna
+# sometimes writes ``[ SILENCIOSO ]`` with spaces inside the brackets. Four of
+# those reached patients between 09 and 11/ago/2026 — three with the identity
+# line prepended by the finalizer, one raw — while the 83 exactly-spelled ones
+# were suppressed correctly.
+#
+# Match the whole reply only. A response that merely mentions the word in a
+# sentence is real text and must be delivered untouched; silence is the right
+# outcome only when the marker IS the entire message.
+_WHATSAPP_SILENCE_MARKER_RE = re.compile(
+    r"^[\[\{\(<*_\s]*silencios[oa][\]\}\)>*_\s]*[.!]*$",
+    re.IGNORECASE,
+)
+
+
+def _whatsapp_is_silence_marker(text: Any) -> bool:
+    """True when a WhatsApp reply is only the model's stay-silent marker."""
+    if not text:
+        return False
+    candidate = unicodedata.normalize("NFKD", str(text))
+    candidate = "".join(ch for ch in candidate if not unicodedata.combining(ch))
+    # Strip the invisible/odd-space classes the transport strips anyway, so a
+    # zero-width character cannot smuggle the marker past this check.
+    candidate = re.sub(r"[\u200b\u2060\u2063\ufeff]", "", candidate)
+    candidate = re.sub(
+        r"[\u00a0\u1680\u180e\u2000-\u200a\u202f\u205f\u3000]", " ", candidate
+    )
+    return bool(_WHATSAPP_SILENCE_MARKER_RE.match(candidate.strip()))
+
+
 # A WhatsApp patient often sends an attachment, its caption, and a short
 # clarification as separate events.  The model should not be forced to emit a
 # new acknowledgement for every event when the previous acknowledgement
@@ -1097,7 +1132,7 @@ def _sanitize_gateway_final_response(
     if platform_value == "whatsapp":
         cleaned = _redact_gateway_user_facing_secrets(str(text))
         # ── [SILENCIOSO]: model chose to stay silent (conversation already resolved)
-        if cleaned.strip().startswith("[SILENCIOSO]"):
+        if _whatsapp_is_silence_marker(cleaned):
             return None
         # ── Effectively-empty reply: strip invisible format chars and odd
         # unicode spaces (the same classes the WhatsApp transport strips on

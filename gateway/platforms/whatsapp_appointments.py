@@ -1179,6 +1179,53 @@ class AppointmentStore:
             )
         return {"id": outbox_id, "chat_key": reception_chat_id, "body": body}
 
+    def enqueue_reception_handoff(
+        self,
+        chat_key: str,
+        reception_chat_id: str,
+        *,
+        now: datetime,
+    ) -> dict[str, str] | None:
+        """Tell reception an automated booking attempt gave up on this chat.
+
+        Until now reception only heard about appointments that COMPLETED, so a
+        patient whose booking hit a dead end was told "talk to reception" while
+        reception was never told anything. With the agenda read broken, that
+        was every single attempt: ``outbox_events`` held zero rows.
+
+        The dead end must be visible to a human even when the cause is a bug,
+        an outage, or a gate that is deliberately off — this notice is the
+        fail-safe for exactly the case where the rest of the flow cannot be
+        trusted.
+
+        Idempotent per chat per day: a patient who retries several times in one
+        afternoon produces one notice, not one per message, and a new day
+        raises it again because that is a genuinely new attempt.
+
+        Same privacy contract as the other reception notices — no name, CPF,
+        phone, email, or any of the patient's words. Reception opens the
+        conversation it already has access to.
+        """
+
+        day = now.date().isoformat()
+        idempotency_key = _opaque_id("reception-handoff", chat_key, day)
+        outbox_id = _opaque_id("outbox", idempotency_key)
+        body = (
+            "Um paciente tentou agendar pelo WhatsApp e o atendimento "
+            "automático não conseguiu concluir. O paciente foi orientado a "
+            "falar com a recepção."
+        )
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO outbox_events
+                    (id, idempotency_key, chat_key, body, state, created_at, sent_at)
+                VALUES (?, ?, ?, ?, 'PENDING', ?, NULL)
+                """,
+                (outbox_id, idempotency_key, reception_chat_id, body, now.isoformat()),
+            )
+        return {"id": outbox_id, "chat_key": reception_chat_id, "body": body}
+
     def claim_expiration(
         self,
         appointment_id: int | str,
@@ -2175,6 +2222,18 @@ class WhatsAppAppointmentsHandler:
     def _handoff(
         self, store: AppointmentStore, message_id: str, chat_key: str
     ) -> str:
+        # Queueing the notice must never cost the patient their reply, so a
+        # failure here is logged and swallowed — same contract as the booking
+        # notice in _complete_authorized_appointment.
+        if self._reception_chat_id:
+            try:
+                store.enqueue_reception_handoff(
+                    chat_key, self._reception_chat_id, now=self._now()
+                )
+            except Exception:
+                logger.warning(
+                    "reception handoff notice could not be queued", exc_info=True
+                )
         return self._respond(
             store, message_id, chat_key, _RECEPTION, FlowState.HANDOFF, {}
         )
