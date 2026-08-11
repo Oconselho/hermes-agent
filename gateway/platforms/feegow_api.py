@@ -201,7 +201,23 @@ class FeegowClient:
                         response_body=body,
                     )
                 if response.status_code == 422:
+                    # Feegow reports field errors as {"<field>": ["reason"]}
+                    # and sends no "message" key at all. Reading only
+                    # "message" logged a bare "Parâmetros inválidos ou
+                    # faltando:" with nothing after the colon, which is how a
+                    # missing mandatory field stayed invisible for days. Fall
+                    # back to naming the rejected fields. The 422 body of this
+                    # API carries validation text, never patient data.
                     message = body.get("message", "") if isinstance(body, dict) else ""
+                    if not message and isinstance(body, dict):
+                        message = "; ".join(
+                            f"{field}: {'; '.join(str(item) for item in reasons)}"
+                            if isinstance(reasons, (list, tuple))
+                            else f"{field}: {reasons}"
+                            for field, reasons in list(body.items())[:5]
+                        )
+                    if not message:
+                        message = str(body)[:200]
                     raise FeegowValidationError(
                         f"Parâmetros inválidos ou faltando: {message}".strip(),
                         status_code=422,
@@ -286,6 +302,107 @@ class FeegowClient:
                 nested = FeegowClient._collection_content(value)
                 return nested or [value]
         return [result] if result else []
+
+    @staticmethod
+    def _normalize_available_schedule(
+        payload: Any,
+        *,
+        procedure_id: int,
+        professional_id: int,
+        local_id: int,
+    ) -> List[Dict[str, Any]]:
+        """Flatten ``appoints/available-schedule`` into one dict per free slot.
+
+        Feegow does not answer this endpoint with a list of slots. It answers
+        with a tree keyed by professional and location, whose leaves are the
+        free times of one calendar day::
+
+            content:
+              profissional_id:
+                "1":
+                  local_id:
+                    "1":
+                      "2026-08-12": ["14:00:00", "14:30:00"]
+                      "2026-08-26": []
+                  age_restriction: {"age_from": 1, "age_to": 120}
+
+        ``_collection_content`` cannot express that shape — it finds no
+        collection key under ``content`` and returns the branch itself as a
+        single "row", which then carries no date or time and is dropped by
+        ``filter_eligible_slots``. Every booking therefore died with an empty
+        agenda even on HTTP 200.
+
+        Only the professional and location that were actually requested are
+        read, so a future multi-professional answer cannot offer someone
+        else's agenda. Sibling keys that are not dates (``age_restriction``)
+        and days whose list is empty produce nothing.
+
+        No ``id`` is emitted: the slot id is an internal handle only —
+        ``create_appointment`` sends ``data``/``horario`` — and
+        ``filter_eligible_slots`` already derives a deterministic opaque id.
+        Inventing a remote-looking identifier here would be worse than none.
+
+        A flat list is passed through untouched, so a plain answer (and every
+        existing caller and fixture) keeps working. Anything unparseable
+        yields ``[]``: an empty agenda is handed off to reception, which is
+        the fail-closed outcome.
+        """
+
+        if isinstance(payload, (list, tuple)):
+            return [item for item in payload if isinstance(item, dict)]
+        if not isinstance(payload, dict):
+            return []
+        if payload.get("success") is False or payload.get("error"):
+            return []
+
+        content = payload.get("content", payload)
+        if isinstance(content, (list, tuple)):
+            return [item for item in content if isinstance(item, dict)]
+        if not isinstance(content, dict):
+            return []
+
+        by_professional = content.get("profissional_id")
+        if not isinstance(by_professional, dict):
+            return []
+        professional_branch = by_professional.get(str(professional_id))
+        if not isinstance(professional_branch, dict):
+            return []
+        by_local = professional_branch.get("local_id")
+        if not isinstance(by_local, dict):
+            return []
+        local_branch = by_local.get(str(local_id))
+        if not isinstance(local_branch, dict):
+            return []
+
+        slots: List[Dict[str, Any]] = []
+        for raw_day, raw_times in local_branch.items():
+            try:
+                day = datetime.strptime(str(raw_day), "%Y-%m-%d").date()
+            except (TypeError, ValueError):
+                continue  # not a date key (e.g. age_restriction)
+            if not isinstance(raw_times, (list, tuple)):
+                continue
+            for raw_time in raw_times:
+                text = str(raw_time).strip()
+                for fmt in ("%H:%M:%S", "%H:%M"):
+                    try:
+                        moment = datetime.strptime(text, fmt).time()
+                        break
+                    except ValueError:
+                        moment = None
+                if moment is None:
+                    continue
+                slots.append(
+                    {
+                        "data": day.isoformat(),
+                        "horario": moment.strftime("%H:%M"),
+                        "procedimento_id": int(procedure_id),
+                        "profissional_id": int(professional_id),
+                        "local_id": int(local_id),
+                    }
+                )
+        slots.sort(key=lambda slot: (slot["data"], slot["horario"]))
+        return slots
 
     def _cached(
         self,
@@ -655,7 +772,16 @@ class FeegowClient:
         start_date: str,
         end_date: str,
     ) -> List[Dict[str, Any]]:
-        """Read real agenda slots with all identifiers required by the flow."""
+        """Read real agenda slots with all identifiers required by the flow.
+
+        ``tipo`` is mandatory on this endpoint and its absence is not a soft
+        failure: Feegow answers HTTP 422 ``{"tipo": ["O campo tipo é
+        obrigatório."]}``, which ``_safe_call`` turns into an empty agenda,
+        which the booking flow reads as "no vacancy" and hands off to
+        reception. Every appointment — teleconsultation and in-person alike —
+        failed that way. ``"P"`` selects the by-procedure agenda, matching the
+        ``procedimento_id`` sent alongside it.
+        """
         params = {
             "data_start": start_date,
             "data_end": end_date,
@@ -663,10 +789,14 @@ class FeegowClient:
             "profissional_id": int(professional_id),
             "especialidade_id": int(specialty_id),
             "local_id": int(local_id),
+            "tipo": "P",
         }
         return self._safe_call(
-            lambda: self._collection_content(
-                self._request("GET", "appoints/available-schedule", params=params)
+            lambda: self._normalize_available_schedule(
+                self._request("GET", "appoints/available-schedule", params=params),
+                procedure_id=int(procedure_id),
+                professional_id=int(professional_id),
+                local_id=int(local_id),
             ),
             fallback=[],
         )
