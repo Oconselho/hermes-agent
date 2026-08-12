@@ -98,6 +98,43 @@ def test_lead_phrasings_are_recognized(text):
 @pytest.mark.parametrize(
     "text",
     [
+        # The qualification question the model asks offers these paths in
+        # words ("agendar uma consulta, remarcar ou desmarcar, agendar seu
+        # retorno"). Whatever the patient echoes back has to land in the
+        # funnel, or qualifying just leaks the lead one turn later.
+        "quero agendar uma consulta",
+        "agendar",
+        "remarcar",
+        "quero desmarcar",
+        "retorno",
+        "meu retorno",
+        "quero meu retorno",
+        "agendar meu retorno",
+        "marcar retorno",
+    ],
+)
+def test_answers_to_the_qualification_question_reenter_the_funnel(text):
+    assert classify_route(event(text)) is Route.APPOINTMENT
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # "retorno" is also how a partner closes a message. Matching it bare
+        # would drop them into the booking menu.
+        "aguardo retorno",
+        "fico no aguardo do retorno",
+        "obrigado pelo retorno",
+        "aguardo seu retorno sobre a proposta",
+    ],
+)
+def test_partner_sign_offs_are_not_booking_intent(text):
+    assert classify_route(event(text)) is not Route.APPOINTMENT
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
         "oi, tudo bem?",
         "bom dia",
         "obrigado!",

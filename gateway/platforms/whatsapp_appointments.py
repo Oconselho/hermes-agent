@@ -464,6 +464,14 @@ _APPOINTMENT_PATTERNS = tuple(
         # still route them. "consulta sequencial" is the new phrasing the menu
         # teaches, so it has to be recognized too.
         r"\bretorno\s+(?:gratuito|do\s+pacote|inclus[oa])\b",
+        # "retorno" as the patient's own answer to the qualification question,
+        # which offers "agendar seu retorno" in words. Deliberately NOT a bare
+        # \bretorno\b: "aguardo retorno" is how partners close a message, and
+        # that must not drop them into the booking menu.
+        r"^retornos?$",
+        r"\b(?:meu|minha)\s+retorno\b",
+        r"\b(?:quero|queria|gostaria|preciso|precisava|marcar|agendar|remarcar)\s+"
+        r"(?:de\s+)?(?:o\s+|meu\s+)?retorno\b",
         r"\bconsulta\s+sequencial\b",
         r"\bsequencial\s+do\s+pacote\b",
         r"\b(?:editar|atualizar|alterar)\s+(?:o\s+|meu\s+|minha\s+)?cadastro\b",
