@@ -105,6 +105,80 @@ class FlowState(str, Enum):
     RECONCILIATION_REQUIRED = "RECONCILIATION_REQUIRED"
 
 
+class LeadStage(str, Enum):
+    """CRM funnel stages, ordered from first contact to outcome.
+
+    The funnel is a *reporting* view over the flow the patient is already
+    walking — it never gates a transition. ``FlowState`` stays the single
+    source of truth for what happens next, so a bug here can misreport a
+    lead but can never misroute a booking.
+    """
+
+    NOVO = "NOVO"
+    QUALIFICANDO = "QUALIFICANDO"
+    ESCOLHENDO_SERVICO = "ESCOLHENDO_SERVICO"
+    ESCOLHENDO_HORARIO = "ESCOLHENDO_HORARIO"
+    IDENTIFICANDO = "IDENTIFICANDO"
+    AGUARDANDO_AUTORIZACAO = "AGUARDANDO_AUTORIZACAO"
+    AGUARDANDO_PAGAMENTO = "AGUARDANDO_PAGAMENTO"
+    AGENDADO = "AGENDADO"
+    ATENDIMENTO_HUMANO = "ATENDIMENTO_HUMANO"
+    PERDIDO = "PERDIDO"
+
+
+# Every FlowState maps to exactly one funnel stage. States absent here are
+# terminal bookkeeping the funnel does not distinguish; they fall back to the
+# lead's current stage rather than inventing a transition.
+_FLOW_STAGE_MAP: dict[str, LeadStage] = {
+    FlowState.AWAITING_APPOINTMENT_ACTION.value: LeadStage.QUALIFICANDO,
+    FlowState.AWAITING_SERVICE.value: LeadStage.ESCOLHENDO_SERVICO,
+    FlowState.AWAITING_SLOT.value: LeadStage.ESCOLHENDO_HORARIO,
+    FlowState.AWAITING_RESCHEDULE_SLOT.value: LeadStage.ESCOLHENDO_HORARIO,
+    FlowState.AWAITING_RETURN_SLOT.value: LeadStage.ESCOLHENDO_HORARIO,
+    FlowState.AWAITING_RETURN_MODALITY.value: LeadStage.ESCOLHENDO_SERVICO,
+    FlowState.AWAITING_APPOINTMENT_SELECTION.value: LeadStage.QUALIFICANDO,
+    FlowState.AWAITING_CPF.value: LeadStage.IDENTIFICANDO,
+    FlowState.AWAITING_BIRTH_DATE.value: LeadStage.IDENTIFICANDO,
+    FlowState.AWAITING_PHONE_CONFIRMATION.value: LeadStage.IDENTIFICANDO,
+    FlowState.AWAITING_NEW_PATIENT_NAME.value: LeadStage.IDENTIFICANDO,
+    FlowState.AWAITING_NEW_PATIENT_SEX.value: LeadStage.IDENTIFICANDO,
+    FlowState.AWAITING_NEW_PATIENT_EMAIL.value: LeadStage.IDENTIFICANDO,
+    FlowState.AWAITING_EDIT_FIELD.value: LeadStage.IDENTIFICANDO,
+    FlowState.AWAITING_EDIT_VALUE.value: LeadStage.IDENTIFICANDO,
+    FlowState.AWAITING_AUTHORIZATION.value: LeadStage.AGUARDANDO_AUTORIZACAO,
+    FlowState.AWAITING_CANCEL_AUTHORIZATION.value: LeadStage.AGUARDANDO_AUTORIZACAO,
+    FlowState.AWAITING_RESCHEDULE_AUTHORIZATION.value: LeadStage.AGUARDANDO_AUTORIZACAO,
+    FlowState.AWAITING_EDIT_AUTHORIZATION.value: LeadStage.AGUARDANDO_AUTORIZACAO,
+    FlowState.RESERVA_CRIADA_STATUS_1.value: LeadStage.AGUARDANDO_PAGAMENTO,
+    FlowState.AGUARDANDO_COMPROVANTE.value: LeadStage.AGUARDANDO_PAGAMENTO,
+    FlowState.COMPROVANTE_RECEBIDO.value: LeadStage.AGUARDANDO_PAGAMENTO,
+    FlowState.AGUARDANDO_VALIDACAO.value: LeadStage.AGUARDANDO_PAGAMENTO,
+    FlowState.PENDENCIA_NO_COMPROVANTE.value: LeadStage.AGUARDANDO_PAGAMENTO,
+    FlowState.PAGAMENTO_VALIDADO.value: LeadStage.AGENDADO,
+    FlowState.CONFIRMADO_STATUS_7.value: LeadStage.AGENDADO,
+    FlowState.COMPLETED.value: LeadStage.AGENDADO,
+    FlowState.HANDOFF.value: LeadStage.ATENDIMENTO_HUMANO,
+    FlowState.EXCECAO_RECEPCAO.value: LeadStage.ATENDIMENTO_HUMANO,
+    FlowState.RECONCILIATION_REQUIRED.value: LeadStage.ATENDIMENTO_HUMANO,
+    FlowState.RESERVA_CANCELADA.value: LeadStage.PERDIDO,
+    FlowState.EXPIRACAO_INICIADA.value: LeadStage.PERDIDO,
+}
+
+
+@dataclass(frozen=True)
+class Lead:
+    chat_key: str
+    stage: str
+    stage_entered_at: str
+    first_seen_at: str
+    updated_at: str
+    touches: int = 0
+    intent_kind: str | None = None
+    service_label: str | None = None
+    greeted_at: str | None = None
+    lost_reason: str | None = None
+
+
 @dataclass(frozen=True)
 class FlowSnapshot:
     state: str
@@ -126,6 +200,8 @@ _REQUIRED_TABLES = frozenset(
         "watcher_leases",
         "authorizations",
         "returns_ledger",
+        "leads",
+        "lead_events",
     }
 )
 
@@ -245,6 +321,36 @@ CREATE TABLE IF NOT EXISTS authorizations (
     consumed_at TEXT,
     created_at TEXT NOT NULL
 );
+
+-- CRM funnel. Deliberately PII-free: ``chat_key`` is the same opaque WhatsApp
+-- identifier already stored in flow_states/contacts, and no name, CPF, phone
+-- or birth date is ever written here. That keeps the funnel reportable to
+-- reception (and retainable past a flow's 24h TTL) without widening the data
+-- class the SPEC's RNF2 restricts.
+CREATE TABLE IF NOT EXISTS leads (
+    chat_key TEXT PRIMARY KEY,
+    stage TEXT NOT NULL,
+    stage_entered_at TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    touches INTEGER NOT NULL DEFAULT 0,
+    intent_kind TEXT,
+    service_label TEXT,
+    greeted_at TEXT,
+    lost_reason TEXT
+);
+
+CREATE TABLE IF NOT EXISTS lead_events (
+    id TEXT PRIMARY KEY,
+    chat_key TEXT NOT NULL,
+    from_stage TEXT,
+    to_stage TEXT NOT NULL,
+    note TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_leads_stage ON leads (stage, updated_at);
+CREATE INDEX IF NOT EXISTS idx_lead_events_chat ON lead_events (chat_key, created_at);
 """
 
 _RECONCILIATION_SUBJECT = {
@@ -269,10 +375,7 @@ _INITIAL_STATE = FlowState.AWAITING_APPOINTMENT_ACTION.value
 # and pinned by tests/gateway/test_whatsapp_menu_formatting.py, which asserts
 # the bytes AFTER format_message. Keep the closing "responda com o número"
 # line: it is the prompt that keeps the funnel moving to the next step.
-_INITIAL_MENU = (
-    "Sou a assistente do Dr. Victor Almeida. Como posso ajudar com o seu "
-    "agendamento?\n"
-    "\n"
+_MENU_OPTIONS = (
     "**1** - Agendar uma consulta\n"
     "**2** - Consultar ou remarcar um agendamento\n"
     "**3** - Desmarcar uma consulta\n"
@@ -281,6 +384,18 @@ _INITIAL_MENU = (
     "\n"
     "Responda com o número da opção desejada."
 )
+_INITIAL_MENU = (
+    "Sou a assistente do Dr. Victor Almeida. Como posso ajudar com o seu "
+    "agendamento?\n"
+    "\n"
+    f"{_MENU_OPTIONS}"
+)
+# Same menu for a chat that has already been introduced to — by this flow or
+# by the model pipeline, which prefixes its own identity line. Repeating the
+# self-introduction is what made the secretary read as amnesiac: a patient who
+# had just been greeted got "Sou a assistente do Dr. Victor Almeida" a second
+# time, as if the previous turn had not happened.
+_RETURNING_MENU = "Como posso ajudar com o seu agendamento?\n" "\n" f"{_MENU_OPTIONS}"
 _SERVICE_MENU = (
     "Escolha o serviço:\n"
     "\n"
@@ -336,8 +451,10 @@ _INSTITUTIONAL_MARKERS = (
 _APPOINTMENT_PATTERNS = tuple(
     re.compile(pattern)
     for pattern in (
-        r"\b(?:quero|gostaria|preciso|desejo)\s+(?:de\s+)?(?:agendar|marcar|remarcar|reagendar|desmarcar)\b",
-        r"\b(?:agendar|marcar|remarcar|reagendar|desmarcar)\s+(?:(?:uma|a|minha|meu)\s+)?(?:consulta|agendamento|horario)\b",
+        r"\b(?:quero|queria|gostaria|preciso|precisava|desejo|pode|poderia|posso|da\s+pra|gostaves)\s+"
+        r"(?:de\s+)?(?:agendar|marcar|remarcar|reagendar|desmarcar|agenda)\b",
+        r"\b(?:agendar|marcar|remarcar|reagendar|desmarcar)\s+(?:(?:uma|um|a|o|minha|meu)\s+)?"
+        r"(?:consulta|agendamento|horario|atendimento|avaliacao|retorno|teleconsulta)\b",
         r"\bcancelar\s+(?:(?:uma|a|o|minha|meu)\s+)?(?:consulta|agendamento|horario)\b",
         r"\b(?:consultar|ver|confirmar|verificar)\s+(?:(?:a|o|minha|meu)\s+)?(?:consulta|agendamento|retorno)\b",
         r"\btenho\s+(?:uma\s+)?consulta\s+(?:agendada|marcada)\b",
@@ -351,8 +468,54 @@ _APPOINTMENT_PATTERNS = tuple(
         r"\bsequencial\s+do\s+pacote\b",
         r"\b(?:editar|atualizar|alterar)\s+(?:o\s+|meu\s+|minha\s+)?cadastro\b",
         r"\b(?:atualizar|alterar)\s+(?:meu\s+|minha\s+)?(?:telefone|celular|e-?mail)\b",
+        # --- lead intents -------------------------------------------------
+        # Everything below recognizes a patient who wants to be scheduled but
+        # never says the verb the older patterns demanded. Each of these was
+        # answered by the model pipeline before, which is where the funnel
+        # leaked: the deterministic flow only ever saw the tidy phrasings.
+        r"\b(?:tele\s?consulta|tele\s?medicina|consulta\s+online|atendimento\s+online|"
+        r"consulta\s+(?:por\s+)?video|video\s?chamada)\b",
+        r"\b(?:tem|teria|tem\s+algum|ha|havera|existe|sobrou|abriu)\s+(?:algum\s+|alguma\s+)?"
+        r"(?:horario|vaga|agenda|disponibilidade)\b",
+        r"\b(?:horario|vaga|agenda|disponibilidade)s?\s+(?:disponivel|disponiveis|livre|livres|para\s+quando)\b",
+        r"\b(?:quanto\s+custa|qual\s+(?:o\s+)?(?:valor|preco)|valor\s+da\s+consulta|preco\s+da\s+consulta)\b",
+        r"\b(?:primeira|nova)\s+consulta\b",
+        r"\bconsulta\s+(?:com\s+)?(?:o\s+)?(?:dr|doutor|medico|victor)\b",
+        r"\b(?:quero|queria|gostaria|preciso|precisava|procuro)\s+(?:de\s+)?"
+        r"(?:uma\s+|um\s+)?(?:consulta|atendimento|avaliacao|horario|agendamento)\b",
+        r"\b(?:como\s+(?:faco|fazer|marco)|onde\s+(?:marco|agendo))\b.{0,20}"
+        r"\b(?:consulta|agendar|marcar|atendimento)\b",
+        # Bare verb/noun as a whole message ("agendar", "agendamento",
+        # "remarcar") — the commonest opening line of all, and previously
+        # unrecognized because no object followed the verb.
+        r"^(?:agendar|agendamento|marcar|remarcar|reagendar|desmarcar|consulta|teleconsulta)$",
     )
 )
+
+_INTENT_DEGLUE_DIGIT_LETTER_RE = re.compile(r"(?<=\d)(?=[^\W\d_])")
+_INTENT_DEGLUE_LETTER_DIGIT_RE = re.compile(r"(?<=[^\W\d_])(?=\d)")
+_INTENT_PUNCTUATION_RE = re.compile(r"[^\w\s-]+")
+
+
+def _intent_text(value: Any) -> str:
+    """Normalize a message for intent matching, ungluing runs and punctuation.
+
+    Every pattern above is ``\\b``-anchored, and a digit is a word character,
+    so a stray leading digit silently defeats the match: the real message
+    ``0quero agendar`` (12/ago/2026) never matched ``\\bquero``, fell through
+    to the model pipeline, and the patient got a generic reply instead of the
+    menu. Patients glue menu digits onto words constantly — they are replying
+    to a numbered list — so this is a routine input shape, not a typo worth
+    losing a booking over. Punctuation collapses for the same reason
+    (``agendar,consulta``); hyphens survive because ``e-mail`` is matched with
+    one.
+    """
+
+    text = _normalize(value)
+    text = _INTENT_DEGLUE_DIGIT_LETTER_RE.sub(" ", text)
+    text = _INTENT_DEGLUE_LETTER_DIGIT_RE.sub(" ", text)
+    text = _INTENT_PUNCTUATION_RE.sub(" ", text)
+    return " ".join(text.split())
 
 
 class AppointmentStore:
@@ -464,6 +627,177 @@ class AppointmentStore:
 
         with self._connect() as connection:
             connection.execute("DELETE FROM flow_states WHERE chat_key = ?", (chat_key,))
+
+    # ------------------------------------------------------------------
+    # CRM funnel
+    # ------------------------------------------------------------------
+
+    def load_lead(self, chat_key: str) -> Lead | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT chat_key, stage, stage_entered_at, first_seen_at, updated_at,"
+                " touches, intent_kind, service_label, greeted_at, lost_reason"
+                " FROM leads WHERE chat_key = ?",
+                (chat_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return Lead(
+            chat_key=str(row[0]),
+            stage=str(row[1]),
+            stage_entered_at=str(row[2]),
+            first_seen_at=str(row[3]),
+            updated_at=str(row[4]),
+            touches=int(row[5] or 0),
+            intent_kind=None if row[6] is None else str(row[6]),
+            service_label=None if row[7] is None else str(row[7]),
+            greeted_at=None if row[8] is None else str(row[8]),
+            lost_reason=None if row[9] is None else str(row[9]),
+        )
+
+    def record_lead(
+        self,
+        chat_key: str,
+        stage: LeadStage,
+        *,
+        now: datetime,
+        intent_kind: str | None = None,
+        service_label: str | None = None,
+        note: str | None = None,
+        greeted: bool = False,
+        lost_reason: str | None = None,
+    ) -> None:
+        """Upsert the lead and journal a stage change, PII-free.
+
+        Only a *change* of stage writes a ``lead_events`` row, so the history
+        reads as a funnel path rather than one row per message; ``touches``
+        carries the message count instead.
+        """
+
+        stamp = now.isoformat()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT stage, intent_kind, service_label, greeted_at FROM leads"
+                " WHERE chat_key = ?",
+                (chat_key,),
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    "INSERT INTO leads (chat_key, stage, stage_entered_at,"
+                    " first_seen_at, updated_at, touches, intent_kind,"
+                    " service_label, greeted_at, lost_reason)"
+                    " VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)",
+                    (
+                        chat_key,
+                        stage.value,
+                        stamp,
+                        stamp,
+                        stamp,
+                        intent_kind,
+                        service_label,
+                        stamp if greeted else None,
+                        lost_reason,
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO lead_events (id, chat_key, from_stage, to_stage,"
+                    " note, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        _opaque_id(chat_key, stage.value, stamp),
+                        chat_key,
+                        None,
+                        stage.value,
+                        note,
+                        stamp,
+                    ),
+                )
+                return
+
+            previous_stage = str(row[0])
+            connection.execute(
+                "UPDATE leads SET stage = ?, updated_at = ?, touches = touches + 1,"
+                " stage_entered_at = CASE WHEN stage = ? THEN stage_entered_at ELSE ? END,"
+                " intent_kind = COALESCE(?, intent_kind),"
+                " service_label = COALESCE(?, service_label),"
+                " greeted_at = CASE WHEN ? THEN COALESCE(greeted_at, ?) ELSE greeted_at END,"
+                " lost_reason = COALESCE(?, lost_reason)"
+                " WHERE chat_key = ?",
+                (
+                    stage.value,
+                    stamp,
+                    stage.value,
+                    stamp,
+                    intent_kind,
+                    service_label,
+                    1 if greeted else 0,
+                    stamp,
+                    lost_reason,
+                    chat_key,
+                ),
+            )
+            if previous_stage != stage.value:
+                connection.execute(
+                    "INSERT INTO lead_events (id, chat_key, from_stage, to_stage,"
+                    " note, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        _opaque_id(chat_key, previous_stage, stage.value, stamp),
+                        chat_key,
+                        previous_stage,
+                        stage.value,
+                        note,
+                        stamp,
+                    ),
+                )
+
+    def lead_was_greeted(self, chat_key: str, *, now: datetime, within_seconds: int) -> bool:
+        """Whether this chat already got the institutional self-introduction."""
+
+        lead = self.load_lead(chat_key)
+        if lead is None or not lead.greeted_at:
+            return False
+        try:
+            greeted_at = datetime.fromisoformat(lead.greeted_at)
+        except ValueError:
+            return False
+        if greeted_at.tzinfo is None:
+            greeted_at = greeted_at.replace(tzinfo=_BRT)
+        return 0 <= (now - greeted_at).total_seconds() <= within_seconds
+
+    def mark_lead_greeted(self, chat_key: str, *, now: datetime) -> None:
+        """Record that the chat has been introduced to, without a stage change."""
+
+        stamp = now.isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE leads SET greeted_at = COALESCE(greeted_at, ?), updated_at = ?"
+                " WHERE chat_key = ?",
+                (stamp, stamp, chat_key),
+            )
+
+    def funnel_counts(self) -> dict[str, int]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT stage, COUNT(*) FROM leads GROUP BY stage"
+            ).fetchall()
+        return {str(stage): int(count) for stage, count in rows}
+
+    def stale_leads(
+        self, *, now: datetime, older_than_seconds: int, stages: Sequence[str]
+    ) -> list[Lead]:
+        """Leads parked mid-funnel with no activity — the follow-up worklist."""
+
+        if not stages:
+            return []
+        cutoff = (now - timedelta(seconds=older_than_seconds)).isoformat()
+        placeholders = ",".join("?" for _ in stages)
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT chat_key FROM leads WHERE updated_at < ?"
+                f" AND stage IN ({placeholders}) ORDER BY updated_at",
+                (cutoff, *stages),
+            ).fetchall()
+        leads = [self.load_lead(str(row[0])) for row in rows]
+        return [lead for lead in leads if lead is not None]
 
     def quarantine_contact(self, chat_key: str, *, now: datetime) -> None:
         """Atomically suppress all local automation state for an excluded contact.
@@ -1687,7 +2021,9 @@ def classify_route(incoming: Any) -> Route:
     institutional_context = f"{user_name} {text}"
     if any(marker in institutional_context for marker in _INSTITUTIONAL_MARKERS):
         return Route.EXCLUDED
-    if any(pattern.search(text) for pattern in _APPOINTMENT_PATTERNS):
+    # Institutional exclusion is matched on the raw normalization first, so
+    # ungluing below can never smuggle a partner contact into the funnel.
+    if any(pattern.search(_intent_text(text)) for pattern in _APPOINTMENT_PATTERNS):
         return Route.APPOINTMENT
     return Route.OUT_OF_SCOPE
 
@@ -2079,6 +2415,18 @@ class WhatsAppAppointmentsHandler:
         self._flow_ttl_seconds = max(
             60, int(settings.get("flow_ttl_hours", 24)) * 3600
         )
+        # How long an institutional self-introduction stays "already said" for
+        # this chat, so neither the menu nor the model pipeline repeats it.
+        self._greeting_ttl_seconds = max(
+            60, int(settings.get("greeting_ttl_hours", 6)) * 3600
+        )
+        # A patient who states a NEW explicit intent after a dead end gets the
+        # funnel reopened instead of the reception line on a loop. Kept above
+        # zero so a burst of messages right after the handoff still collapses
+        # into the single reception answer that burst deserves.
+        self._handoff_reentry_seconds = max(
+            0, int(settings.get("handoff_reentry_minutes", 30)) * 60
+        )
         self._flow_retention_days = max(
             1, int(settings.get("flow_retention_days", 30))
         )
@@ -2134,6 +2482,87 @@ class WhatsAppAppointmentsHandler:
             updated_at = updated_at.replace(tzinfo=_BRT)
         return (self._now() - updated_at).total_seconds() > self._flow_ttl_seconds
 
+    def note_model_greeting(self, incoming: Any) -> None:
+        """Record that the MODEL pipeline already introduced the service.
+
+        The two answering paths used to be blind to each other, so a patient
+        greeted by the model ("Aqui é a assistente do Dr. Victor Almeida")
+        was greeted again by this flow's menu two messages later — the
+        amnesiac feel reported on 12/ago/2026. Only the duplicate is dropped:
+        the model's own institutional disclosure is never suppressed from
+        here, so the automation-disclosure requirement keeps exactly one
+        owner.
+
+        Best-effort and side-effect-free on the reply path: never creates the
+        database, never touches an excluded contact, and swallows failures.
+        """
+
+        if not self._enabled or not self._db_path.exists():
+            return
+        try:
+            if classify_route(incoming) is Route.EXCLUDED:
+                return
+            source = getattr(incoming, "source", None)
+            chat_key = str(getattr(source, "chat_id", "") or "")
+            if not chat_key:
+                return
+            store = AppointmentStore(self._db_path)
+            if store.load_lead(chat_key) is None:
+                # NOVO is "reached us, not yet qualified as a lead" — the
+                # funnel's inbox. Promotion happens when intent shows up.
+                store.record_lead(
+                    chat_key,
+                    LeadStage.NOVO,
+                    now=self._now(),
+                    greeted=True,
+                    note="apresentacao pelo modelo",
+                )
+            else:
+                store.mark_lead_greeted(chat_key, now=self._now())
+        except Exception:
+            logger.warning("model greeting not recorded", exc_info=True)
+
+    def _menu_for(self, store: AppointmentStore, chat_key: str) -> str:
+        """The action menu, introducing the service only on a cold chat.
+
+        Every re-prompt inside an open flow is by definition a chat that has
+        already been greeted, so this is what stops the menu from opening
+        with "Sou a assistente do Dr. Victor Almeida" over and over in the
+        same conversation.
+        """
+
+        try:
+            already_greeted = store.lead_was_greeted(
+                chat_key, now=self._now(), within_seconds=self._greeting_ttl_seconds
+            )
+        except Exception:
+            logger.warning("greeting lookup failed", exc_info=True)
+            already_greeted = False
+        return _RETURNING_MENU if already_greeted else _INITIAL_MENU
+
+    def _handoff_is_reopenable(self, flow: FlowSnapshot, route: Route) -> bool:
+        """Whether a handed-off chat may restart the funnel on this message.
+
+        Requires BOTH a fresh unambiguous appointment intent and a cooling
+        period since the handoff, so the reopen answers a patient who came
+        back with a new request — not the next line of the same conversation
+        that just failed.
+        """
+
+        if flow.state != FlowState.HANDOFF.value or route is not Route.APPOINTMENT:
+            return False
+        if not flow.updated_at:
+            return False
+        try:
+            updated_at = datetime.fromisoformat(flow.updated_at)
+        except ValueError:
+            return False
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=_BRT)
+        return (
+            self._now() - updated_at
+        ).total_seconds() >= self._handoff_reentry_seconds
+
     def handle(self, incoming: Any) -> str | None:
         """Handle an explicit intent or active flow; ``None`` preserves old routing."""
 
@@ -2164,6 +2593,14 @@ class WhatsAppAppointmentsHandler:
             # fresh-menu branch); a stray follow-up gets no reply at all.
             store.purge_flow(chat_key)
             flow = None
+        if flow is not None and self._handoff_is_reopenable(flow, route):
+            # A dead end must not become a permanent one. Before this, every
+            # later message from a handed-off chat re-answered the reception
+            # line for the whole 24h flow TTL — including a patient coming
+            # back the next hour with a brand new, perfectly bookable request.
+            store.purge_flow(chat_key)
+            flow = None
+
         if route is not Route.APPOINTMENT and flow is None:
             return None
 
@@ -2173,10 +2610,19 @@ class WhatsAppAppointmentsHandler:
             return prior
 
         if flow is None:
+            menu = self._menu_for(store, chat_key)
+            self._track_lead(
+                store,
+                chat_key,
+                FlowState.AWAITING_APPOINTMENT_ACTION,
+                {},
+                greeted=True,
+                note="entrada no funil",
+            )
             return store.record_response(
                 message_id,
                 chat_key,
-                _INITIAL_MENU,
+                menu,
                 FlowState.AWAITING_APPOINTMENT_ACTION.value,
                 {},
                 now=self._now(),
@@ -2201,6 +2647,47 @@ class WhatsAppAppointmentsHandler:
         except Exception:
             return self._handoff(store, message_id, chat_key)
 
+    def _track_lead(
+        self,
+        store: AppointmentStore,
+        chat_key: str,
+        state: FlowState,
+        data: Mapping[str, Any] | None = None,
+        *,
+        greeted: bool = False,
+        note: str | None = None,
+    ) -> None:
+        """Move the CRM funnel alongside the flow, never blocking the reply.
+
+        The funnel is observational: a failure here must cost the patient
+        nothing, so it is logged and swallowed exactly like the reception
+        notice in ``_handoff``.
+        """
+
+        try:
+            stage = _FLOW_STAGE_MAP.get(state.value)
+            if stage is None:
+                lead = store.load_lead(chat_key)
+                if lead is None:
+                    return
+                stage = LeadStage(lead.stage)
+            service_label = None
+            if isinstance(data, Mapping):
+                raw_label = data.get("service_label")
+                if raw_label:
+                    service_label = str(raw_label)
+            store.record_lead(
+                chat_key,
+                stage,
+                now=self._now(),
+                service_label=service_label,
+                greeted=greeted,
+                note=note,
+                lost_reason=note if stage is LeadStage.PERDIDO else None,
+            )
+        except Exception:
+            logger.warning("lead funnel update failed", exc_info=True)
+
     def _respond(
         self,
         store: AppointmentStore,
@@ -2210,6 +2697,7 @@ class WhatsAppAppointmentsHandler:
         state: FlowState,
         data: Mapping[str, Any],
     ) -> str:
+        self._track_lead(store, chat_key, state, data)
         return store.record_response(
             message_id,
             chat_key,
@@ -2876,7 +3364,7 @@ class WhatsAppAppointmentsHandler:
                     store,
                     message_id,
                     chat_key,
-                    f"{_PRICE_LIST_TEXT}\n\n{_INITIAL_MENU}",
+                    f"{_PRICE_LIST_TEXT}\n\n{self._menu_for(store, chat_key)}",
                     FlowState.AWAITING_APPOINTMENT_ACTION,
                     data,
                 )
@@ -2897,7 +3385,7 @@ class WhatsAppAppointmentsHandler:
                     store,
                     message_id,
                     chat_key,
-                    _INITIAL_MENU,
+                    self._menu_for(store, chat_key),
                     FlowState.AWAITING_APPOINTMENT_ACTION,
                     data,
                 )
