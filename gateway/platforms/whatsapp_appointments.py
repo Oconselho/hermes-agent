@@ -65,6 +65,10 @@ class Route(Enum):
     EXCLUDED = "excluded"
     OUT_OF_SCOPE = "out_of_scope"
     APPOINTMENT = "appointment"
+    # A conversation being opened, with no concrete request yet ("Boa noite",
+    # "Alguém aí?"). Answered by this flow rather than by the model: see
+    # ``_is_opener``.
+    OPENER = "opener"
 
 
 class FlowState(str, Enum):
@@ -361,6 +365,11 @@ _RECONCILIATION_SUBJECT = {
 }
 
 _INITIAL_STATE = FlowState.AWAITING_APPOINTMENT_ACTION.value
+# Routes that may open the funnel on a chat with no flow in progress. An
+# appointment intent says what it wants; an opener says only that someone is
+# there — both deserve the menu, and both must be answered without a model
+# round trip.
+_FUNNEL_ROUTES = (Route.APPOINTMENT, Route.OPENER)
 # Menu layout note: one option per line, number emphasized. Author emphasis
 # as MARKDOWN (``**1**``) — never as WhatsApp's own ``*1*``. The transport's
 # ``WhatsAppBehaviorMixin.format_message`` reads this text as Markdown on the
@@ -375,18 +384,28 @@ _INITIAL_STATE = FlowState.AWAITING_APPOINTMENT_ACTION.value
 # and pinned by tests/gateway/test_whatsapp_menu_formatting.py, which asserts
 # the bytes AFTER format_message. Keep the closing "responda com o número"
 # line: it is the prompt that keeps the funnel moving to the next step.
+#
+# Option 6 is the way out. Without it the menu is a trap: any reply that is
+# not 1-5 re-prints the menu, so a partner or a colleague who opened with
+# "boa noite" would bounce off the booking list until the flow TTL expired.
+# It also keeps the cold open honest — the flow now answers people who never
+# said they wanted an appointment, so it has to offer them somewhere to go.
 _MENU_OPTIONS = (
     "**1** - Agendar uma consulta\n"
     "**2** - Consultar ou remarcar um agendamento\n"
     "**3** - Desmarcar uma consulta\n"
     "**4** - Agendar consulta sequencial do pacote de atendimento\n"
     "**5** - Atualizar telefone ou e-mail cadastrado\n"
+    "**6** - Falar sobre outro assunto\n"
     "\n"
     "Responda com o número da opção desejada."
 )
+# "Como posso ajudar?" and not "com o seu agendamento": this menu now also
+# answers a bare "boa noite", where assuming the subject would put words in
+# the patient's mouth before they said anything. The options carry the
+# context on their own.
 _INITIAL_MENU = (
-    "Sou a assistente do Dr. Victor Almeida. Como posso ajudar com o seu "
-    "agendamento?\n"
+    "Sou a assistente do Dr. Victor Almeida. Como posso ajudar?\n"
     "\n"
     f"{_MENU_OPTIONS}"
 )
@@ -395,7 +414,17 @@ _INITIAL_MENU = (
 # self-introduction is what made the secretary read as amnesiac: a patient who
 # had just been greeted got "Sou a assistente do Dr. Victor Almeida" a second
 # time, as if the previous turn had not happened.
-_RETURNING_MENU = "Como posso ajudar com o seu agendamento?\n" "\n" f"{_MENU_OPTIONS}"
+_RETURNING_MENU = "Como posso ajudar?\n" "\n" f"{_MENU_OPTIONS}"
+# Answer to option 6. The flow is dropped right after this line, so the next
+# message reaches the model pipeline with its nine-category classification —
+# the part of the system that knows what to do with someone who is not
+# booking anything.
+_OTHER_SUBJECT_REPLY = (
+    "Certo. Me conte, por favor, do que você precisa, que eu encaminho ao "
+    "Dr. Victor."
+)
+# Answer to a second greeting sent while the menu is still on screen.
+_MENU_NUDGE = "Estou aqui. É só responder com o número da opção que você precisa."
 _SERVICE_MENU = (
     "Escolha o serviço:\n"
     "\n"
@@ -524,6 +553,138 @@ def _intent_text(value: Any) -> str:
     text = _INTENT_DEGLUE_LETTER_DIGIT_RE.sub(" ", text)
     text = _INTENT_PUNCTUATION_RE.sub(" ", text)
     return " ".join(text.split())
+
+
+# --- the cold open ---------------------------------------------------------
+#
+# The first line of a real patient contact is almost never the tidy phrasing
+# _APPOINTMENT_PATTERNS demands. It is "Boa noite", "Oi", "Alguém aí?",
+# "preciso de informações" — a conversation being opened, before any request
+# is stated. Every one of those used to fall through to the model pipeline,
+# and the live test of 12/ago/2026 shows exactly what that cost:
+#
+#   21:21:44  "Boa note"    → [SILENCIOSO] após 10,7 s  (nada foi enviado)
+#   21:21:51  "Alguém ai?"  → frase livre 8,8 s depois, sem apresentação e
+#                             sem número nenhum para o paciente responder
+#
+# Three separate defects, one cause: the opening message is the one message
+# the deterministic flow refused to look at. It is also the one message where
+# the secretary must introduce itself, offer something to press, and answer
+# now — a model round trip cannot do any of the three reliably.
+_OPENER_ANCHORS = frozenset(
+    {
+        "oi", "ola", "opa", "alo", "hey", "eai", "bom", "boa", "dia", "tarde",
+        "noite", "alguem", "atendimento", "atende", "atendem",
+    }
+)
+# Words that may keep an opener company without turning it into a request.
+# Deliberately small: anything outside this set means the patient said
+# something concrete, which belongs to the intent patterns or to the model.
+_OPENER_FILLER = frozenset(
+    {
+        "a", "as", "ai", "aqui", "com", "da", "de", "do", "e", "esta", "gente",
+        "hoje", "la", "o", "os", "para", "pra", "por", "favor", "gentileza",
+        "prezados", "senhor", "senhora", "sr", "sra", "ta", "tem", "tudo",
+        "bem", "vcs", "vc", "voce", "voces", "secretaria", "consultorio",
+        "clinica", "dr", "doutor", "victor", "almeida", "agora",
+    }
+)
+_OPENER_VOCABULARY = _OPENER_ANCHORS | _OPENER_FILLER
+# An opener is short by nature. The bound is what keeps the vocabulary test
+# from swallowing a long message that happens to use only common words.
+_OPENER_MAX_WORDS = 8
+# Openings that carry a word outside the vocabulary but still state no
+# request — "preciso de informações", "pode me ajudar?", "queria falar com o
+# Dr. Victor". Matched explicitly, never by vocabulary.
+_OPENER_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"^(?:tem\s+)?(?:alguem|gente)\b",
+        r"\b(?:preciso|precisava|queria|quero|gostaria)\s+(?:de\s+)?"
+        r"(?:uma\s+|umas\s+|algumas\s+|mais\s+)?informa(?:cao|coes)\b",
+        r"^informa(?:cao|coes)$",
+        r"\b(?:pode|poderia|consegue|conseguem|podem)\s+(?:me\s+)?ajudar\b",
+        r"^(?:me\s+)?ajuda(?:r)?$",
+        r"^preciso\s+de\s+ajuda$",
+        r"\b(?:quero|queria|gostaria|preciso|precisava)\s+(?:de\s+)?falar\s+"
+        r"(?:com\s+)?(?:o\s+|a\s+)?(?:dr|doutor|victor|medico|secretaria)\b",
+    )
+)
+
+
+def _within_one_edit(word: str, target: str) -> bool:
+    """Whether ``word`` reaches ``target`` in at most one character edit."""
+
+    if word == target:
+        return True
+    if abs(len(word) - len(target)) > 1:
+        return False
+    if len(word) == len(target):
+        return sum(a != b for a, b in zip(word, target)) == 1
+    shorter, longer = (word, target) if len(word) < len(target) else (target, word)
+    index = offset = 0
+    while index < len(shorter):
+        if shorter[index] == longer[index + offset]:
+            index += 1
+            continue
+        if offset:
+            return False
+        offset = 1
+    return True
+
+
+def _opener_text(value: Any) -> str:
+    """Normalize an opening line, repairing one-character slips in greetings.
+
+    "Boa note" is a real message (12/ago/2026) — "boa noite" with one letter
+    missing. Openers are the shortest and fastest-typed messages a patient
+    sends, so a single-character slip in one is routine input, not a typo
+    worth losing the whole first impression over.
+
+    The repair is bounded on purpose: only short messages, only against the
+    small opener vocabulary, and only when exactly one vocabulary word is
+    within one edit. An ambiguous slip is left alone rather than guessed at,
+    so this can widen what counts as a greeting but never rewrite a message
+    into a request the patient did not make.
+    """
+
+    text = _intent_text(value)
+    words = text.split()
+    if not words or len(words) > _OPENER_MAX_WORDS:
+        return text
+    repaired: list[str] = []
+    for word in words:
+        if word in _OPENER_VOCABULARY or len(word) < 3:
+            repaired.append(word)
+            continue
+        candidates = {
+            candidate
+            for candidate in _OPENER_VOCABULARY
+            if _within_one_edit(word, candidate)
+        }
+        repaired.append(candidates.pop() if len(candidates) == 1 else word)
+    return " ".join(repaired)
+
+
+def _is_opener(value: Any) -> bool:
+    """Whether the message opens a conversation without stating a request yet.
+
+    Checked only AFTER the appointment patterns, so a message that says what
+    it wants ("bom dia, quero agendar") is routed by its intent and never
+    demoted to a bare greeting.
+    """
+
+    text = _opener_text(value)
+    if not text:
+        return False
+    if any(pattern.search(text) for pattern in _OPENER_PATTERNS):
+        return True
+    words = text.split()
+    if len(words) > _OPENER_MAX_WORDS:
+        return False
+    return bool(
+        _OPENER_ANCHORS.intersection(words) and set(words).issubset(_OPENER_VOCABULARY)
+    )
 
 
 class AppointmentStore:
@@ -2033,6 +2194,10 @@ def classify_route(incoming: Any) -> Route:
     # ungluing below can never smuggle a partner contact into the funnel.
     if any(pattern.search(_intent_text(text)) for pattern in _APPOINTMENT_PATTERNS):
         return Route.APPOINTMENT
+    # Intent first, opener second: "bom dia, quero agendar" is an appointment,
+    # not a greeting. Only a message that states nothing reaches this line.
+    if _is_opener(text):
+        return Route.OPENER
     return Route.OUT_OF_SCOPE
 
 
@@ -2428,6 +2593,13 @@ class WhatsAppAppointmentsHandler:
         self._greeting_ttl_seconds = max(
             60, int(settings.get("greeting_ttl_hours", 6)) * 3600
         )
+        # The cold open uses this much shorter window instead: long enough to
+        # collapse one burst of messages into a single introduction, short
+        # enough that a contact coming back later is greeted like the new
+        # conversation it is.
+        self._opener_greeting_window_seconds = max(
+            60, int(settings.get("opener_greeting_window_minutes", 10)) * 60
+        )
         # A patient who states a NEW explicit intent after a dead end gets the
         # funnel reopened instead of the reception line on a loop. Kept above
         # zero so a burst of messages right after the handoff still collapses
@@ -2530,23 +2702,57 @@ class WhatsAppAppointmentsHandler:
         except Exception:
             logger.warning("model greeting not recorded", exc_info=True)
 
-    def _menu_for(self, store: AppointmentStore, chat_key: str) -> str:
+    def _menu_for(
+        self,
+        store: AppointmentStore,
+        chat_key: str,
+        *,
+        within_seconds: int | None = None,
+    ) -> str:
         """The action menu, introducing the service only on a cold chat.
 
         Every re-prompt inside an open flow is by definition a chat that has
         already been greeted, so this is what stops the menu from opening
         with "Sou a assistente do Dr. Victor Almeida" over and over in the
-        same conversation.
+        same conversation. ``within_seconds`` overrides how far back a
+        greeting still counts; the cold open passes a much shorter window
+        (see ``handle``).
         """
 
         try:
             already_greeted = store.lead_was_greeted(
-                chat_key, now=self._now(), within_seconds=self._greeting_ttl_seconds
+                chat_key,
+                now=self._now(),
+                within_seconds=(
+                    self._greeting_ttl_seconds if within_seconds is None else within_seconds
+                ),
             )
         except Exception:
             logger.warning("greeting lookup failed", exc_info=True)
             already_greeted = False
         return _RETURNING_MENU if already_greeted else _INITIAL_MENU
+
+    def _is_reception_chat(self, chat_key: str) -> bool:
+        """Whether this chat is the reception's own notification channel."""
+
+        if not self._reception_chat_id:
+            return False
+        return _digits(chat_key) == _digits(self._reception_chat_id)
+
+    def _menu_is_fresh(self, flow: FlowSnapshot) -> bool:
+        """Whether the menu was sent recently enough to still be on screen."""
+
+        if not flow.updated_at:
+            return False
+        try:
+            updated_at = datetime.fromisoformat(flow.updated_at)
+        except ValueError:
+            return False
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=_BRT)
+        return (
+            self._now() - updated_at
+        ).total_seconds() <= self._opener_greeting_window_seconds
 
     def _handoff_is_reopenable(self, flow: FlowSnapshot, route: Route) -> bool:
         """Whether a handed-off chat may restart the funnel on this message.
@@ -2590,7 +2796,15 @@ class WhatsAppAppointmentsHandler:
                 )
             return None
 
-        if route is not Route.APPOINTMENT and not self._db_path.exists():
+        if route is Route.OPENER and self._is_reception_chat(chat_key):
+            # The reception's own chat is this flow's outbound notification
+            # channel, not a patient. Answering "bom dia" from it with the
+            # booking menu would point the clinic's own number at a funnel
+            # built for patients. An explicit appointment intent from that
+            # number is left alone — it routes exactly as it did before.
+            route = Route.OUT_OF_SCOPE
+
+        if route not in _FUNNEL_ROUTES and not self._db_path.exists():
             return None
         store = AppointmentStore(self._db_path)
         flow = store.load_flow(chat_key)
@@ -2609,7 +2823,7 @@ class WhatsAppAppointmentsHandler:
             store.purge_flow(chat_key)
             flow = None
 
-        if route is not Route.APPOINTMENT and flow is None:
+        if route not in _FUNNEL_ROUTES and flow is None:
             return None
 
         message_id = _event_identity(incoming, chat_key)
@@ -2618,7 +2832,18 @@ class WhatsAppAppointmentsHandler:
             return prior
 
         if flow is None:
-            menu = self._menu_for(store, chat_key)
+            # A cold open re-introduces the secretary. ``greeting_ttl_hours``
+            # is the wrong clock here: it exists to stop the flow repeating
+            # "Sou a assistente do Dr. Victor Almeida" *inside* an exchange,
+            # and with no flow in progress there is no exchange to be inside
+            # of. On 12/ago/2026 the long TTL turned into the opposite bug —
+            # a contact reopened hours later got a menu from a secretary that
+            # never said who it was. The short window still collapses the
+            # double introduction the two pipelines can produce within one
+            # burst, which is the case the TTL was actually written for.
+            menu = self._menu_for(
+                store, chat_key, within_seconds=self._opener_greeting_window_seconds
+            )
             self._track_lead(
                 store,
                 chat_key,
@@ -3376,6 +3601,43 @@ class WhatsAppAppointmentsHandler:
                     FlowState.AWAITING_APPOINTMENT_ACTION,
                     data,
                 )
+            if _is_opener(text) and self._menu_is_fresh(flow):
+                # Still saying hello, or nudging because the menu has not been
+                # read yet. The real burst was "Boa note" and "Alguém ai?"
+                # seven seconds apart (12/ago/2026): re-printing the whole
+                # list at every nudge is exactly what makes a secretary read
+                # as amnesiac, so answer the nudge and leave the list where
+                # the patient can already see it.
+                return self._respond(
+                    store,
+                    message_id,
+                    chat_key,
+                    _MENU_NUDGE,
+                    FlowState.AWAITING_APPOINTMENT_ACTION,
+                    data,
+                )
+            if normalized == "6":
+                # Leave the funnel instead of looping the menu. The response
+                # is recorded (so the delivery stays deduplicated) and the
+                # flow row is then dropped, which is what lets the next
+                # message be classified by the model pipeline as usual.
+                response = store.record_response(
+                    message_id,
+                    chat_key,
+                    _OTHER_SUBJECT_REPLY,
+                    FlowState.COMPLETED.value,
+                    {},
+                    now=self._now(),
+                )
+                self._track_lead(
+                    store,
+                    chat_key,
+                    FlowState.HANDOFF,
+                    {},
+                    note="saiu do funil: outro assunto",
+                )
+                store.purge_flow(chat_key)
+                return response
             if normalized != "1":
                 action = {"2": "MANAGE", "3": "CANCEL", "4": "RETURN", "5": "EDIT"}.get(
                     normalized

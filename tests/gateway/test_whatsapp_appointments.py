@@ -108,8 +108,11 @@ def test_route_priority_is_excluded_before_cpf_media_or_appointment_intent():
         "segue meu CPF 52998224725",
         "enviei um documento",
         "meu exame está anexado",
-        "oi, tudo bem?",
         "vocês aceitam plano de saúde?",
+        # NOTE: a bare greeting used to belong on this list. Since the cold
+        # open became deterministic it is answered here instead — see
+        # test_greeting_opens_the_flow_and_therefore_creates_state below and
+        # the Route.OPENER cases in test_whatsapp_appointments_funnel.py.
     ],
 )
 def test_isolated_cpf_media_and_generic_messages_do_not_enter_flow(tmp_path, text):
@@ -119,6 +122,26 @@ def test_isolated_cpf_media_and_generic_messages_do_not_enter_flow(tmp_path, tex
     assert classify_route(incoming) is Route.OUT_OF_SCOPE
     assert WhatsAppAppointmentsHandler({"enabled": True}, db_path=db_path).handle(incoming) is None
     assert not db_path.exists()
+
+
+def test_greeting_opens_the_flow_and_therefore_creates_state(tmp_path):
+    """The cost of answering the cold open deterministically, made explicit.
+
+    Answering "bom dia" with numbered options means the next message can be
+    a bare "1" — and reading that digit requires remembering which menu was
+    shown. So a greeting now provisions the database, where before it left
+    no trace at all.
+
+    Nothing new is stored: the chat key is the same identifier ``flow_states``
+    already held for every patient in the funnel, under the same 24h flow TTL
+    and the same purge job. What changed is only *when* the row appears.
+    """
+
+    db_path = tmp_path / "appointments.sqlite3"
+    handler = WhatsAppAppointmentsHandler({"enabled": True}, db_path=db_path)
+
+    assert handler.handle(event("bom dia", message_id="hello-1")) is not None
+    assert db_path.exists()
 
 
 def test_explicit_appointment_intent_creates_only_idempotent_minimal_state(tmp_path):

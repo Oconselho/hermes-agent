@@ -135,8 +135,6 @@ def test_partner_sign_offs_are_not_booking_intent(text):
 @pytest.mark.parametrize(
     "text",
     [
-        "oi, tudo bem?",
-        "bom dia",
         "obrigado!",
         "1",
         "meu exame está anexado",
@@ -148,6 +146,231 @@ def test_non_lead_messages_still_stay_out_of_the_funnel(text):
     """Broadening intent must not swallow the model pipeline's traffic."""
 
     assert classify_route(event(text)) is Route.OUT_OF_SCOPE
+
+
+# --------------------------------------------------------------------------
+# The cold open — the 12/ago/2026 evening test
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # The two literal messages from the failing test, in order.
+        "Boa note",
+        "Alguém ai?",
+        # The rest of how a conversation actually opens.
+        "oi, tudo bem?",
+        "bom dia",
+        "boa tarde",
+        "Boa noite",
+        "olá",
+        "oi",
+        "opa",
+        "bom dia, tudo bem?",
+        "tem alguém?",
+        "alguém aí",
+        "preciso de informações",
+        "queria uma informação",
+        "pode me ajudar?",
+        "boa tarde, por favor",
+        "quero falar com o Dr. Victor",
+        "oi doutor",
+    ],
+)
+def test_opening_messages_are_answered_by_the_funnel(text):
+    """An opening line must never need a model round trip to be answered."""
+
+    assert classify_route(event(text)) is Route.OPENER
+
+
+def test_greeting_typo_still_opens_the_conversation():
+    """``Boa note`` — the real message, 12/ago/2026 21:21:44 UTC.
+
+    One missing letter cost the patient the entire first impression: the
+    message reached the model, which stayed silent for 10.7 seconds and then
+    sent nothing at all.
+    """
+
+    assert classify_route(event("Boa note")) is Route.OPENER
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # A stated request is an appointment, not a greeting — the intent
+        # patterns must keep winning, or the opener would flatten every
+        # message into the same generic menu path.
+        "bom dia, quero agendar uma consulta",
+        "boa tarde, tem horário disponível?",
+        "oi, quanto custa a consulta",
+    ],
+)
+def test_a_greeting_that_states_a_request_is_still_an_appointment(text):
+    assert classify_route(event(text)) is Route.APPOINTMENT
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Typo repair is bounded: it may widen what counts as a greeting, but
+        # it must never rewrite a message into something the sender did not
+        # say. None of these is an opener under any single-character edit.
+        "obrigado pelo retorno",
+        "segue o comprovante",
+        "meu nome é Ana",
+        "vocês aceitam plano de saúde?",
+        "está doendo muito",
+    ],
+)
+def test_typo_repair_does_not_invent_an_opener(text):
+    assert classify_route(event(text)) is not Route.OPENER
+
+
+def test_institutional_contact_never_becomes_an_opener():
+    """The partner exclusion runs before the greeting, exactly as before."""
+
+    assert classify_route(event("Bom dia, somos da clinica parceira")) is Route.EXCLUDED
+
+
+def test_opening_message_gets_the_introduction_and_the_numbered_options(tmp_path):
+    """The whole 12/ago/2026 evening complaint, in one assertion block."""
+
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    clock = MutableClock(datetime(2026, 8, 12, 18, 21, tzinfo=BRT))
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True}, db_path=db_path, clock=clock
+    )
+
+    reply = handler.handle(event("Boa note", message_id="m-1"))
+
+    assert reply is not None, "a greeting must be answered by the flow, not the model"
+    assert "Sou a assistente do Dr. Victor Almeida" in reply
+    for option in ("**1**", "**2**", "**3**", "**4**", "**5**", "**6**"):
+        assert option in reply
+    assert "Responda com o número da opção desejada." in reply
+
+
+def test_the_opening_message_reaches_the_agenda_without_the_model(tmp_path):
+    """``Boa noite`` → ``1`` → ``3`` must walk straight to the service menu."""
+
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    clock = MutableClock(datetime(2026, 8, 12, 18, 21, tzinfo=BRT))
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True}, db_path=db_path, clock=clock
+    )
+
+    handler.handle(event("Boa noite", message_id="m-1"))
+    service_menu = handler.handle(event("1", message_id="m-2"))
+
+    assert "Teleconsulta" in service_menu
+
+
+def test_a_later_contact_is_introduced_to_again(tmp_path):
+    """The greeting TTL must not leave a returning contact unintroduced.
+
+    ``greeting_ttl_hours`` (6h) exists to stop the flow repeating itself
+    inside one exchange. Applied to a cold open it produced the opposite
+    defect on 12/ago/2026: a contact that came back hours later got a menu
+    from a secretary that never said who it was.
+    """
+
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    clock = MutableClock(datetime(2026, 8, 12, 13, 0, tzinfo=BRT))
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True}, db_path=db_path, clock=clock
+    )
+
+    first = handler.handle(event("bom dia", message_id="m-1"))
+    assert "Sou a assistente do Dr. Victor Almeida" in first
+
+    # Same burst: one introduction only.
+    clock.value += timedelta(minutes=2)
+    handler.handle(event("2", message_id="m-2"))
+
+    # Hours later, with the flow long expired: a new conversation.
+    clock.value += timedelta(hours=30)
+    later = handler.handle(event("boa noite", message_id="m-3"))
+    assert "Sou a assistente do Dr. Victor Almeida" in later
+
+
+def test_a_second_greeting_does_not_reprint_the_whole_menu(tmp_path):
+    """The real burst: "Boa note" and "Alguém ai?" seven seconds apart.
+
+    Both are openers, and both arrive before the patient has read anything.
+    Printing the five options twice in a row is the amnesiac behaviour the
+    single-introduction rule exists to prevent.
+    """
+
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    clock = MutableClock(datetime(2026, 8, 12, 18, 21, tzinfo=BRT))
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True}, db_path=db_path, clock=clock
+    )
+
+    first = handler.handle(event("Boa note", message_id="m-1"))
+    assert "**1**" in first
+
+    clock.value += timedelta(seconds=7)
+    second = handler.handle(event("Alguém ai?", message_id="m-2"))
+
+    assert "**1**" not in second
+    assert "Sou a assistente" not in second
+
+    # The menu is still the live state: the next digit is read normally.
+    clock.value += timedelta(seconds=20)
+    assert "Teleconsulta" in handler.handle(event("1", message_id="m-3"))
+
+
+def test_a_greeting_long_after_the_menu_gets_the_menu_again(tmp_path):
+    """The nudge only replaces the menu while the menu is still on screen."""
+
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    clock = MutableClock(datetime(2026, 8, 12, 18, 21, tzinfo=BRT))
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True}, db_path=db_path, clock=clock
+    )
+
+    handler.handle(event("bom dia", message_id="m-1"))
+    clock.value += timedelta(hours=3)
+    later = handler.handle(event("oi", message_id="m-2"))
+
+    assert "**1**" in later
+
+
+def test_the_reception_chat_never_gets_the_booking_menu(tmp_path):
+    """Reception is this flow's outbound channel, not a patient."""
+
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True, "reception_chat_id": "5571996691002@s.whatsapp.net"},
+        db_path=db_path,
+        clock=MutableClock(datetime(2026, 8, 12, 18, 21, tzinfo=BRT)),
+    )
+
+    reception = event(
+        "bom dia", chat_id="5571996691002@s.whatsapp.net", message_id="r-1"
+    )
+    assert handler.handle(reception) is None
+
+
+def test_option_six_leaves_the_funnel_instead_of_looping_the_menu(tmp_path):
+    """Without an exit, the menu is a trap for whoever is not booking."""
+
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    clock = MutableClock(datetime(2026, 8, 12, 18, 21, tzinfo=BRT))
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True}, db_path=db_path, clock=clock
+    )
+
+    handler.handle(event("boa noite", message_id="m-1"))
+    exit_reply = handler.handle(event("6", message_id="m-2"))
+
+    assert "**1**" not in exit_reply, "option 6 must not re-print the menu"
+
+    # The flow is gone, so the next message is the model pipeline's again.
+    clock.value += timedelta(minutes=1)
+    assert handler.handle(event("é sobre uma parceria", message_id="m-3")) is None
 
 
 def test_institutional_exclusion_still_beats_a_glued_intent():
@@ -179,7 +402,7 @@ def test_menu_introduces_once_and_then_stops_repeating_itself(tmp_path):
     handler.handle(event("obrigado", message_id="m-2"))
     second = handler.handle(event("quero agendar", message_id="m-3"))
     assert "Sou a assistente do Dr. Victor Almeida" not in second
-    assert "Como posso ajudar com o seu agendamento?" in second
+    assert "Como posso ajudar?" in second
     assert "**1** - Agendar uma consulta" in second
 
 

@@ -5,6 +5,7 @@ Covers the ignored-number denylist and the outbound leak guardrails
 """
 
 import asyncio
+import re
 from types import SimpleNamespace
 
 from gateway.config import Platform
@@ -142,10 +143,17 @@ def test_social_greeting_is_classified_without_operational_request():
 
 def test_initial_social_greeting_gets_safe_secretary_reply():
     result = _whatsapp_greeting_response("Oi")
-    assert result == (
-        "Olá, sou a assistente do Dr. Victor. Ele está ocupado no momento. "
-        "Posso anotar seu recado?"
-    )
+    assert result == "Olá! Sou a assistente do Dr. Victor Almeida. Como posso ajudar?"
+
+
+def test_greeting_fallback_introduces_without_offering_unreadable_numbers():
+    """The fallback runs where no state machine can read a numbered reply."""
+
+    result = _whatsapp_greeting_response("Boa noite")
+    assert "assistente do Dr. Victor Almeida" in result
+    assert not re.search(r"\d", result)
+    # The message-taking secretary this text used to belong to is gone.
+    assert "recado" not in result.lower()
 
 
 def test_status_update_without_request_is_suppressed_after_recent_reply():

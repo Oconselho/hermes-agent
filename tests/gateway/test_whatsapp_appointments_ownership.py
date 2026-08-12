@@ -90,7 +90,10 @@ EXCLUDED_ROWS = [
 OUT_OF_SCOPE_ROWS = [
     ("cpf-only", event(CPF_FORMATTED)),
     ("cpf-digits-only", event("52998224725")),
-    ("generic-greeting", event("Bom dia, tudo bem?")),
+    # NOTE: "Bom dia, tudo bem?" used to sit here. A greeting is now
+    # Route.OPENER — the deterministic flow answers the cold open instead of
+    # handing it to the model. Its ownership guarantee is asserted separately
+    # in test_an_opener_owns_only_its_own_chat below.
     ("generic-mention", event("Minha consulta foi ótima, obrigado!")),
     (
         "media-without-reservation",
@@ -155,6 +158,30 @@ def test_out_of_scope_row_with_existing_database_still_returns_none(tmp_path):
     store = AppointmentStore(db_path)
     assert store.count("flow_states") == 0
     assert store.count("inbox_events") == 0
+    assert store.count("outbox_events") == 0
+    assert feegow.calls == []
+
+
+def test_an_opener_owns_only_its_own_chat(tmp_path):
+    """The cold open takes state — but only for the chat that opened it.
+
+    Answering a greeting deterministically necessarily creates a flow row
+    (the next message can be a bare "1"). The ownership boundary is what must
+    not move: one greeting must not touch another contact's row, and must not
+    call Feegow at all.
+    """
+
+    feegow = NoCallFeegow()
+    handler = _handler(tmp_path, feegow)
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+
+    stranger = event("Bom dia, tudo bem?", chat_id="5571900000000@s.whatsapp.net")
+    assert handler.handle(stranger) is not None
+
+    store = AppointmentStore(db_path)
+    assert store.count("flow_states") == 1
+    assert store.load_flow("5571900000000@s.whatsapp.net") is not None
+    assert store.load_flow("5571999999999@s.whatsapp.net") is None
     assert store.count("outbox_events") == 0
     assert feegow.calls == []
 

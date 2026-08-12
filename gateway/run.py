@@ -239,11 +239,19 @@ def _whatsapp_is_social_greeting(text: Any) -> bool:
 
 
 def _whatsapp_greeting_response(text: Any) -> str:
-    """Return the deterministic first-contact reply for a bare greeting."""
-    return (
-        "Olá, sou a assistente do Dr. Victor. Ele está ocupado no momento. "
-        "Posso anotar seu recado?"
-    )
+    """Return the deterministic first-contact reply for a bare greeting.
+
+    Reached only when the appointment funnel declined the message — it is
+    disabled, or this contact is institutional. The old wording ("Ele está
+    ocupado no momento. Posso anotar seu recado?") was left over from the
+    message-taking secretary that predates the booking flow, and it opened a
+    first contact by announcing the doctor was unavailable.
+
+    Deliberately WITHOUT numbered options, unlike the funnel's menu: on this
+    path nothing is listening for the digit, so offering numbers would invite
+    a reply that no state machine could read.
+    """
+    return "Olá! Sou a assistente do Dr. Victor Almeida. Como posso ajudar?"
 
 
 def _whatsapp_is_no_action_update(text: Any) -> bool:
@@ -12213,11 +12221,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Load conversation history from transcript
         history = self.session_store.load_transcript(session_entry.session_id)
 
+        # The deterministic patient workflow gets first refusal on this
+        # message, and it is resolved HERE — above the two suppression checks
+        # below — because both of them swallow exactly the messages the funnel
+        # exists to answer. A bare "boa noite" reads as a social greeting to
+        # one and as a repeated acknowledgement to the other, so on
+        # 12/ago/2026 the opening message never reached the funnel at all: it
+        # was answered by the model 10.7s later with nothing in it, or with a
+        # sentence that carried no options the patient could reply to.
+        #
+        # ``None`` preserves the complete existing model pipeline for
+        # non-patients and institutional contacts. The handler is built once
+        # and cached (see ``_get_appointment_handler``); the watcher started
+        # at startup shares this exact instance, and re-delivery of the same
+        # message is deduplicated inside it.
+        _appointment_response = await self._deterministic_appointment_response(
+            event, source
+        )
+
         # A bare greeting gets one deterministic secretary introduction. Once
         # that introduction is already visible in the transcript, suppress
         # repeated social greetings to avoid a personal back-and-forth.
         if (
             getattr(source.platform, "value", source.platform) == "whatsapp"
+            and _appointment_response is None
             and not str(event.text or "").lstrip().startswith("/")
             and _whatsapp_is_social_greeting(event.text)
         ):
@@ -12242,6 +12269,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # through to the model.
         if (
             getattr(source.platform, "value", source.platform) == "whatsapp"
+            and _appointment_response is None
             and not str(event.text or "").lstrip().startswith("/")
             and _should_suppress_whatsapp_followup(event.text, history)
         ):
@@ -12932,15 +12960,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     pass
 
-            # Deterministic patient workflow. ``None`` preserves the complete
-            # existing model pipeline for non-patients and institutional
-            # contacts. The handler is built once and cached (see
-            # ``_get_appointment_handler``); the watcher started at startup
-            # shares this exact instance.
-            _appointment_response = await self._deterministic_appointment_response(
-                event, source
-            )
-
+            # Resolved above, before the suppression checks that used to eat
+            # the cold open. Kept as one call so the funnel sees each message
+            # exactly once.
             if _appointment_response is not None:
                 agent_result = {
                     "final_response": _appointment_response,
@@ -19958,10 +19980,15 @@ ETAPA 3 — A CATEGORIA. Escolha UMA das nove abaixo e siga o comportamento dela
    antes de qualificar. "Fale com a recepção" como primeira resposta a um paciente é erro.
 
    ➤ PASSO 1 — QUALIFICAR. Se a intenção ainda não estiver clara, faça UMA pergunta que
-   abra o funil, oferecendo os caminhos em palavras que o paciente possa repetir:
-      "[Saudação]! [Identificação]. [Nome], posso ajudar. Você quer agendar uma consulta,
-      remarcar ou desmarcar um horário, agendar seu retorno, ou tem outra dúvida sobre o
-      atendimento?"
+   abra o funil, oferecendo os caminhos em palavras que o paciente possa repetir.
+   Monte a resposta com estas frases, cada uma inteira e independente:
+      1. Saudação com identificação: "Boa tarde! Sou a assistente do Dr. Victor Almeida."
+         Omita esta frase INTEIRA se você já se identificou nesta conversa.
+      2. A pergunta, sempre completa: "[Nome], você quer agendar uma consulta, remarcar
+         ou desmarcar um horário, agendar seu retorno, ou tem outra dúvida sobre o
+         atendimento?"
+   ⚠️ NUNCA escreva um fragmento solto como "Posso ajudar." no lugar da frase omitida:
+   ao suprimir a apresentação, o que sobra tem que continuar sendo uma frase inteira.
    ⚠️ Varie a formulação a cada uso, mas mantenha as opções reconhecíveis.
    ⚠️ Uma pergunta por vez. Nunca peça CPF antes de saber o que a pessoa quer.
 
