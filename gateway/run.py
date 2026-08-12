@@ -13077,6 +13077,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         return None
                     response = _institutional_response
+                    # Hand the deterministic funnel the one fact it cannot
+                    # observe: this chat has already been introduced to. Its
+                    # menu then drops the duplicate "Sou a assistente do Dr.
+                    # Victor Almeida" a later turn would otherwise repeat.
+                    # Disclosure itself is untouched — only the funnel's copy
+                    # of it is suppressed, so this path stays its sole owner.
+                    if _appointment_response is None and _WHATSAPP_INSTITUTIONAL_IDENTITY_RE.search(
+                        response
+                    ):
+                        try:
+                            _greeting_handler = self._get_appointment_handler()
+                            if _greeting_handler is not None:
+                                await asyncio.to_thread(
+                                    _greeting_handler.note_model_greeting, event
+                                )
+                        except Exception:
+                            logger.debug(
+                                "[WhatsApp] greeting handoff to funnel failed",
+                                exc_info=True,
+                            )
 
                 if source.platform and source.platform.value == "whatsapp" and response:
                     _original_response = response
