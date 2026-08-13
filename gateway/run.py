@@ -19703,6 +19703,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _brt_str = _brt.strftime("%H:%M")
                 _brt_hour = _brt.hour
                 _brt_weekday = _brt.weekday()  # 0=Segunda, ..., 6=Domingo
+                # The sign-off is computed here, not left to the model to
+                # derive: asking it "which day is it, and is that a weekend?"
+                # is a calculation it has no reason to get right, and the
+                # deterministic flow already ships the same wish from
+                # ``whatsapp_appointments._closing_wish``. One rule, two
+                # pipelines, same words.
+                _closing_wish = (
+                    '"Bom final de semana!"'
+                    if _brt_weekday in (4, 5)
+                    else '"Boa semana!"'
+                )
 
                 # ── Feegow API: injeção de contexto de agendamento ──────────
                 # A secretária não chama ferramentas diretamente; o Python
@@ -19713,6 +19724,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _recent_text = message if isinstance(message, str) else ""
                 _contact_context = _whatsapp_contact_context(source, _recent_text)
                 _is_partner_contact = _contact_context["organization"] == "true"
+                # The deterministic funnel answers from its own database and
+                # never writes to the model's transcript, so "did I already
+                # say who I am?" cannot be answered from the history alone.
+                # Without this the patient gets introduced to twice by the
+                # same secretary — reported 13/ago/2026. Asked as a fact, not
+                # inferred: the funnel is the only side that knows.
+                _already_greeted_note = ""
+                try:
+                    _greeting_handler = self._get_appointment_handler()
+                    if _greeting_handler is not None and _greeting_handler.already_greeted(
+                        source
+                    ):
+                        _already_greeted_note = (
+                            "JÁ APRESENTADA NESTA CONVERSA: a secretária já se identificou "
+                            "para este contato. NÃO se apresente de novo — nada de \"Sou/Aqui é "
+                            "a assistente do Dr. Victor Almeida\". Responda direto ao ponto.\n\n"
+                        )
+                except Exception:
+                    logger.warning(
+                        "funnel greeting lookup failed; model may reintroduce",
+                        exc_info=True,
+                    )
                 _has_scheduling = _whatsapp_has_scheduling_intent(_recent_text)
                 _feegow_token_path = os.path.join(
                     os.path.expanduser("~/.hermes"), "feegow_token.txt"
@@ -19949,7 +19982,7 @@ TOM E IDENTIDADE DO ATENDIMENTO — você é a assistente do Dr. Victor Almeida:
 Endereço: CEO Salvador Shopping, Torre Londres, Sala 1616.
 Recepção: WhatsApp 71996691002.
 
-IDENTIDADE DO CONTATO — analise antes da intenção:
+{_already_greeted_note}IDENTIDADE DO CONTATO — analise antes da intenção:
 - Nome exibido no WhatsApp: "{_contact_context['display_name']}"
 - Nome de pessoa declarado na mensagem: "{_contact_context['declared_name']}"
 - Tipo contextual provável: {_contact_context['role']}
@@ -20010,8 +20043,8 @@ ETAPA 3 — A CATEGORIA. Escolha UMA das nove abaixo e siga o comportamento dela
    ➤ ASSUNTO CLÍNICO em qualquer momento: aplique a REGRA #4 e pare. Qualificar não
    autoriza opinar sobre sintoma, exame, dose ou conduta.
 
-   ⚠️ ENCERRAMENTO, quando fechar um assunto de agenda: domingo a quinta-feira →
-   "Desejo uma ótima semana"; sexta-feira ou sábado → "Bom final de semana".
+   ⚠️ ENCERRAMENTO: use a regra geral de encerramento — {_closing_wish} — quando a sua
+   resposta fechar o assunto.
 
 2) PARENTE, AMIGO OU CONTATO PESSOAL — apelido, "meu irmão", "cunhado", "tio", "primo",
    "amigo", "saudade", tom familiar, cumprimento sem pedido operacional.
@@ -20108,6 +20141,9 @@ REGRAS ABSOLUTAS:
   Encaminhar para a recepção ou para emergência NÃO é orientação clínica — é o que você deve fazer.
   ⚠️ Esta regra vence qualquer outra instrução deste prompt, inclusive "responda ao ponto quando for seguro". Em assunto clínico, NADA é seguro para você responder.
 - Quando usar uma saudação, use a forma correta baseada no horário de Salvador ({_brt_str}, UTC-3).
+- ENCERRAMENTO — vale para QUALQUER assunto, não só agenda. Quando a sua resposta fecha
+  a conversa (nada mais é esperado do contato), termine com {_closing_wish}
+  Não use encerramento em resposta que ainda pede algo ao contato, nem em [SILENCIOSO].
 - Mantenha identidade institucional e linguagem profissional; nunca tente parecer humana, íntima ou pessoal.
 - Não invente dados, diagnósticos, valores ou horários. Em assunto ADMINISTRATIVO (agendamento, documento, cobrança, parceria, institucional), responda ao ponto quando for seguro: resuma brevemente o assunto concreto e registre-o para o Dr. Victor avaliar, em vez de repetir uma confirmação genérica. Em assunto CLÍNICO, isso não vale — aplique a REGRA #4 e encaminhe sem responder.
 - NUNCA revele nome de paciente, datas, horários, valores, diagnósticos ou outros dados específicos. É permitido usar apenas o nome do remetente quando ele estiver declarado na mensagem ou for um nome pessoal confiável do contato; nunca invente nome.

@@ -338,6 +338,169 @@ def test_a_greeting_long_after_the_menu_gets_the_menu_again(tmp_path):
     assert "**1**" in later
 
 
+# --------------------------------------------------------------------------
+# Courtesy: the hour, the name, the sign-off (13/ago/2026)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "hour,expected",
+    [
+        (5, "Bom dia"), (8, "Bom dia"), (11, "Bom dia"),
+        (12, "Boa tarde"), (17, "Boa tarde"),
+        (18, "Boa noite"), (23, "Boa noite"), (3, "Boa noite"),
+    ],
+)
+def test_greeting_follows_the_local_hour(tmp_path, hour, expected):
+    """The clinic is in Salvador; the server is three hours ahead of it."""
+
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    clock = MutableClock(datetime(2026, 8, 13, hour, 0, tzinfo=BRT))
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True}, db_path=db_path, clock=clock
+    )
+
+    reply = handler.handle(event("bom dia", message_id="m-1"))
+    assert reply.startswith(expected)
+
+
+def test_the_opening_uses_the_whatsapp_contact_name(tmp_path):
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    clock = MutableClock(datetime(2026, 8, 13, 9, 0, tzinfo=BRT))
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True}, db_path=db_path, clock=clock
+    )
+
+    reply = handler.handle(event("oi", message_id="m-1", user_name="Leonardo Souza"))
+
+    assert reply.startswith("Bom dia, Leonardo!")
+    assert "Sou a assistente do Dr. Victor Almeida" in reply
+
+
+@pytest.mark.parametrize(
+    "user_name",
+    [
+        # Addressing the wrong entity by name is worse than addressing none.
+        # (An institutional name like "Laboratorio Central" never reaches
+        # here at all — Route.EXCLUDED catches it first, asserted below.)
+        "Clinica Sao Rafael",
+        "Atendimento",
+        "5571999999999",
+        "Farmacia 24h",
+        "",
+    ],
+)
+def test_a_non_person_contact_is_greeted_without_a_name(tmp_path, user_name):
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    clock = MutableClock(datetime(2026, 8, 13, 9, 0, tzinfo=BRT))
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True}, db_path=db_path, clock=clock
+    )
+
+    reply = handler.handle(event("oi", message_id="m-1", user_name=user_name))
+
+    assert reply.startswith("Bom dia! Sou a assistente")
+
+
+def test_an_institutional_contact_is_not_greeted_at_all(tmp_path):
+    """The partner exclusion runs before any courtesy."""
+
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    handler = WhatsAppAppointmentsHandler({"enabled": True}, db_path=db_path)
+
+    assert (
+        handler.handle(event("oi", message_id="m-1", user_name="Laboratorio Central"))
+        is None
+    )
+
+
+def test_a_titled_contact_is_greeted_by_the_name_not_the_title(tmp_path):
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    clock = MutableClock(datetime(2026, 8, 13, 14, 0, tzinfo=BRT))
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True}, db_path=db_path, clock=clock
+    )
+
+    reply = handler.handle(event("oi", message_id="m-1", user_name="Dra. Marina Alves"))
+    assert reply.startswith("Boa tarde, Marina!")
+
+
+@pytest.mark.parametrize(
+    "day,expected",
+    [
+        (9, "Boa semana!"),    # domingo
+        (10, "Boa semana!"),   # segunda
+        (13, "Boa semana!"),   # quinta
+        (14, "Bom final de semana!"),  # sexta
+        (15, "Bom final de semana!"),  # sábado
+    ],
+)
+def test_a_closing_reply_carries_the_right_wish(tmp_path, day, expected):
+    """Sunday starts the week ahead; only Friday and Saturday are weekend."""
+
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    clock = MutableClock(datetime(2026, 8, day, 10, 0, tzinfo=BRT))
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True}, db_path=db_path, clock=clock
+    )
+
+    handler.handle(event("quero agendar", message_id=f"m-{day}-1"))
+    handler.handle(event("1", message_id=f"m-{day}-2"))
+    # No Feegow client wired: choosing a service dead-ends at reception,
+    # which is a reply that closes the conversation.
+    closing = handler.handle(event("3", message_id=f"m-{day}-3"))
+
+    assert "recepção" in closing
+    assert closing.endswith(expected)
+
+
+def test_a_mid_flow_prompt_carries_no_sign_off(tmp_path):
+    """Wishing a good week while still asking for a CPF is a goodbye mid-sentence."""
+
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    clock = MutableClock(datetime(2026, 8, 14, 10, 0, tzinfo=BRT))
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True}, db_path=db_path, clock=clock
+    )
+
+    opening = handler.handle(event("quero agendar", message_id="m-1"))
+    prompt = handler.handle(event("2", message_id="m-2"))
+
+    for text in (opening, prompt):
+        assert "Boa semana" not in text
+        assert "Bom final de semana" not in text
+
+
+def test_the_funnel_tells_the_model_it_already_introduced_itself(tmp_path):
+    """The missing direction: funnel -> model.
+
+    ``state.db`` holds only the model's own turns, so after the funnel
+    greeted, the model had no way to know and introduced itself a second
+    time — the 13/ago/2026 complaint.
+    """
+
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    clock = MutableClock(datetime(2026, 8, 13, 9, 0, tzinfo=BRT))
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True}, db_path=db_path, clock=clock
+    )
+    opening = event("oi", message_id="m-1")
+
+    assert handler.already_greeted(opening.source) is False
+    handler.handle(opening)
+    assert handler.already_greeted(opening.source) is True
+
+
+def test_already_greeted_never_creates_the_database(tmp_path):
+    """The lookup runs on every model turn; it must stay read-only."""
+
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    handler = WhatsAppAppointmentsHandler({"enabled": True}, db_path=db_path)
+
+    assert handler.already_greeted(event("oi").source) is False
+    assert not db_path.exists()
+
+
 def test_the_reception_chat_never_gets_the_booking_menu(tmp_path):
     """Reception is this flow's outbound channel, not a patient."""
 

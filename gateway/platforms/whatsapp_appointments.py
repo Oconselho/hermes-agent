@@ -404,11 +404,10 @@ _MENU_OPTIONS = (
 # answers a bare "boa noite", where assuming the subject would put words in
 # the patient's mouth before they said anything. The options carry the
 # context on their own.
-_INITIAL_MENU = (
-    "Sou a assistente do Dr. Victor Almeida. Como posso ajudar?\n"
-    "\n"
-    f"{_MENU_OPTIONS}"
-)
+_INITIAL_MENU_BODY = "Sou a assistente do Dr. Victor Almeida. Como posso ajudar?"
+# Kept for the callers and tests that want the introduction without a live
+# clock or contact — ``_opening_menu`` is what production uses.
+_INITIAL_MENU = f"{_INITIAL_MENU_BODY}\n\n{_MENU_OPTIONS}"
 # Same menu for a chat that has already been introduced to — by this flow or
 # by the model pipeline, which prefixes its own identity line. Repeating the
 # self-introduction is what made the secretary read as amnesiac: a patient who
@@ -610,6 +609,84 @@ _OPENER_PATTERNS = tuple(
         r"(?:com\s+)?(?:o\s+|a\s+)?(?:dr|doutor|victor|medico|secretaria)\b",
     )
 )
+
+
+# --- courtesy: who we are talking to, and when ----------------------------
+#
+# All three of these read the clock in BRT (America/Bahia). The secretary
+# answers a clinic in Salvador, so "boa noite" has to mean night *there* —
+# the server runs on UTC, three hours ahead, which would greet the whole
+# 21:00-23:59 BRT stretch as if it were the next morning.
+def _time_greeting(now: datetime) -> str:
+    """"Bom dia" / "Boa tarde" / "Boa noite" for the local hour."""
+
+    hour = now.hour
+    if 5 <= hour < 12:
+        return "Bom dia"
+    if 12 <= hour < 18:
+        return "Boa tarde"
+    return "Boa noite"
+
+
+def _closing_wish(now: datetime) -> str:
+    """The sign-off: weekend wish on Friday and Saturday, week wish otherwise.
+
+    ``weekday()`` is Monday=0 … Sunday=6, so Friday and Saturday are 4 and 5.
+    Sunday belongs to the week ahead, not the weekend behind — a patient
+    written to on Sunday evening is starting their week.
+    """
+
+    return "Bom final de semana!" if now.weekday() in (4, 5) else "Boa semana!"
+
+
+# A WhatsApp push name is whatever the contact typed into their own phone:
+# it can be a person, a company, a phone number, an emoji, or a job title.
+# Only the first case may be used to address someone by name — greeting a
+# laboratory as "Bom dia, Laboratório!" reads worse than not greeting at all.
+_NAME_TOKEN_RE = re.compile(r"^[^\W\d_][^\W\d_'-]+$")
+_NON_PERSON_NAME_MARKERS = (
+    "adm", "atendimento", "clinica", "comercial", "consultorio", "contato",
+    "delivery", "distribuidora", "eireli", "empresa", "epi", "farmacia",
+    "financeiro", "hospital", "imobiliaria", "lab", "laboratorio", "loja",
+    "ltda", "marketing", "me", "mei", "oficial", "ortopedia", "recepcao",
+    "rh", "sa", "salao", "seguros", "servicos", "suporte", "telemedicina",
+    "vendas",
+)
+
+
+def _contact_first_name(source: Any) -> str | None:
+    """The contact's first name, or ``None`` when it is not safely a person.
+
+    Conservative on purpose: anything with a digit, an organizational word,
+    or a shape that is not a plain name is refused, and the greeting simply
+    goes out without a name. Addressing the wrong entity by name is a worse
+    failure than addressing nobody.
+    """
+
+    raw = str(
+        getattr(source, "user_name", "") or getattr(source, "chat_name", "") or ""
+    ).strip()
+    if not raw:
+        return None
+    normalized = _normalize(raw)
+    if any(marker in normalized for marker in _INSTITUTIONAL_MARKERS):
+        return None
+    if any(
+        marker == word
+        for marker in _NON_PERSON_NAME_MARKERS
+        for word in normalized.split()
+    ):
+        return None
+    first = raw.split()[0].strip(".,;:!?")
+    # "Dr", "Dra", "Sr" and friends title someone else — skip to the name.
+    if _normalize(first).rstrip(".") in {"dr", "dra", "sr", "sra", "srta"}:
+        parts = raw.split()
+        if len(parts) < 2:
+            return None
+        first = parts[1].strip(".,;:!?")
+    if len(first) < 2 or not _NAME_TOKEN_RE.match(first):
+        return None
+    return first[:1].upper() + first[1:]
 
 
 def _within_one_edit(word: str, target: str) -> bool:
@@ -2708,6 +2785,7 @@ class WhatsAppAppointmentsHandler:
         chat_key: str,
         *,
         within_seconds: int | None = None,
+        source: Any = None,
     ) -> str:
         """The action menu, introducing the service only on a cold chat.
 
@@ -2716,7 +2794,8 @@ class WhatsAppAppointmentsHandler:
         with "Sou a assistente do Dr. Victor Almeida" over and over in the
         same conversation. ``within_seconds`` overrides how far back a
         greeting still counts; the cold open passes a much shorter window
-        (see ``handle``).
+        (see ``handle``) and the ``source`` it was greeted from, so the
+        introduction can open with the hour and the contact's own name.
         """
 
         try:
@@ -2730,7 +2809,66 @@ class WhatsAppAppointmentsHandler:
         except Exception:
             logger.warning("greeting lookup failed", exc_info=True)
             already_greeted = False
-        return _RETURNING_MENU if already_greeted else _INITIAL_MENU
+        if already_greeted:
+            return _RETURNING_MENU
+        return f"{self._opening_line(source)}\n\n{_MENU_OPTIONS}"
+
+    def _opening_line(self, source: Any = None) -> str:
+        """The first line of a cold open: the hour, the name, the identity.
+
+        "Sou a assistente do Dr. Victor Almeida" alone is correct and cold.
+        A clinic's first line is a greeting to a person, so it leads with the
+        time of day and the contact's own name when WhatsApp gives us one it
+        is safe to use — and degrades quietly to the bare introduction when
+        it does not.
+        """
+
+        greeting = _time_greeting(self._now())
+        name = _contact_first_name(source) if source is not None else None
+        opening = f"{greeting}, {name}!" if name else f"{greeting}!"
+        return f"{opening} {_INITIAL_MENU_BODY}"
+
+    def already_greeted(self, source: Any) -> bool:
+        """Whether THIS flow has already introduced itself in this chat.
+
+        The mirror of ``note_model_greeting``, and the direction that was
+        missing: the funnel's replies never enter the model's transcript
+        (``state.db`` holds only the model's own turns), so the model had no
+        way to know the secretary had just said "Sou a assistente do Dr.
+        Victor Almeida" one message earlier. It introduced itself again, and
+        the patient met the same secretary twice — the exact complaint of
+        13/ago/2026.
+
+        Read-only and best-effort: never creates the database, and any
+        failure answers "not greeted", which at worst repeats a greeting
+        rather than suppressing a required disclosure.
+        """
+
+        if not self._enabled or not self._db_path.exists():
+            return False
+        try:
+            chat_key = str(getattr(source, "chat_id", "") or "")
+            if not chat_key:
+                return False
+            return AppointmentStore(self._db_path).lead_was_greeted(
+                chat_key,
+                now=self._now(),
+                within_seconds=self._greeting_ttl_seconds,
+            )
+        except Exception:
+            logger.warning("greeting lookup failed", exc_info=True)
+            return False
+
+    def _sign_off(self, message: str) -> str:
+        """Append the closing wish to a message that ends the conversation.
+
+        Only the replies that actually close something get this — the
+        reception hand-off, the finished booking, the exit to another
+        subject. Adding it to a mid-flow prompt would wish the patient a good
+        week while still asking them for a CPF.
+        """
+
+        return f"{message} {_closing_wish(self._now())}"
 
     def _is_reception_chat(self, chat_key: str) -> bool:
         """Whether this chat is the reception's own notification channel."""
@@ -2842,7 +2980,10 @@ class WhatsAppAppointmentsHandler:
             # double introduction the two pipelines can produce within one
             # burst, which is the case the TTL was actually written for.
             menu = self._menu_for(
-                store, chat_key, within_seconds=self._opener_greeting_window_seconds
+                store,
+                chat_key,
+                within_seconds=self._opener_greeting_window_seconds,
+                source=source,
             )
             self._track_lead(
                 store,
@@ -2956,7 +3097,8 @@ class WhatsAppAppointmentsHandler:
                     "reception handoff notice could not be queued", exc_info=True
                 )
         return self._respond(
-            store, message_id, chat_key, _RECEPTION, FlowState.HANDOFF, {}
+            store, message_id, chat_key, self._sign_off(_RECEPTION),
+            FlowState.HANDOFF, {},
         )
 
     def _enter_reconciliation(
@@ -3058,7 +3200,12 @@ class WhatsAppAppointmentsHandler:
             label = "telefone" if data["edit_field"] == "telefone" else "e-mail"
             response = f"Cadastro atualizado: {label} alterado com sucesso."
         return self._respond(
-            store, message_id, chat_key, response, FlowState.COMPLETED, completed
+            store,
+            message_id,
+            chat_key,
+            self._sign_off(response),
+            FlowState.COMPLETED,
+            completed,
         )
 
     def _authorization_still_valid(
@@ -3629,6 +3776,9 @@ class WhatsAppAppointmentsHandler:
                     {},
                     now=self._now(),
                 )
+                # No sign-off here: this line hands the conversation over and
+                # asks the patient to keep talking. Wishing them a good week
+                # in the same breath would be a goodbye and a question at once.
                 self._track_lead(
                     store,
                     chat_key,
