@@ -479,11 +479,21 @@ class FeegowClient:
         nome: Optional[str] = None,
         telefone: Optional[str] = None,
         email: Optional[str] = None,
+        *,
+        strict: bool = False,
     ) -> List[Dict[str, Any]]:
         """Busca pacientes na base Feegow e normaliza o envelope em uma lista.
 
         Usa o endpoint ``patient/search`` (singular, GET).
         Parâmetros em português: ``paciente_cpf``, ``paciente_nome``.
+
+        ``strict=True`` desliga a degradação graciosa e propaga o erro. Quem
+        só enriquece contexto para o modelo prefere lista vazia a exceção; o
+        portão de identidade do agendamento, não: para ele lista vazia
+        significa "este CPF não existe na base", e a decisão seguinte é criar
+        um paciente novo. Em 13/ago/2026 um 409 da Feegow virou exatamente
+        isso — base ilegível lida como base vazia. Base ilegível não é base
+        vazia.
         """
         params: Dict[str, str] = {}
         if cpf:
@@ -501,12 +511,15 @@ class FeegowClient:
             )
 
         logger.info("Feegow: searching patients with %s", list(params.keys()))
-        return self._safe_call(
-            lambda: self._collection_content(
+
+        def read() -> List[Dict[str, Any]]:
+            return self._collection_content(
                 self._request("GET", "patient/search", params=params)
-            ),
-            fallback=[],
-        )
+            )
+
+        if strict:
+            return read()
+        return self._safe_call(read, fallback=[])
 
     def create_patient(
         self,
@@ -802,11 +815,16 @@ class FeegowClient:
         )
 
     def find_patient_by_cpf(self, cpf: str) -> List[Dict[str, Any]]:
-        """Return exact CPF candidates for the deterministic identity gate."""
+        """Return exact CPF candidates for the deterministic identity gate.
+
+        Reads strictly: this is the only caller whose empty result is a
+        decision ("no such patient → create one"), so an unreadable base must
+        raise here and let the flow fail closed to reception.
+        """
         digits = "".join(ch for ch in str(cpf) if ch.isdigit())
         return [
             patient
-            for patient in self.search_patients(cpf=digits)
+            for patient in self.search_patients(cpf=digits, strict=True)
             if "".join(ch for ch in str(patient.get("cpf", "")) if ch.isdigit()) == digits
         ]
 
