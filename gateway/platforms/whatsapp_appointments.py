@@ -2537,7 +2537,35 @@ def _normalized_phone(value: Any) -> str:
 
 
 def _chat_phone(chat_key: str) -> str:
-    return _normalized_phone(chat_key.split("@", 1)[0])
+    """Return the patient's real phone digits for a WhatsApp chat key.
+
+    WhatsApp addresses a DM either by phone JID (``557188326547@s.whatsapp.net``)
+    or by LID (``52802445381872@lid``), and LID digits are not a phone number at
+    all — they are an opaque 14/15-digit identity. Reading them as a phone made
+    the confirmation step reject every LID-addressed patient, because an opaque
+    id can never be 10 or 11 digits long. On 13/ago/2026 that killed a lead who
+    had already picked a slot and given CPF and birth date: the flow died one
+    line before the write, and every chat in the base is LID-addressed.
+
+    The bridge already writes the LID→phone mapping this needs, and
+    ``gateway.run`` / ``gateway.session`` already resolve identities through it.
+    A LID with no mapping file resolves to itself and still fails the length
+    check downstream — an unresolvable identity must fail closed to reception,
+    never be guessed at.
+    """
+
+    raw = chat_key.split("@", 1)[0]
+    direct = _normalized_phone(raw)
+    if not chat_key.casefold().endswith("@lid"):
+        return direct
+    try:
+        from gateway.whatsapp_identity import canonical_whatsapp_identifier
+
+        resolved = _normalized_phone(canonical_whatsapp_identifier(chat_key))
+    except Exception:
+        logger.warning("LID phone resolution failed for a booking", exc_info=True)
+        return direct
+    return resolved or direct
 
 
 def _patient_phones(patient: Mapping[str, Any]) -> set[str]:
@@ -3013,12 +3041,24 @@ class WhatsAppAppointmentsHandler:
                     store, flow, message_id, chat_key, incoming
                 )
             except Exception:
+                # Failing closed is right; failing closed in silence is not.
+                # Every dead end reception was told about on 13/ago/2026 left
+                # no trace of its cause, so the reason had to be reconstructed
+                # from the databases afterwards. State is not logged — only
+                # the exception — because the flow's state carries patient data.
+                logger.warning(
+                    "payment proof handling failed; reception notified",
+                    exc_info=True,
+                )
                 return self._handoff(store, message_id, chat_key)
 
         text = str(getattr(incoming, "text", "") or "").strip()
         try:
             return self._advance(store, flow, message_id, chat_key, text)
         except Exception:
+            logger.warning(
+                "appointment flow failed; reception notified", exc_info=True
+            )
             return self._handoff(store, message_id, chat_key)
 
     def _track_lead(
@@ -3929,6 +3969,11 @@ class WhatsAppAppointmentsHandler:
                     data,
                 )
             data["birth_date"] = birth.strftime("%d/%m/%Y")
+            # An unreadable base says nothing about this CPF. ``find_patient``
+            # reads strictly for exactly that reason: an empty list here means
+            # "no such patient" and books a brand new one, so a failed read
+            # must raise and fail closed rather than register a second record
+            # for someone Feegow already has.
             patients = self.find_patient(data["cpf"])
             if _has_legacy_or_ambiguous_return(patients) or len(patients) > 1:
                 return self._handoff(store, message_id, chat_key)
