@@ -1156,7 +1156,15 @@ def test_new_patient_teleconsultation_summary_discloses_registration(tmp_path):
         procedures=[{"procedimento_id": 3, "nome": "Teleconsulta", "valor": 300}],
     )
     handler = WhatsAppAppointmentsHandler(
-        payment_config(), db_path=tmp_path / "appointments.sqlite3", feegow_client=feegow
+        payment_config(),
+        db_path=tmp_path / "appointments.sqlite3",
+        feegow_client=feegow,
+        # The slot above is a fixed date, so the clock has to be fixed too.
+        # Reading the wall clock made this test start failing on 05/ago/2026
+        # and stay red forever: a teleconsultation in the past has no payment
+        # window, so the flow correctly failed closed to reception and the
+        # assertion below blamed the summary.
+        clock=MutableClock(datetime(2026, 8, 1, 10, 0, tzinfo=ZoneInfo("America/Bahia"))),
     )
 
     handler.handle(event("Quero agendar uma consulta", message_id="tele-new-1"))
