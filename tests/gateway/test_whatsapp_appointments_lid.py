@@ -21,7 +21,8 @@ bridge's ``lid-mapping-*.json`` files via ``gateway.whatsapp_identity``.
 from __future__ import annotations
 
 import json
-from datetime import datetime
+import sqlite3
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -52,6 +53,7 @@ LID = "52802445381872"
 LID_CHAT_KEY = f"{LID}@lid"
 PHONE_WITH_COUNTRY = "557188326547"
 PHONE = "7188326547"
+RECEPTION = "5571996691002@s.whatsapp.net"
 
 PROC1 = {"procedimento_id": 1, "nome": "Consulta", "valor": 600}
 SLOT = {"id": "slot-1", "procedimento_id": 1, "data": "2026-08-05", "horario": "14:00"}
@@ -190,35 +192,159 @@ def test_unreadable_patient_base_goes_to_reception_instead_of_creating_a_patient
     assert [name for name, _ in feegow.calls if name == "create_patient"] == []
 
 
-def test_reception_hears_about_the_unreadable_base(tmp_path):
-    """The dead end is only visible to a human through the handoff notice."""
-    _write_lid_mapping()
-    feegow = _UnreadablePatients(
-        slots=[dict(SLOT)],
-        patients=[known_patient(celular=PHONE)],
-        procedures=[dict(PROC1)],
-    )
-    handler = _build(
-        feegow, tmp_path
-    )
-    handler._reception_chat_id = "5571996691002@s.whatsapp.net"
+# --------------------------------------------------------- the notice content
 
+
+def _outbox(tmp_path):
+    with sqlite3.connect(tmp_path / "appointments.sqlite3") as connection:
+        return connection.execute(
+            "SELECT chat_key, body, state FROM outbox_events ORDER BY created_at"
+        ).fetchall()
+
+
+def _drive_to_dead_end(handler):
+    """Karina's exact path: menu → serviço → vaga → CPF → nascimento → beco."""
     for index, text in enumerate(
         ("Quero agendar uma consulta", "1", "1", "1", CPF_FORMATTED, BIRTH_DATE),
         start=1,
     ):
         handler.handle(
-            event(text, message_id=f"notice-{index}", chat_id=LID_CHAT_KEY)
+            event(
+                text,
+                message_id=f"notice-{index}",
+                chat_id=LID_CHAT_KEY,
+                user_name="Karina Costa",
+            )
         )
 
-    import sqlite3
 
-    with sqlite3.connect(tmp_path / "appointments.sqlite3") as connection:
-        rows = connection.execute(
-            "SELECT chat_key, state FROM outbox_events"
-        ).fetchall()
+def test_dead_end_notice_tells_reception_who_to_call_and_what_was_answered(tmp_path):
+    """The anonymous notice reception could not act on, replaced."""
+    _write_lid_mapping()
+    handler = _build(
+        _UnreadablePatients(
+            slots=[dict(SLOT)],
+            patients=[known_patient(celular=PHONE)],
+            procedures=[dict(PROC1)],
+        ),
+        tmp_path,
+    )
+    handler._reception_chat_id = RECEPTION
 
-    assert rows == [("5571996691002@s.whatsapp.net", "PENDING")]
+    _drive_to_dead_end(handler)
+
+    (chat_key, body, state), = _outbox(tmp_path)
+    assert (chat_key, state) == (RECEPTION, "PENDING")
+    assert "Karina" in body
+    assert "71 8832-6547" in body
+    assert "Consulta presencial" in body
+    assert "05/08/2026 às 14:00" in body
+    assert "data de nascimento" in body
+    assert "Ligar para o paciente" in body
+
+
+def test_dead_end_notice_never_carries_cpf_or_birth_date(tmp_path):
+    """Reception gets what it needs to call, not the patient's record."""
+    _write_lid_mapping()
+    handler = _build(
+        _UnreadablePatients(
+            slots=[dict(SLOT)],
+            patients=[known_patient(celular=PHONE)],
+            procedures=[dict(PROC1)],
+        ),
+        tmp_path,
+    )
+    handler._reception_chat_id = RECEPTION
+
+    _drive_to_dead_end(handler)
+
+    (_, body, _), = _outbox(tmp_path)
+    assert CPF not in body
+    assert CPF_FORMATTED not in body
+    assert BIRTH_DATE not in body
+
+
+def test_one_dead_end_notice_per_chat_per_day(tmp_path):
+    """A patient who retries all afternoon is one call for reception, not six."""
+    _write_lid_mapping()
+    handler = _build(
+        _UnreadablePatients(
+            slots=[dict(SLOT)],
+            patients=[known_patient(celular=PHONE)],
+            procedures=[dict(PROC1)],
+        ),
+        tmp_path,
+    )
+    handler._reception_chat_id = RECEPTION
+
+    _drive_to_dead_end(handler)
+    handler.handle(
+        event("Oi?", message_id="notice-again", chat_id=LID_CHAT_KEY)
+    )
+
+    assert len(_outbox(tmp_path)) == 1
+
+
+# ------------------------------------------------------------ clinical promise
+
+
+def test_clinical_refusal_actually_reaches_reception(tmp_path):
+    """"Vou encaminhar para a equipe" had no code behind it until now."""
+    _write_lid_mapping()
+    handler = _build(FakeFeegow(), tmp_path)
+    handler._reception_chat_id = RECEPTION
+    # The store only exists once the flow has touched it.
+    handler.handle(
+        event("Quero agendar uma consulta", message_id="clin-0", chat_id=LID_CHAT_KEY)
+    )
+
+    handler.note_clinical_escalation(
+        event("meu marido descobriu diabetes", chat_id=LID_CHAT_KEY, user_name="Karina Costa")
+    )
+
+    body = _outbox(tmp_path)[-1][1]
+    assert "Assunto clínico" in body
+    assert "Karina" in body
+    assert "71 8832-6547" in body
+    # The clinical content itself stays in the chat, not in the notice.
+    assert "diabetes" not in body.lower()
+
+
+def test_clinical_notice_collapses_a_burst_but_not_a_later_message(tmp_path):
+    _write_lid_mapping()
+    clock = MutableClock(NOW)
+    handler = WhatsAppAppointmentsHandler(
+        payment_config(),
+        db_path=tmp_path / "appointments.sqlite3",
+        proofs_dir=tmp_path / "proofs",
+        feegow_client=FakeFeegow(),
+        clock=clock,
+    )
+    handler._reception_chat_id = RECEPTION
+    handler.handle(
+        event("Quero agendar uma consulta", message_id="clin-1", chat_id=LID_CHAT_KEY)
+    )
+
+    handler.note_clinical_escalation(event("a", chat_id=LID_CHAT_KEY))
+    handler.note_clinical_escalation(event("b", chat_id=LID_CHAT_KEY))
+    assert sum("Assunto clínico" in body for _, body, _ in _outbox(tmp_path)) == 1
+
+    clock.value += timedelta(hours=3)
+    handler.note_clinical_escalation(event("c", chat_id=LID_CHAT_KEY))
+    assert sum("Assunto clínico" in body for _, body, _ in _outbox(tmp_path)) == 2
+
+
+def test_reception_chat_never_notifies_itself(tmp_path):
+    """The notification channel is not a patient."""
+    handler = _build(FakeFeegow(), tmp_path)
+    handler._reception_chat_id = RECEPTION
+    handler.handle(
+        event("Quero agendar uma consulta", message_id="self-1", chat_id=LID_CHAT_KEY)
+    )
+
+    handler.note_clinical_escalation(event("x", chat_id=RECEPTION))
+
+    assert [body for _, body, _ in _outbox(tmp_path) if "Assunto clínico" in body] == []
 
 
 # ------------------------------------------------------- the strict client read

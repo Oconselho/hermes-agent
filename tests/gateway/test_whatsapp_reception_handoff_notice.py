@@ -81,16 +81,33 @@ class TestHandoffNotifiesReception:
         assert len(rows) == 1
         chat_key, body = rows[0]
         assert chat_key == RECEPTION
-        assert "agendar" in body.lower()
-        assert "recepção" in body.lower()
+        assert "agendamento automático" in body.lower()
+        # The point of the notice: a human is asked to pick up the phone.
+        assert "ligar para o paciente" in body.lower()
 
-    def test_notice_carries_no_patient_data(self, tmp_path):
+    def test_notice_identifies_who_reception_should_call(self, tmp_path):
+        """Anonymous, this notice was unactionable — see the module docstring."""
+        handler, db_path, _ = _handler(tmp_path)
+        _attempt_booking(handler)
+
+        body = _outbox(db_path)[0][1]
+        assert "71 99999-9999" in body
+        assert "Paciente" in body
+
+    def test_notice_carries_no_record_data(self, tmp_path):
+        """Name and phone are what reception needs to call; the record is not.
+
+        CPF, birth date, e-mail and the registered name stay in Feegow, and
+        the patient's own words stay in the chat — each under its own access
+        control. Only the WhatsApp identity reception is about to dial travels
+        in the notice.
+        """
         handler, db_path, _ = _handler(tmp_path)
         _attempt_booking(handler)
 
         body = _outbox(db_path)[0][1]
         for sentinel in (CPF, CPF_FORMATTED, BIRTH_DATE, "Paciente Exemplo",
-                         "71999999999", "old@example.invalid"):
+                         "old@example.invalid"):
             assert sentinel not in body, f"PII leak: {sentinel!r}"
 
     def test_retrying_the_same_day_does_not_flood_reception(self, tmp_path):

@@ -1103,6 +1103,16 @@ _WHATSAPP_CLINICAL_REFUSAL = (
     "imediatamente ou ligue 192."
 )
 
+# The refusal has two producers: the deterministic guard above, and the model
+# reproducing the same template from the prompt (REGRA #4) — which is what
+# actually happened on 13/ago/2026. Both promise the patient a forward to the
+# team, so both must trigger the reception notice. Matching the promise itself
+# rather than the whole string keeps the greeting prefix the model prepends
+# from defeating the match.
+_WHATSAPP_CLINICAL_ESCALATION_RE = re.compile(
+    r"(?i)n[ãa]o\s+presta\s+orienta[çc][ãa]o\s+cl[íi]nica"
+)
+
 
 def _sanitize_gateway_final_response(
     platform: Any, text: str, *, trusted_source: bool = False
@@ -13117,6 +13127,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         except Exception:
                             logger.debug(
                                 "[WhatsApp] greeting handoff to funnel failed",
+                                exc_info=True,
+                            )
+
+                    # "Vou encaminhar sua mensagem para a equipe do Dr.
+                    # Victor" was a sentence with nothing behind it: the
+                    # clinical refusal notified no one, so a patient who wrote
+                    # about a new diagnosis on 13/ago/2026 was told they had
+                    # been forwarded to a team that never heard of them. The
+                    # appointment outbox is the only channel reception
+                    # watches, so the promise is kept through it.
+                    #
+                    # Matched on the delivered text rather than on the
+                    # sanitizer's return, because the refusal has two
+                    # producers — the deterministic guard AND the model
+                    # following the same template from the prompt — and both
+                    # make the same promise to the patient.
+                    if _WHATSAPP_CLINICAL_ESCALATION_RE.search(response):
+                        try:
+                            _clinical_handler = self._get_appointment_handler()
+                            if _clinical_handler is not None:
+                                await asyncio.to_thread(
+                                    _clinical_handler.note_clinical_escalation, event
+                                )
+                        except Exception:
+                            logger.warning(
+                                "[WhatsApp] clinical escalation notice failed",
                                 exc_info=True,
                             )
 

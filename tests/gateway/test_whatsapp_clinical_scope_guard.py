@@ -25,6 +25,7 @@ caught by the guard.
 import pytest
 
 from gateway.run import (
+    _WHATSAPP_CLINICAL_ESCALATION_RE as ESCALATION_RE,
     _WHATSAPP_CLINICAL_REFUSAL as REFUSAL,
     _WHATSAPP_SANITIZER_FALLBACKS,
     _sanitize_gateway_final_response,
@@ -176,3 +177,65 @@ def test_transcript_echo_untouched_on_other_platforms():
     """The STT echo call site is shared; only WhatsApp changes behaviour."""
     raw = '🎙️ "qualquer coisa"'
     assert _whatsapp_safe_transcript_echo(Platform.TELEGRAM, raw) == raw
+
+
+# ── The refusal's promise: "vou encaminhar para a equipe do Dr. Victor" ──────
+#
+# Between 12 and 13/ago/2026 the secretary delivered this refusal to 8 distinct
+# conversations and notified reception in none of them: the sentence had no
+# code behind it. The detector below is what turns the promise into an actual
+# message, so it is tested against what was really sent, read back from
+# state.db — not against the template it was supposed to follow.
+
+# ── Delivered to 8 conversations, 12-13/ago/2026 (state.db, role=assistant) ──
+DELIVERED_REFUSALS = [
+    "Boa noite! Aqui é a assistente do Dr. Victor Almeida. Este canal não "
+    "presta orientação clínica. Vou encaminhar sua mensagem para a equipe do "
+    "Dr. Victor. Em caso de urgência, procure atendimento médico imediatamente "
+    "ou ligue 192.",
+    # "Sou a", not "Aqui é" — the model varies the identification it prepends.
+    "Boa tarde! Sou a assistente do Dr. Victor Almeida. Este canal não presta "
+    "orientação clínica. Vou encaminhar sua mensagem para a equipe do Dr. "
+    "Victor. Em caso de urgência, procure atendimento médico imediatamente ou "
+    "ligue 192.",
+    "Bom dia! Aqui é a assistente do Dr. Victor Almeida. Este canal não presta "
+    "orientação clínica. Vou encaminhar sua mensagem para a equipe do Dr. "
+    "Victor. Em caso de urgência, procure atendimento médico imediatamente ou "
+    "ligue 192.",
+]
+
+
+@pytest.mark.parametrize("text", DELIVERED_REFUSALS)
+def test_delivered_refusals_reach_reception(text):
+    """Every refusal a patient really received must raise the notice.
+
+    The greeting the model prepends is why this matches the promise rather
+    than the whole string: anchoring on the template would have missed all
+    three of these.
+    """
+    assert ESCALATION_RE.search(text), f"refusal notified nobody: {text[:60]!r}"
+
+
+def test_the_guards_own_refusal_reaches_reception():
+    """The refusal has two producers; the deterministic one counts too."""
+    assert ESCALATION_RE.search(REFUSAL)
+
+
+@pytest.mark.parametrize("text", BLOCKED_VINICIUS + BLOCKED_MORE)
+def test_blocked_clinical_conduct_always_ends_up_notifying_reception(text):
+    """Composing the two halves: whatever the guard refuses, reception hears.
+
+    This is the property that matters in production — not that some string
+    matches, but that no path exists where a patient is refused in silence.
+    """
+    assert ESCALATION_RE.search(_sanitize_gateway_final_response(Platform.WHATSAPP, text))
+
+
+@pytest.mark.parametrize("text", ALLOWED_TEMPLATES)
+def test_approved_templates_do_not_notify_reception(text):
+    """A false positive here is reception paged for an ordinary conversation.
+
+    Category F (urgência) is the trap: it escalates and names 192, but it is
+    not the clinical refusal and reception has nothing to call back about.
+    """
+    assert not ESCALATION_RE.search(text), f"spurious notice for: {text[:60]!r}"

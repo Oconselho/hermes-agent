@@ -1172,10 +1172,18 @@ class AppointmentStore:
         *,
         now: datetime | None = None,
     ) -> str:
-        """Atomically persist one inbox result and its resulting flow state."""
+        """Atomically persist one inbox result and its resulting flow state.
+
+        ``contact_name`` is carried across the write when the caller does not
+        supply it. Every other key in ``data`` is state for the current step
+        and is meant to be dropped when the step changes — the steps rebuild
+        the dict freely for exactly that reason. The contact's name is not
+        step state: it is a property of the chat, known only at the cold open
+        (it arrives on the live event, never from Feegow) and needed much
+        later, when the reception handoff notice has to say who to call.
+        """
 
         timestamp = (now or datetime.now(timezone.utc)).isoformat()
-        serialized = json.dumps(dict(data), ensure_ascii=False, separators=(",", ":"))
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
@@ -1183,6 +1191,20 @@ class AppointmentStore:
             ).fetchone()
             if existing is not None:
                 return str(existing[0])
+            merged = dict(data)
+            if not merged.get("contact_name"):
+                prior = connection.execute(
+                    "SELECT data_json FROM flow_states WHERE chat_key = ?",
+                    (chat_key,),
+                ).fetchone()
+                if prior is not None:
+                    try:
+                        carried = json.loads(str(prior[0])).get("contact_name")
+                    except (TypeError, ValueError):
+                        carried = None
+                    if carried:
+                        merged["contact_name"] = carried
+            serialized = json.dumps(merged, ensure_ascii=False, separators=(",", ":"))
             connection.execute(
                 """
                 INSERT INTO inbox_events
@@ -1765,6 +1787,7 @@ class AppointmentStore:
         reception_chat_id: str,
         *,
         now: datetime,
+        details: Mapping[str, str] | None = None,
     ) -> dict[str, str] | None:
         """Tell reception an automated booking attempt gave up on this chat.
 
@@ -1782,19 +1805,83 @@ class AppointmentStore:
         afternoon produces one notice, not one per message, and a new day
         raises it again because that is a genuinely new attempt.
 
-        Same privacy contract as the other reception notices — no name, CPF,
-        phone, email, or any of the patient's words. Reception opens the
-        conversation it already has access to.
+        Unlike the booking and receipt notices, this one has no Feegow
+        appointment id — nothing was created — so "reception looks it up"
+        resolves to nothing at all. Anonymous, it told reception that someone
+        it could not name had given up, which is not something anyone can act
+        on: on 13/ago/2026 a lead who had already chosen a slot was lost that
+        way. ``details`` carries what reception needs to make the call, and
+        nothing more: no CPF, no birth date, and none of the patient's own
+        words. Those stay in Feegow and in the chat, each under its own
+        access control.
         """
 
         day = now.date().isoformat()
         idempotency_key = _opaque_id("reception-handoff", chat_key, day)
         outbox_id = _opaque_id("outbox", idempotency_key)
-        body = (
-            "Um paciente tentou agendar pelo WhatsApp e o atendimento "
-            "automático não conseguiu concluir. O paciente foi orientado a "
-            "falar com a recepção."
+        lines = [
+            "Lead parado no agendamento automático pelo WhatsApp.",
+            "",
+        ]
+        lines.extend(f"{label}: {value}" for label, value in (details or {}).items())
+        if len(lines) > 2:
+            lines.append("")
+        lines.append(
+            "Ligar para o paciente para concluir o agendamento e esclarecer dúvidas."
         )
+        body = "\n".join(lines)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO outbox_events
+                    (id, idempotency_key, chat_key, body, state, created_at, sent_at)
+                VALUES (?, ?, ?, ?, 'PENDING', ?, NULL)
+                """,
+                (outbox_id, idempotency_key, reception_chat_id, body, now.isoformat()),
+            )
+        return {"id": outbox_id, "chat_key": reception_chat_id, "body": body}
+
+    def enqueue_reception_clinical(
+        self,
+        chat_key: str,
+        reception_chat_id: str,
+        *,
+        now: datetime,
+        details: Mapping[str, str] | None = None,
+    ) -> dict[str, str] | None:
+        """Make the clinical refusal's promise true.
+
+        The secretary tells the patient "vou encaminhar sua mensagem para a
+        equipe do Dr. Victor" whenever it refuses clinical conduct — and until
+        now that sentence had no code behind it. Nothing was queued, nothing
+        was sent, and a patient who wrote about a new diabetes diagnosis on
+        13/ago/2026 was told they had been forwarded to a team that never
+        heard of them.
+
+        Bucketed by the hour, not by the day like the booking dead end: a
+        burst collapses into one notice, but a patient who writes again three
+        hours later is raising something new and reception has to hear it.
+
+        The patient's own words are never carried. What they wrote is clinical
+        content; reception reads it in the chat, which is where it already is.
+        """
+
+        bucket = now.strftime("%Y-%m-%dT%H")
+        idempotency_key = _opaque_id("reception-clinical", chat_key, bucket)
+        outbox_id = _opaque_id("outbox", idempotency_key)
+        lines = [
+            "Assunto clínico recebido pela secretária automática no WhatsApp.",
+            "",
+        ]
+        lines.extend(f"{label}: {value}" for label, value in (details or {}).items())
+        if len(lines) > 2:
+            lines.append("")
+        lines.append(
+            "O paciente foi informado de que a mensagem seria encaminhada à "
+            "equipe do Dr. Victor. Abrir a conversa no WhatsApp para ler o "
+            "teor e retornar o contato."
+        )
+        body = "\n".join(lines)
         with self._connect() as connection:
             connection.execute(
                 """
@@ -2568,6 +2655,51 @@ def _chat_phone(chat_key: str) -> str:
     return resolved or direct
 
 
+def _format_phone(digits: str) -> str:
+    """``7188326547`` → ``71 8832-6547``, so reception can dial it as written."""
+
+    if len(digits) == 11:
+        return f"{digits[:2]} {digits[2:7]}-{digits[7:]}"
+    if len(digits) == 10:
+        return f"{digits[:2]} {digits[2:6]}-{digits[6:]}"
+    return digits
+
+
+def _format_moment(value: Any) -> str:
+    """An ISO timestamp as ``13/08 15:48``, or empty when it is unreadable."""
+
+    try:
+        return datetime.fromisoformat(str(value)).strftime("%d/%m %H:%M")
+    except (TypeError, ValueError):
+        return ""
+
+
+# Where the patient got to before the flow gave up. Reception opens the call
+# knowing what was already answered, so the patient is not asked twice.
+_HANDOFF_STEP_LABELS = {
+    FlowState.AWAITING_APPOINTMENT_ACTION.value: "escolha do atendimento",
+    FlowState.AWAITING_SERVICE.value: "escolha do serviço",
+    FlowState.AWAITING_SLOT.value: "escolha da vaga",
+    FlowState.AWAITING_CPF.value: "informação do CPF",
+    FlowState.AWAITING_BIRTH_DATE.value: "data de nascimento",
+    FlowState.AWAITING_PHONE_CONFIRMATION.value: "confirmação do telefone",
+    FlowState.AWAITING_NEW_PATIENT_NAME.value: "nome para o cadastro",
+    FlowState.AWAITING_NEW_PATIENT_SEX.value: "sexo para o cadastro",
+    FlowState.AWAITING_NEW_PATIENT_EMAIL.value: "e-mail para o cadastro",
+    FlowState.AWAITING_AUTHORIZATION.value: "confirmação do agendamento",
+    FlowState.AWAITING_APPOINTMENT_SELECTION.value: "escolha do agendamento",
+    FlowState.AWAITING_RESCHEDULE_SLOT.value: "escolha da nova vaga",
+    FlowState.AWAITING_RESCHEDULE_AUTHORIZATION.value: "confirmação da remarcação",
+    FlowState.AWAITING_CANCEL_AUTHORIZATION.value: "confirmação do cancelamento",
+    FlowState.AWAITING_RETURN_MODALITY.value: "modalidade do retorno",
+    FlowState.AWAITING_RETURN_SLOT.value: "escolha da vaga de retorno",
+    FlowState.AWAITING_EDIT_FIELD.value: "escolha do dado a atualizar",
+    FlowState.AWAITING_EDIT_VALUE.value: "novo valor do cadastro",
+    FlowState.AWAITING_EDIT_AUTHORIZATION.value: "confirmação da atualização",
+    FlowState.AGUARDANDO_COMPROVANTE.value: "envio do comprovante",
+}
+
+
 def _patient_phones(patient: Mapping[str, Any]) -> set[str]:
     values: list[Any] = []
     for key in ("telefone", "celular", "phone", "mobile", "telefone_celular"):
@@ -2807,6 +2939,47 @@ class WhatsAppAppointmentsHandler:
         except Exception:
             logger.warning("model greeting not recorded", exc_info=True)
 
+    def note_clinical_escalation(self, incoming: Any) -> None:
+        """Queue the reception notice the clinical refusal promises.
+
+        The refusal is produced by the model pipeline, not by this flow, so
+        this is the seam where the promise becomes an actual message. Kept
+        here because the outbox — the only delivery path reception is watching
+        — belongs to this store.
+
+        Best-effort on the reply path, exactly like ``note_model_greeting``:
+        never creates the database, and a failure costs the patient nothing.
+        The patient still gets the refusal either way; what fails is only
+        reception hearing about it, and that is logged loudly because it is
+        the whole point of the call.
+        """
+
+        if not self._enabled or not self._reception_chat_id:
+            return
+        if not self._db_path.exists():
+            return
+        try:
+            source = getattr(incoming, "source", None)
+            chat_key = str(getattr(source, "chat_id", "") or "")
+            if not chat_key or self._is_reception_chat(chat_key):
+                return
+            details: dict[str, str] = {}
+            phone = _format_phone(_chat_phone(chat_key))
+            name = _contact_first_name(source)
+            if phone:
+                details["Contato"] = f"{name} — {phone}" if name else phone
+            details["Recebido"] = self._now().strftime("%d/%m %H:%M")
+            AppointmentStore(self._db_path).enqueue_reception_clinical(
+                chat_key,
+                self._reception_chat_id,
+                now=self._now(),
+                details=details,
+            )
+        except Exception:
+            logger.warning(
+                "clinical escalation notice could not be queued", exc_info=True
+            )
+
     def _menu_for(
         self,
         store: AppointmentStore,
@@ -3013,11 +3186,21 @@ class WhatsAppAppointmentsHandler:
                 within_seconds=self._opener_greeting_window_seconds,
                 source=source,
             )
+            # The contact's name lives only in the live event, and the
+            # reception handoff notice is built much later, from the store
+            # alone. Carrying it in the flow is what lets that notice name who
+            # to call. ``leads`` is deliberately name-free (see its schema
+            # comment); ``flow_states`` already holds the patient's name, CPF
+            # and phone under the same 24h TTL, so this adds no data class.
+            opening_data: dict[str, Any] = {}
+            contact_name = _contact_first_name(source)
+            if contact_name:
+                opening_data["contact_name"] = contact_name
             self._track_lead(
                 store,
                 chat_key,
                 FlowState.AWAITING_APPOINTMENT_ACTION,
-                {},
+                opening_data,
                 greeted=True,
                 note="entrada no funil",
             )
@@ -3026,7 +3209,7 @@ class WhatsAppAppointmentsHandler:
                 chat_key,
                 menu,
                 FlowState.AWAITING_APPOINTMENT_ACTION.value,
-                {},
+                opening_data,
                 now=self._now(),
             )
 
@@ -3130,7 +3313,10 @@ class WhatsAppAppointmentsHandler:
         if self._reception_chat_id:
             try:
                 store.enqueue_reception_handoff(
-                    chat_key, self._reception_chat_id, now=self._now()
+                    chat_key,
+                    self._reception_chat_id,
+                    now=self._now(),
+                    details=self._handoff_details(store, chat_key),
                 )
             except Exception:
                 logger.warning(
@@ -3140,6 +3326,58 @@ class WhatsAppAppointmentsHandler:
             store, message_id, chat_key, self._sign_off(_RECEPTION),
             FlowState.HANDOFF, {},
         )
+
+    def _handoff_details(
+        self, store: AppointmentStore, chat_key: str
+    ) -> dict[str, str]:
+        """What reception needs to chase this lead by phone.
+
+        Read before ``_respond`` wipes the flow, because the answers the
+        patient already gave — which service, which slot, how far they got —
+        are exactly what makes the call worth making. Best-effort: a notice
+        with only a phone number still beats the anonymous one it replaces.
+        """
+
+        details: dict[str, str] = {}
+        phone = _format_phone(_chat_phone(chat_key))
+        if phone:
+            details["Contato"] = phone
+        try:
+            flow = store.load_flow(chat_key)
+            lead = store.load_lead(chat_key)
+        except Exception:
+            logger.warning("handoff details unavailable", exc_info=True)
+            return details
+
+        if flow is not None:
+            name = str(flow.data.get("contact_name") or "").strip()
+            if name and phone:
+                details["Contato"] = f"{name} — {phone}"
+            slot = flow.data.get("selected_slot")
+            if isinstance(slot, Mapping):
+                chosen = " às ".join(
+                    part
+                    for part in (
+                        str(slot.get("display_date") or "").strip(),
+                        str(slot.get("time") or "").strip(),
+                    )
+                    if part
+                )
+                if chosen:
+                    details["Vaga escolhida"] = chosen
+            step = _HANDOFF_STEP_LABELS.get(flow.state)
+            if step:
+                details["Parou em"] = step
+        if lead is not None:
+            if lead.service_label:
+                details["Interesse"] = str(lead.service_label)
+            seen = _format_moment(lead.first_seen_at)
+            answered = _format_moment(lead.updated_at)
+            if seen and answered and seen != answered:
+                details["Respostas"] = f"de {seen} a {answered}"
+            elif seen or answered:
+                details["Respostas"] = str(answered or seen)
+        return details
 
     def _enter_reconciliation(
         self,
