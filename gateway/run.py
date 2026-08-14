@@ -403,6 +403,54 @@ _WHATSAPP_SCHEDULING_STRONG_TERMS = (
     "quando o dr", "quando dr", "tem vaga", "tem horário", "tem horario",
     "qual o dia", "quero marcar", "gostaria de marcar", "preciso marcar",
 )
+# "dia" is the weakest word the corroboration below accepts, and it is also
+# the last word of nearly every Brazilian WhatsApp message.  Greetings and
+# sign-offs are stripped before corroboration so "bom dia" cannot vouch for a
+# booking request — on 14/ago/2026 11:38 BRT "Tenha um ótimo dia!!" is what
+# turned a partner's thank-you note into a page to reception.
+_WHATSAPP_TIME_GREETING_RE = re.compile(
+    r"\b(?:bom|boa|otimo|otima|excelente|abencoado|abencoada|feliz|linda|lindo)"
+    r"\s+(?:dia|tarde|noite|semana|final de semana|fim de semana|domingo)\b"
+)
+# ``retorno`` means "return visit" to a patient and "a reply" to everyone who
+# writes for a living.  "dar um retorno", "aguardo seu retorno" and "obrigada
+# pelo retorno" are the reply sense and never a booking request.
+_WHATSAPP_RETORNO_AS_REPLY_RE = re.compile(
+    r"\b(?:d(?:ar|ando|ei|eu|ou|arei|aremos|amos)|aguard(?:o|ando|a|amos)"
+    r"|espero|esperando|obrigad[oa] pelo|pelo|sem|cobrando|cobrar)\s+"
+    r"(?:(?:um|uma|o|a|do|da|de|seu|sua|esse|este|algum)\s+){0,2}retorno\b"
+    # "retorno do exame", "retorno do docusign": the result of a thing, which
+    # is a third sense and also not a visit.
+    r"|\bretorno\s+d[oa]s?\s+(?:exame|resultado|laudo|medicament|receita|contrato"
+    r"|docusign|sistema|link|pagamento|boleto|documento|financeiro)\w*\b"
+)
+# When a booking is being asked for, the message says *when*.  The greeting is
+# already gone by the time this runs, so "dia" here is a real date question.
+_WHATSAPP_SCHEDULING_WHEN = (
+    r"quando|qual|dia|data|horario|hoje|hj|amanha|semana|proxim\w*|vaga"
+    r"|disponib\w*|encaixe|manha|tarde|noite"
+    r"|segunda|terca|quarta|quinta|sexta|sabado|domingo"
+)
+_WHATSAPP_WEEKDAY_PT = ("seg", "ter", "qua", "qui", "sex", "sáb", "dom")
+# What reception is being asked to do, most specific first: "remarcar" is a
+# different job from "marcar" and must not collapse into it.
+_WHATSAPP_SCHEDULING_INTEREST_RULES = (
+    ("desmarcar/cancelar consulta",
+     r"\b(?:desmarcar|desmarcacao|cancelar|cancelamento|desistir)\w*\b"),
+    ("remarcar consulta",
+     r"\b(?:remarcar|remarcacao|reagendar|reagendamento|adiar|antecipar)\w*\b"
+     r"|\b(?:mudar|trocar|alterar|transferir)\s+(?:o|a|de|para)?\s*"
+     r"(?:dia|horario|data|consulta)\b"),
+    ("agendar retorno", r"\bretorno\b"),
+    ("agendar exame/procedimento",
+     r"\b(?:exame|exames|procedimento|ultrassom|ultrassonografia|endoscopia"
+     r"|colonoscopia|bioimpedancia|densitometria)\w*\b"),
+    ("marcar consulta",
+     r"\b(?:marcar|marque|agendar|agendamento|marcacao|consulta|avaliacao"
+     r"|primeira consulta)\w*\b"),
+    ("consultar horários disponíveis",
+     r"\b(?:horario|vaga|disponib|encaixe|quando|qual dia|que dia)\w*\b"),
+)
 
 
 def _whatsapp_clean_prompt_value(value: Any, *, limit: int = 120) -> str:
@@ -453,6 +501,11 @@ def _whatsapp_has_scheduling_intent(text: Any) -> bool:
     A bare ``consulta`` or ``retorno`` is intentionally insufficient: phrases
     such as "passou em atendimento", "teve consulta" and "retorno do exame"
     describe history or clinical context, not a request to book an appointment.
+
+    The two weak branches corroborate with ``dia``, so the greeting that opens
+    or closes the message is removed first: "bom dia" is punctuation here, not
+    evidence that anyone wants a slot.  ``retorno`` is likewise only counted in
+    its return-visit sense — "dar um retorno" is a promise to reply.
     """
     raw = str(text or "").lower()
     normalized = unicodedata.normalize("NFKD", raw)
@@ -460,17 +513,74 @@ def _whatsapp_has_scheduling_intent(text: Any) -> bool:
     normalized = re.sub(r"\s+", " ", normalized).strip()
     if any(term in normalized for term in _WHATSAPP_SCHEDULING_STRONG_TERMS):
         return True
+    # Corroboration only: the strong terms above are checked against the whole
+    # message, because "tem horário?" is a booking request no matter what
+    # greeting it is wrapped in.
+    corroborating = _WHATSAPP_TIME_GREETING_RE.sub(" ", normalized)
     if re.search(r"\b(?:minha|sua|uma|a|o)\s+consulta\b", normalized):
         return bool(re.search(
-            r"\b(?:quando|qual|tem|verificar|disponib|horario|dia|remarcar|cancelar)\b",
-            normalized,
+            r"\b(?:" + _WHATSAPP_SCHEDULING_WHEN
+            + r"|tem|verificar|remarcar|cancelar)\b",
+            corroborating,
         ))
-    if re.search(r"\bretorno\b", normalized):
+    if re.search(r"\bretorno\b", _WHATSAPP_RETORNO_AS_REPLY_RE.sub(" ", normalized)):
         return bool(re.search(
-            r"\b(?:marcar|agendar|horario|dia|vaga|disponib|encaixe)\w*\b",
-            normalized,
+            r"\b(?:" + _WHATSAPP_SCHEDULING_WHEN + r"|marcar|agendar)\b",
+            corroborating,
         ))
     return False
+
+
+def _whatsapp_scheduling_interest(text: Any) -> str:
+    """Name the booking the sender is asking for, in reception's own words.
+
+    Reception does not need the message replayed; it needs to know which of a
+    handful of jobs is waiting.  Ordered most specific first, so "remarcar"
+    never degrades into "marcar".
+    """
+    raw = str(text or "").lower()
+    normalized = unicodedata.normalize("NFKD", raw)
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    # Same reason the gate above ignores it: "fico no aguardo do retorno" at
+    # the end of a booking request must not relabel it as a return visit.
+    normalized = _WHATSAPP_RETORNO_AS_REPLY_RE.sub(" ", normalized)
+    for label, pattern in _WHATSAPP_SCHEDULING_INTEREST_RULES:
+        if re.search(pattern, normalized):
+            return label
+    return "agendamento — ver a conversa"
+
+
+def _whatsapp_reception_notice(
+    title: str,
+    when: datetime,
+    interest: str,
+    fields: Optional[List[Any]] = None,
+    footer: str = "",
+) -> str:
+    """Reception's copy of an inbound request: day, time, what is being asked.
+
+    Every notice reception gets is built here so all of them lead with the
+    same three facts, in the order reception works in.  Before 14/ago/2026
+    these were four ad-hoc strings that quoted the raw message instead — which
+    is how a partner's "Tenha um ótimo dia!!" reached reception as a referral
+    with nothing in it to act on.
+    """
+    weekday = _WHATSAPP_WEEKDAY_PT[when.weekday()]
+    lines = [
+        f"{title}",
+        "",
+        f"Dia: {when.strftime('%d/%m')} ({weekday})",
+        f"Hora: {when.strftime('%H:%M')}",
+        f"Interesse: {interest}",
+    ]
+    for label, value in fields or []:
+        value = _whatsapp_clean_prompt_value(value, limit=160)
+        if value:
+            lines.append(f"{label}: {value}")
+    if footer:
+        lines.extend(["", footer])
+    return "\n".join(lines)
 
 
 def _whatsapp_contact_context(source: Any, message: Any) -> Dict[str, str]:
@@ -19807,35 +19917,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning("Feegow: token found=%s, len=%d", bool(_feegow_token), len(_feegow_token))
                 if _feegow_token:
                     logger.warning("Feegow: token loaded (%d chars), searching context", len(_feegow_token))
+                    # ── Extrair telefone do paciente (resolver LID→phone) ──
+                    # Resolvido ANTES do bloco Feegow: o aviso de "API
+                    # indisponível" abaixo existe justamente para quando o
+                    # import ou o construtor do cliente falha, e ali o número
+                    # é a única coisa que a recepção pode usar.  Enquanto isso
+                    # morava dentro do try, esse aviso morria de NameError —
+                    # em silêncio, no exato caso para o qual foi escrito.
+                    import re as _wa_re2, glob as _wa_glob2
+                    _wa_sender = str(getattr(source, "user_id", "") or "")
+                    _wa_sender_digits = _wa_re2.sub(r"[^0-9]", "", _wa_sender)
+                    # Resolver LID para número de telefone real
+                    _wa_phone_resolved = ""
+                    try:
+                        for _mf in _wa_glob2.glob(os.path.join(
+                            os.path.expanduser("~/.hermes/whatsapp/session"),
+                            "lid-mapping-[0-9]*.json"
+                        )):
+                            if "_reverse" not in _mf:
+                                with open(_mf, encoding="utf-8") as _mfh:
+                                    _mapped_lid = _mfh.read().strip().strip('"')
+                                if _mapped_lid and _mapped_lid in _wa_sender_digits:
+                                    _wa_phone_resolved = os.path.basename(_mf).replace("lid-mapping-", "").replace(".json", "")
+                                    break
+                    except Exception:
+                        pass
+                    # Fallback: usa source.chat_id ou o próprio _wa_sender_digits
+                    _tel_paciente = _wa_phone_resolved or _wa_sender_digits or str(source.chat_id)
+                    if _tel_paciente.startswith("55") and len(_tel_paciente) >= 12:
+                        _tel_formatado = f"{_tel_paciente[2:4]} {_tel_paciente[4:5]}{_tel_paciente[5:9]}-{_tel_paciente[9:]}"
+                    else:
+                        _tel_formatado = _tel_paciente
+
                     try:
                         from gateway.platforms.feegow_api import FeegowClient
                         _feegow = FeegowClient(token=_feegow_token)
-
-                        # ── Extrair telefone do paciente (resolver LID→phone) ──
-                        import re as _wa_re2, glob as _wa_glob2
-                        _wa_sender = str(getattr(source, "user_id", "") or "")
-                        _wa_sender_digits = _wa_re2.sub(r"[^0-9]", "", _wa_sender)
-                        # Resolver LID para número de telefone real
-                        _wa_phone_resolved = ""
-                        try:
-                            for _mf in _wa_glob2.glob(os.path.join(
-                                os.path.expanduser("~/.hermes/whatsapp/session"),
-                                "lid-mapping-[0-9]*.json"
-                            )):
-                                if "_reverse" not in _mf:
-                                    with open(_mf, encoding="utf-8") as _mfh:
-                                        _mapped_lid = _mfh.read().strip().strip('"')
-                                    if _mapped_lid and _mapped_lid in _wa_sender_digits:
-                                        _wa_phone_resolved = os.path.basename(_mf).replace("lid-mapping-", "").replace(".json", "")
-                                        break
-                        except Exception:
-                            pass
-                        # Fallback: usa source.chat_id ou o próprio _wa_sender_digits
-                        _tel_paciente = _wa_phone_resolved or _wa_sender_digits or str(source.chat_id)
-                        if _tel_paciente.startswith("55") and len(_tel_paciente) >= 12:
-                            _tel_formatado = f"{_tel_paciente[2:4]} {_tel_paciente[4:5]}{_tel_paciente[5:9]}-{_tel_paciente[9:]}"
-                        else:
-                            _tel_formatado = _tel_paciente
 
                         # A consulta Feegow só ocorre quando há intenção
                         # explícita de agendamento.  Menção a consulta,
@@ -19875,17 +19991,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         if _contact_context["declared_name"] != "não identificado"
                                         else _contact_context["display_name"]
                                     )
-                                    _cpf_for_partner = (
-                                        f"\nCPF informado: {_cpf_extracted}"
-                                        if _cpf_extracted else ""
-                                    )
-                                    _partner_msg = (
-                                        "🔔 *ENCAMINHAMENTO DE PARCEIRO* — WhatsApp\n\n"
-                                        f"Contato: *{_contact_label}*\n"
-                                        f"Organização: {_contact_context['display_name']}"
-                                        f"{_cpf_for_partner}\n\n"
-                                        f"Mensagem:\n\"{_recent_text[:300]}\"\n\n"
-                                        "Não classificar o remetente como paciente."
+                                    _partner_fields = [
+                                        ("Empresa parceira", _contact_context["display_name"]),
+                                    ]
+                                    # Only when the person named themselves —
+                                    # otherwise this repeats the company name
+                                    # back as if it were a person, which is how
+                                    # the 14/ago notice read.
+                                    if _contact_label != _contact_context["display_name"]:
+                                        _partner_fields.append(("Falou com", _contact_label))
+                                    if _cpf_extracted:
+                                        _partner_fields.append(("CPF informado", _cpf_extracted))
+                                    _partner_msg = _whatsapp_reception_notice(
+                                        "🔔 *PEDIDO DE PARCEIRO* — WhatsApp",
+                                        _brt,
+                                        _whatsapp_scheduling_interest(_recent_text),
+                                        _partner_fields,
+                                        footer=(
+                                            "O remetente é a empresa parceira, não o paciente. "
+                                            "Não cadastrar como paciente.\n"
+                                            f"👉 https://wa.me/{_tel_paciente}"
+                                        ),
                                     )
                                     safe_schedule_threadsafe(
                                         _wp_adapter.send("557196691002@s.whatsapp.net", _partner_msg),
@@ -19917,17 +20043,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 try:
                                     _wp_adapter = self.adapters.get(source.platform)
                                     if _wp_adapter and hasattr(_wp_adapter, "send"):
-                                        _assunto = _recent_text[:200] if _recent_text else "Solicitou atendimento"
-                                        # Se a mensagem for só CPF, usar descrição contextual
-                                        if _cpf_extracted and _recent_text.replace(".","").replace("-","").strip() == _cpf_extracted:
-                                            _assunto = "Solicitou agendamento de consulta" if _has_scheduling else "Solicitou informação/atendimento"
+                                        _notif_msg = _whatsapp_reception_notice(
+                                            "🔔 *PEDIDO DE AGENDAMENTO* — WhatsApp",
+                                            _brt,
+                                            _whatsapp_scheduling_interest(_recent_text),
+                                            [
+                                                ("Paciente", _p_nome),
+                                                ("CPF", _cpf_extracted),
+                                                ("ID Feegow", _p_id),
+                                                ("Tel", _tel_formatado),
+                                            ],
+                                            footer=f"👉 https://wa.me/{_tel_paciente}",
+                                        )
                                         safe_schedule_threadsafe(
-                                            _wp_adapter.send("557196691002@s.whatsapp.net",
-                                                f"🔔 *NOVO AGENDAMENTO* — WhatsApp\n\n"
-                                                f"Paciente: *{_p_nome}*\nCPF: {_cpf_extracted}\nID Feegow: {_p_id}\n"
-                                                f"Tel: {_tel_formatado}\n\n"
-                                                f"Assunto: {_assunto}\n\n"
-                                                f"👉 https://wa.me/{_tel_paciente}"),
+                                            _wp_adapter.send("557196691002@s.whatsapp.net", _notif_msg),
                                             _loop_for_step, logger=logger,
                                             log_message="Feegow notification error")
                                 except Exception:
@@ -19942,16 +20071,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 try:
                                     _wp_adapter = self.adapters.get(source.platform)
                                     if _wp_adapter and hasattr(_wp_adapter, "send"):
-                                        _assunto = _recent_text[:200] if _recent_text else "Solicitou atendimento"
-                                        if _cpf_extracted and _recent_text.replace(".","").replace("-","").strip() == _cpf_extracted:
-                                            _assunto = "Solicitou agendamento de consulta" if _has_scheduling else "Solicitou informação/atendimento"
+                                        _notif_msg = _whatsapp_reception_notice(
+                                            "🆕 *PACIENTE NOVO — PEDIDO DE AGENDAMENTO*",
+                                            _brt,
+                                            _whatsapp_scheduling_interest(_recent_text),
+                                            [
+                                                ("CPF", _cpf_extracted),
+                                                ("Tel", _tel_formatado),
+                                            ],
+                                            footer=(
+                                                "Não cadastrado no Feegow. Cadastrar e atender.\n"
+                                                f"👉 https://wa.me/{_tel_paciente}"
+                                            ),
+                                        )
                                         safe_schedule_threadsafe(
-                                            _wp_adapter.send("557196691002@s.whatsapp.net",
-                                                f"🆕 *NOVO PACIENTE* — WhatsApp\n\n"
-                                                f"CPF: {_cpf_extracted}\nTel: {_tel_formatado}\n\n"
-                                                f"Assunto: {_assunto}\n\n"
-                                                f"👉 https://wa.me/{_tel_paciente}\n\n"
-                                                f"Não cadastrado no Feegow. Cadastrar e atender."),
+                                            _wp_adapter.send("557196691002@s.whatsapp.net", _notif_msg),
                                             _loop_for_step, logger=logger,
                                             log_message="Feegow new patient notification error")
                                 except Exception:
@@ -19979,16 +20113,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             try:
                                 _wp_adapter = self.adapters.get(source.platform)
                                 if _wp_adapter and hasattr(_wp_adapter, "send"):
-                                    _msg_paciente = _recent_text[:300] if _recent_text else "(mensagem não disponível)"
-                                    _notif_msg = (
-                                        f"⚠️ *SOLICITAÇÃO DE AGENDAMENTO* — API indisponível\n\n"
-                                        f"Tel: {_tel_formatado}\n\n"
-                                        f"Mensagem do paciente:\n"
-                                        f"\"{_msg_paciente}\"\n\n"
-                                        f"👉 *Responder direto para o paciente*:\n"
-                                        f"https://wa.me/{_tel_paciente}\n\n"
-                                        f"A API Feegow está momentaneamente indisponível. "
-                                        f"Entre em contato com o paciente para agendar."
+                                    _notif_msg = _whatsapp_reception_notice(
+                                        "⚠️ *PEDIDO DE AGENDAMENTO* — Feegow fora do ar",
+                                        _brt,
+                                        _whatsapp_scheduling_interest(_recent_text),
+                                        [("Tel", _tel_formatado)],
+                                        footer=(
+                                            "A agenda do Feegow não pôde ser consultada. "
+                                            "Agendar pelo sistema e responder ao paciente.\n"
+                                            f"👉 https://wa.me/{_tel_paciente}"
+                                        ),
                                     )
                                     safe_schedule_threadsafe(
                                         _wp_adapter.send("557196691002@s.whatsapp.net", _notif_msg),

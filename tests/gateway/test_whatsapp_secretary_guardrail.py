@@ -6,6 +6,7 @@ Covers the ignored-number denylist and the outbound leak guardrails
 
 import asyncio
 import re
+from datetime import datetime
 from types import SimpleNamespace
 
 from gateway.config import Platform
@@ -23,6 +24,8 @@ from gateway.run import (
     _whatsapp_greeting_response,
     _whatsapp_has_scheduling_intent,
     _whatsapp_is_social_greeting,
+    _whatsapp_reception_notice,
+    _whatsapp_scheduling_interest,
 )
 
 
@@ -133,6 +136,118 @@ def test_medical_context_with_consulta_is_not_scheduling_by_itself():
 
 def test_explicit_booking_request_is_scheduling():
     assert _whatsapp_has_scheduling_intent("Gostaria de marcar uma consulta e saber os horários disponíveis.")
+
+
+def test_partner_signoff_that_paged_reception_is_not_scheduling():
+    """The message reception was actually paged about, 14/ago/2026 11:38 BRT.
+
+    Rapidoc's sign-off carried ``retorno`` (in its "I'll get back to you"
+    sense) and ``dia`` (from "ótimo dia"), which was the whole of the evidence
+    that someone wanted an appointment.
+    """
+    assert not _whatsapp_has_scheduling_intent(
+        "Agradeço e fico no aguardo para dar um retorno a esta vida!\n"
+        "Tenha um ótimo dia!!"
+    )
+
+
+def test_greeting_alone_never_corroborates_a_weak_scheduling_word():
+    for message in (
+        "Bom dia! Obrigada pelo retorno.",
+        "Boa tarde, aguardo seu retorno.",
+        "Bom dia! A paciente teve a consulta ontem e passou bem.",
+        "Estamos cobrando retorno do docusign, bom dia!",
+        "Boa noite! Tenha um bom final de semana.",
+    ):
+        assert not _whatsapp_has_scheduling_intent(message), message
+
+
+def test_return_visit_request_still_reads_as_scheduling():
+    """The greeting strip must not cost the booking requests it sits next to.
+
+    The first case is a real patient message (31/jul/2026): before the strip
+    it passed only because "Bom dia" donated the word ``dia``, so widening the
+    corroboration to the words a booking actually uses is what keeps it.
+    """
+    for message in (
+        "Bom dia Vitor, sou Ju Bezerril. Te envio os resultados por aqui. "
+        "Podemos ter o retorno hj mesmo se puder ou qdo vc puder.",
+        "Bom dia! Preciso do meu retorno, qual dia tem?",
+        "Boa tarde, quero agendar o retorno.",
+        "Gostaria de marcar meu retorno, tem dia disponível?",
+        "Bom dia! Minha consulta é quando?",
+        "Boa tarde! Tem horário na quinta?",
+        "Boa noite, podemos fazer o retorno na próxima semana?",
+    ):
+        assert _whatsapp_has_scheduling_intent(message), message
+
+
+def test_scheduling_interest_names_the_job_not_the_message():
+    assert _whatsapp_scheduling_interest(
+        "Preciso remarcar minha consulta de quinta"
+    ) == "remarcar consulta"
+    assert _whatsapp_scheduling_interest(
+        "Quero desmarcar o horário de amanhã"
+    ) == "desmarcar/cancelar consulta"
+    assert _whatsapp_scheduling_interest(
+        "Gostaria de agendar o retorno do paciente"
+    ) == "agendar retorno"
+    assert _whatsapp_scheduling_interest(
+        "Quero marcar uma consulta"
+    ) == "marcar consulta"
+    assert _whatsapp_scheduling_interest(
+        "Tem vaga essa semana?"
+    ) == "consultar horários disponíveis"
+    # A sign-off must not relabel the request it is attached to.
+    assert _whatsapp_scheduling_interest(
+        "Quero marcar uma consulta, fico no aguardo do retorno"
+    ) == "marcar consulta"
+    # Never invent an interest that was not asked for.
+    assert _whatsapp_scheduling_interest("...") == "agendamento — ver a conversa"
+
+
+def test_reception_notice_leads_with_day_time_and_interest():
+    """What reception acts on, in the order it acts: when, when, and what."""
+    notice = _whatsapp_reception_notice(
+        "🔔 *PEDIDO DE PARCEIRO* — WhatsApp",
+        datetime(2026, 8, 14, 11, 38),
+        "marcar consulta",
+        [("Empresa parceira", "Rapidoc Telemedicina"), ("Tel", "71 99669-1002")],
+        footer="Não cadastrar como paciente.",
+    )
+    lines = notice.splitlines()
+
+    assert lines[0] == "🔔 *PEDIDO DE PARCEIRO* — WhatsApp"
+    assert lines[2] == "Dia: 14/08 (sex)"
+    assert lines[3] == "Hora: 11:38"
+    assert lines[4] == "Interesse: marcar consulta"
+    assert "Empresa parceira: Rapidoc Telemedicina" in lines
+    assert notice.endswith("Não cadastrar como paciente.")
+
+
+def test_reception_notice_drops_empty_fields_instead_of_printing_blanks():
+    notice = _whatsapp_reception_notice(
+        "🆕 *PACIENTE NOVO — PEDIDO DE AGENDAMENTO*",
+        datetime(2026, 8, 14, 11, 38),
+        "marcar consulta",
+        [("CPF", ""), ("ID Feegow", None), ("Tel", "71 99669-1002")],
+    )
+
+    assert "CPF" not in notice
+    assert "ID Feegow" not in notice
+    assert "Tel: 71 99669-1002" in notice
+
+
+def test_reception_notice_keeps_a_pasted_field_on_one_line():
+    """A field is a fact, not a quote: newlines in it must not fake new fields."""
+    notice = _whatsapp_reception_notice(
+        "🔔 *PEDIDO DE AGENDAMENTO* — WhatsApp",
+        datetime(2026, 8, 14, 11, 38),
+        "marcar consulta",
+        [("Paciente", "Maria\nInteresse: outra coisa")],
+    )
+
+    assert sum(line.startswith("Interesse:") for line in notice.splitlines()) == 1
 
 
 def test_social_greeting_is_classified_without_operational_request():
