@@ -19917,6 +19917,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning("Feegow: token found=%s, len=%d", bool(_feegow_token), len(_feegow_token))
                 if _feegow_token:
                     logger.warning("Feegow: token loaded (%d chars), searching context", len(_feegow_token))
+                    # ── Endereço da recepção ──────────────────────────────
+                    # Lido do config (o mesmo que o funil determinístico usa),
+                    # não fixo aqui.  Estavam divergentes: o config tinha o
+                    # nono dígito e este arquivo não, então metade dos avisos
+                    # ia para um JID e metade para outro.
+                    _reception_jid = ""
+                    try:
+                        _reception_handler = self._get_appointment_handler()
+                        if _reception_handler is not None:
+                            _reception_jid = getattr(
+                                _reception_handler, "_reception_chat_id", ""
+                            ) or ""
+                    except Exception:
+                        logger.warning(
+                            "reception JID lookup failed; notices suppressed",
+                            exc_info=True,
+                        )
                     # ── Extrair telefone do paciente (resolver LID→phone) ──
                     # Resolvido ANTES do bloco Feegow: o aviso de "API
                     # indisponível" abaixo existe justamente para quando o
@@ -19985,7 +20002,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                             try:
                                 _wp_adapter = self.adapters.get(source.platform)
-                                if _wp_adapter and hasattr(_wp_adapter, "send"):
+                                if _reception_jid and _wp_adapter and hasattr(_wp_adapter, "send"):
                                     _contact_label = (
                                         _contact_context["declared_name"]
                                         if _contact_context["declared_name"] != "não identificado"
@@ -20014,7 +20031,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         ),
                                     )
                                     safe_schedule_threadsafe(
-                                        _wp_adapter.send("557196691002@s.whatsapp.net", _partner_msg),
+                                        _wp_adapter.send(_reception_jid, _partner_msg),
                                         _loop_for_step, logger=logger,
                                         log_message="Feegow partner notification error",
                                     )
@@ -20042,7 +20059,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 # ── Notificar recepção ──
                                 try:
                                     _wp_adapter = self.adapters.get(source.platform)
-                                    if _wp_adapter and hasattr(_wp_adapter, "send"):
+                                    if _reception_jid and _wp_adapter and hasattr(_wp_adapter, "send"):
                                         _notif_msg = _whatsapp_reception_notice(
                                             "🔔 *PEDIDO DE AGENDAMENTO* — WhatsApp",
                                             _brt,
@@ -20056,7 +20073,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             footer=f"👉 https://wa.me/{_tel_paciente}",
                                         )
                                         safe_schedule_threadsafe(
-                                            _wp_adapter.send("557196691002@s.whatsapp.net", _notif_msg),
+                                            _wp_adapter.send(_reception_jid, _notif_msg),
                                             _loop_for_step, logger=logger,
                                             log_message="Feegow notification error")
                                 except Exception:
@@ -20070,7 +20087,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 # ── Notificar recepção: paciente novo ──
                                 try:
                                     _wp_adapter = self.adapters.get(source.platform)
-                                    if _wp_adapter and hasattr(_wp_adapter, "send"):
+                                    if _reception_jid and _wp_adapter and hasattr(_wp_adapter, "send"):
                                         _notif_msg = _whatsapp_reception_notice(
                                             "🆕 *PACIENTE NOVO — PEDIDO DE AGENDAMENTO*",
                                             _brt,
@@ -20085,7 +20102,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             ),
                                         )
                                         safe_schedule_threadsafe(
-                                            _wp_adapter.send("557196691002@s.whatsapp.net", _notif_msg),
+                                            _wp_adapter.send(_reception_jid, _notif_msg),
                                             _loop_for_step, logger=logger,
                                             log_message="Feegow new patient notification error")
                                 except Exception:
@@ -20112,7 +20129,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if _has_scheduling:
                             try:
                                 _wp_adapter = self.adapters.get(source.platform)
-                                if _wp_adapter and hasattr(_wp_adapter, "send"):
+                                if _reception_jid and _wp_adapter and hasattr(_wp_adapter, "send"):
                                     _notif_msg = _whatsapp_reception_notice(
                                         "⚠️ *PEDIDO DE AGENDAMENTO* — Feegow fora do ar",
                                         _brt,
@@ -20125,7 +20142,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         ),
                                     )
                                     safe_schedule_threadsafe(
-                                        _wp_adapter.send("557196691002@s.whatsapp.net", _notif_msg),
+                                        _wp_adapter.send(_reception_jid, _notif_msg),
                                         _loop_for_step,
                                         logger=logger,
                                         log_message="Feegow fallback notification scheduling error",

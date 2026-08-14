@@ -31,7 +31,12 @@ from tests.gateway.appointment_helpers import (
 
 BRT = ZoneInfo("America/Bahia")
 NOW = datetime(2026, 8, 1, 10, 0, tzinfo=BRT)
+# As written in config.yaml — a Bahia number spelled with the ninth
+# digit, the way a human writes it on a card.
 RECEPTION = "5571996691002@s.whatsapp.net"
+# The shape WhatsApp actually delivers to for DDD 71. Sends to the
+# spelling above are accepted and reach nobody.
+RECEPTION_DELIVERED = "557196691002@s.whatsapp.net"
 
 
 def _handler(tmp_path, *, reception_chat_id="", service="1"):
@@ -74,7 +79,7 @@ class TestInPersonBookingNotifiesReception:
         rows = _outbox(db_path)
         assert len(rows) == 1
         chat_key, body = rows[0]
-        assert chat_key == RECEPTION
+        assert chat_key == RECEPTION_DELIVERED
         assert "agendamento" in body.lower()
         assert "confirmar" in body.lower()
 

@@ -2623,6 +2623,26 @@ def _normalized_phone(value: Any) -> str:
     return phone
 
 
+def _reception_send_target(value: Any) -> str:
+    """The reception JID to send to, in the shape WhatsApp will deliver to.
+
+    Shared by this class and ``gateway.run`` so the deterministic funnel and
+    the model pipeline can never page two different addresses — before this,
+    ``run.py`` hardcoded the working form while the config carried another.
+    """
+
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        from gateway.whatsapp_identity import to_whatsapp_phone_jid
+
+        return to_whatsapp_phone_jid(raw)
+    except Exception:
+        logger.warning("reception JID normalization failed; using it as written")
+        return raw
+
+
 def _chat_phone(chat_key: str) -> str:
     """Return the patient's real phone digits for a WhatsApp chat key.
 
@@ -2821,7 +2841,19 @@ class WhatsAppAppointmentsHandler:
         self._return_window_days = max(
             1, int(settings.get("return_window_days", 60))
         )
-        self._reception_chat_id = str(settings.get("reception_chat_id") or "").strip()
+        # Normalized to the ninth-digit shape its DDD actually uses.  The
+        # configured value is a Bahia number written the way a human writes it
+        # — ``5571996691002``, with the 9 — and WhatsApp addresses DDD 71
+        # without it.  A send to the nine-digit form does not bounce; it is
+        # accepted, marked SENT, and delivered to nobody.  Every notice this
+        # class queues went there.
+        self._reception_chat_id_configured = str(
+            settings.get("reception_chat_id") or ""
+        ).strip()
+        self._reception_chat_id = _reception_send_target(
+            self._reception_chat_id_configured
+        )
+        self._reception_identities_cache = None
         self._flow_ttl_seconds = max(
             60, int(settings.get("flow_ttl_hours", 24)) * 3600
         )
@@ -3072,11 +3104,41 @@ class WhatsAppAppointmentsHandler:
         return f"{message} {_closing_wish(self._now())}"
 
     def _is_reception_chat(self, chat_key: str) -> bool:
-        """Whether this chat is the reception's own notification channel."""
+        """Whether this chat is the reception's own notification channel.
+
+        Sending has exactly one right answer — the shape WhatsApp delivers to
+        — but recognising has several: reception's own messages can arrive
+        under the configured spelling, under the normalized one, or, as every
+        chat in production does, under a LID. Matching only the send target
+        would hand reception the booking menu, which the rule this guards
+        exists to prevent.
+        """
 
         if not self._reception_chat_id:
             return False
-        return _digits(chat_key) == _digits(self._reception_chat_id)
+        return _digits(chat_key) in self._reception_identities()
+
+    def _reception_identities(self) -> frozenset:
+        """Every digit-form that means "this is reception"."""
+
+        cached = getattr(self, "_reception_identities_cache", None)
+        if cached is not None:
+            return cached
+        forms = {
+            _digits(self._reception_chat_id),
+            _digits(self._reception_chat_id_configured),
+            _digits(_chat_phone(self._reception_chat_id)),
+        }
+        try:
+            from gateway.whatsapp_identity import expand_whatsapp_aliases
+
+            for alias in expand_whatsapp_aliases(self._reception_chat_id):
+                forms.add(_digits(alias))
+        except Exception:
+            logger.warning("reception alias expansion failed", exc_info=True)
+        identities = frozenset(form for form in forms if form)
+        self._reception_identities_cache = identities
+        return identities
 
     def _menu_is_fresh(self, flow: FlowSnapshot) -> bool:
         """Whether the menu was sent recently enough to still be on screen."""

@@ -31,7 +31,12 @@ from tests.gateway.appointment_helpers import (
 
 BRT = ZoneInfo("America/Bahia")
 NOW = datetime(2026, 8, 1, 10, 0, tzinfo=BRT)
+# As written in config.yaml — a Bahia number spelled with the ninth
+# digit, the way a human writes it on a card.
 RECEPTION = "5571996691002@s.whatsapp.net"
+# The shape WhatsApp actually delivers to for DDD 71. Sends to the
+# spelling above are accepted and reach nobody.
+RECEPTION_DELIVERED = "557196691002@s.whatsapp.net"
 
 
 def _handler(tmp_path, *, reception_chat_id=RECEPTION, slots=()):
@@ -80,7 +85,7 @@ class TestHandoffNotifiesReception:
         rows = _outbox(db_path)
         assert len(rows) == 1
         chat_key, body = rows[0]
-        assert chat_key == RECEPTION
+        assert chat_key == RECEPTION_DELIVERED
         assert "agendamento automático" in body.lower()
         # The point of the notice: a human is asked to pick up the phone.
         assert "ligar para o paciente" in body.lower()
@@ -193,3 +198,30 @@ class TestHandoffNotifiesReception:
 
         assert "recepção" not in response.lower()
         assert _outbox(db_path) == []
+
+
+class TestReceptionAddress:
+    """The address notices are sent to, and the addresses reception writes from.
+
+    Until 14/ago/2026 ``gateway.run`` hardcoded the delivering form while
+    ``config.yaml`` carried the human spelling, so the model pipeline paged an
+    address that worked and this class paged one that did not.
+    """
+
+    def test_notices_go_to_the_shape_whatsapp_delivers_to(self, tmp_path):
+        handler, _, _ = _handler(tmp_path, reception_chat_id=RECEPTION)
+
+        assert handler._reception_chat_id == RECEPTION_DELIVERED
+
+    def test_reception_is_recognised_under_either_spelling(self, tmp_path):
+        handler, _, _ = _handler(tmp_path, reception_chat_id=RECEPTION)
+
+        assert handler._is_reception_chat(RECEPTION)
+        assert handler._is_reception_chat(RECEPTION_DELIVERED)
+        assert not handler._is_reception_chat("5571988326547@s.whatsapp.net")
+
+    def test_an_unset_address_stays_unset(self, tmp_path):
+        handler, _, _ = _handler(tmp_path, reception_chat_id="")
+
+        assert handler._reception_chat_id == ""
+        assert not handler._is_reception_chat(RECEPTION)

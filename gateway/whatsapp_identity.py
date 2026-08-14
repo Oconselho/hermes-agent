@@ -74,6 +74,52 @@ def normalize_whatsapp_identifier(value: str) -> str:
 _BARE_PHONE_RE = re.compile(r"^\+?[\d\s().\-]+$")
 
 
+# Brazil added a ninth digit to mobile numbers, but WhatsApp only stores it
+# for the DDDs where it was actually rolled out to the installed base — the
+# São Paulo/Rio/Espírito Santo band, DDD 11–28.  From DDD 31 south and north
+# (Minas, Bahia, the whole Northeast, Centro-Oeste, Sul, Norte) WhatsApp
+# addresses the same person WITHOUT the 9, and a send to the nine-digit form
+# addresses nobody: it does not bounce, it just never arrives.
+#
+# The boundary is not a guess.  Counted over the 6,000+ ``lid-mapping-*.json``
+# files this account has accumulated: every DDD from 11 to 28 stores the
+# nine-digit form (DDD 11: 1187 of 1220), and every DDD from 31 to 99 stores
+# the eight-digit one (DDD 71: 1402 of 1404).  The handful of exceptions on
+# each side are landlines, which are eight digits nationwide.
+_BR_NINTH_DIGIT_MAX_DDD = 28
+
+
+def brazilian_whatsapp_number(digits: str) -> str:
+    """Put a Brazilian number in the shape WhatsApp addresses it by.
+
+    Takes and returns bare digits including the ``55`` country code.  Numbers
+    that are not Brazilian mobiles — other countries, landlines, anything of
+    an unexpected length — are returned untouched: this only ever adds or
+    removes the ninth digit, and only when it is certain which one applies.
+    """
+    number = re.sub(r"\D+", "", str(digits or ""))
+    if not number.startswith("55") or len(number) not in (12, 13):
+        return number
+    ddd = number[2:4]
+    if not ddd.isdigit() or not 11 <= int(ddd) <= 99:
+        return number
+    local = number[4:]
+    keeps_ninth = int(ddd) <= _BR_NINTH_DIGIT_MAX_DDD
+    # Only touch what is unambiguously a mobile.  A local part starting 2-5 is
+    # a landline in every DDD and never carried the ninth digit; ``9`` followed
+    # by ``2``/``3``/``0`` is a VoIP or non-geographic range that is genuinely
+    # nine digits long — this account holds 26 of them, and stripping their
+    # leading 9 would invent a number nobody answers.  A real ninth digit is a
+    # ``9`` in front of an old eight-digit mobile, which always began 6-9.
+    if len(local) == 9:
+        if not keeps_ninth and local[0] == "9" and local[1] in "6789":
+            return f"55{ddd}{local[1:]}"
+        return number
+    if len(local) == 8 and keeps_ninth and local[0] in "6789":
+        return f"55{ddd}9{local}"
+    return number
+
+
 def to_whatsapp_jid(value: str) -> str:
     """Normalize an *outbound* WhatsApp target to a bridge-safe JID.
 
@@ -116,6 +162,21 @@ def to_whatsapp_jid(value: str) -> str:
             return f"{digits}@s.whatsapp.net"
 
     return normalized
+
+
+def to_whatsapp_phone_jid(value: str) -> str:
+    """Build a phone JID for sending, in the ninth-digit shape its DDD uses.
+
+    Use this for any *configured* outbound phone number.  A human writing a
+    Bahia number into a config file writes it the way it is printed on a card
+    — ``+55 71 99669-1002`` — and sending to that literal reaches nobody,
+    silently.  LIDs, groups and non-Brazilian numbers pass through unchanged.
+    """
+    jid = to_whatsapp_jid(value)
+    if not jid.endswith("@s.whatsapp.net"):
+        return jid
+    local, _, domain = jid.partition("@")
+    return f"{brazilian_whatsapp_number(local)}@{domain}"
 
 
 def expand_whatsapp_aliases(identifier: str) -> Set[str]:
