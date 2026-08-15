@@ -33,7 +33,8 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Set
+import unicodedata
+from typing import Any, Set
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +117,59 @@ def brazilian_whatsapp_number(digits: str) -> str:
             return f"55{ddd}{local[1:]}"
         return number
     if len(local) == 8 and keeps_ninth and local[0] in "6789":
+        return f"55{ddd}9{local}"
+    return number
+
+
+# A company writing in is not a patient, and reception's WhatsApp is for
+# patients. Kept here rather than in ``gateway.run`` because two independent
+# paths page reception — the model pipeline and the appointment funnel's
+# clinical escalation — and on 14/ago/2026 22:06 BRT a partner reached
+# reception through the second one while the first was being fixed.
+_ORGANIZATION_HINTS = (
+    "rapidoc", "telemedicina", "plataforma", "clinica", "hospital",
+    "laboratorio", "labchecap", "farmacia", "convenio", "financeiro",
+    "contabilidade", "empresa", "instituto", "operadora", "beneficios",
+)
+
+
+def contact_is_organization(source: Any) -> bool:
+    """Whether the WhatsApp display identity strongly resembles an organization.
+
+    Reads only the names WhatsApp itself shows for the chat, never the message
+    body: a patient may well mention a clinic or a lab, and saying the word
+    must not turn them into one.
+    """
+    labels = " ".join(
+        str(getattr(source, attr, "") or "")
+        for attr in ("chat_name", "user_name")
+    ).lower()
+    normalized = unicodedata.normalize("NFKD", labels)
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    return any(term in normalized for term in _ORGANIZATION_HINTS)
+
+
+def brazilian_dialable_number(digits: str) -> str:
+    """The same person's number in the shape a *human* dials it.
+
+    The inverse concern of :func:`brazilian_whatsapp_number`.  WhatsApp
+    addresses a Bahian mobile as ``557196691002``, but nobody in Brazil writes
+    or dials it that way — the national numbering plan gave every mobile a
+    ninth digit in 2016, so a receptionist reading "(71) 9669-1002" off a
+    notice sees a number that looks truncated and cannot be dialled.
+
+    Use this for display; use :func:`brazilian_whatsapp_number` for anything
+    the bridge sends to or any ``wa.me`` link.
+    """
+    number = re.sub(r"\D+", "", str(digits or ""))
+    if not number.startswith("55") or len(number) != 12:
+        return number
+    ddd, local = number[2:4], number[4:]
+    if not ddd.isdigit() or not 11 <= int(ddd) <= 99:
+        return number
+    # Same conservative test as above: only an old eight-digit mobile, never a
+    # landline, gains the ninth digit back.
+    if local[0] in "6789":
         return f"55{ddd}9{local}"
     return number
 

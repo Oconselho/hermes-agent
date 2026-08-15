@@ -1750,6 +1750,7 @@ class AppointmentStore:
         reception_chat_id: str,
         *,
         now: datetime,
+        details: Mapping[str, str] | None = None,
     ) -> dict[str, str] | None:
         """Tell reception a booking was made and still needs confirming.
 
@@ -1757,19 +1758,26 @@ class AppointmentStore:
         in-person ones, where the patient pays on site. Reception would
         otherwise only learn of the booking by watching Feegow.
 
-        Same privacy contract as :meth:`enqueue_reception_receipt`: the body
-        carries the Feegow appointment id and nothing else. No name, CPF,
-        phone, or email — reception looks the id up in Feegow, which already
-        holds that data under its own access control.
+        Carried only the appointment id until 15/ago/2026, on the reasoning
+        that reception could look the rest up in Feegow. Victor asked for the
+        patient named in the notice itself: reception works from WhatsApp on a
+        phone, and "confirmar na Feegow" meant opening a second system to find
+        out who the message was even about. ``details`` carries the same
+        identification the hand-off notice does, and the id still leads.
         """
 
         identifier = str(appointment_id)
         idempotency_key = _opaque_id("reception-booking", identifier)
         outbox_id = _opaque_id("outbox", idempotency_key)
-        body = (
-            f"Novo agendamento {identifier} feito pelo WhatsApp. "
-            "Pagamento presencial. Confirmar na Feegow."
-        )
+        lines = [
+            f"Novo agendamento {identifier} feito pelo WhatsApp.",
+            "",
+        ]
+        lines.extend(f"{label}: {value}" for label, value in (details or {}).items())
+        if len(lines) > 2:
+            lines.append("")
+        lines.append("Pagamento presencial. Confirmar na Feegow.")
+        body = "\n".join(lines)
         with self._connect() as connection:
             connection.execute(
                 """
@@ -2676,13 +2684,110 @@ def _chat_phone(chat_key: str) -> str:
 
 
 def _format_phone(digits: str) -> str:
-    """``7188326547`` → ``71 8832-6547``, so reception can dial it as written."""
+    """``7188326547`` → ``71 98832-6547``, so reception can dial it as written.
 
+    The stored form is WhatsApp's, which for DDD 31+ has no ninth digit; the
+    dialable form always does. Reception reads this off a phone screen, so it
+    gets the number as Brazil writes it, not as Baileys addresses it.
+    """
+
+    try:
+        from gateway.whatsapp_identity import brazilian_dialable_number
+
+        national = brazilian_dialable_number(f"55{digits}")
+        if national.startswith("55") and len(national) in (12, 13):
+            digits = national[2:]
+    except Exception:
+        logger.warning("dialable phone normalization failed", exc_info=True)
     if len(digits) == 11:
         return f"{digits[:2]} {digits[2:7]}-{digits[7:]}"
     if len(digits) == 10:
         return f"{digits[:2]} {digits[2:6]}-{digits[6:]}"
     return digits
+
+
+def _contact_is_organization(source: Any) -> bool:
+    """Whether this chat is a company rather than a patient.
+
+    Fails open — an unreadable identity is treated as a patient — because the
+    cost of a wrong "yes" is reception never hearing about a real patient,
+    while a wrong "no" is one notice too many about a company.
+    """
+
+    try:
+        from gateway.whatsapp_identity import contact_is_organization
+
+        return contact_is_organization(source)
+    except Exception:
+        logger.warning("organization check failed; treating as patient", exc_info=True)
+        return False
+
+
+def _identification_details(data: Mapping[str, Any]) -> dict[str, str]:
+    """Who the patient is, in the order reception reads it.
+
+    The five facts Victor asked reception to receive on 15/ago/2026 — the
+    slot they want, then name, birth date, CPF and Feegow id. Fields the
+    patient has not given yet are left out rather than printed empty: this
+    notice is built from a flow that may have stopped at any step, and a
+    column of "não informado" would bury the answers that do exist.
+    """
+
+    details: dict[str, str] = {}
+    slot = data.get("selected_slot")
+    if isinstance(slot, Mapping):
+        chosen = " às ".join(
+            part
+            for part in (
+                str(slot.get("display_date") or "").strip(),
+                str(slot.get("time") or "").strip(),
+            )
+            if part
+        )
+        if chosen:
+            details["Agendamento desejado"] = chosen
+    name = str(data.get("name") or data.get("contact_name") or "").strip()
+    if name:
+        details["Nome"] = name
+    birth = str(data.get("birth_date") or "").strip()
+    if birth:
+        details["Nascimento"] = birth
+    cpf = _digits(data.get("cpf"))
+    if len(cpf) == 11:
+        details["CPF"] = f"{cpf[:3]}.{cpf[3:6]}.{cpf[6:9]}-{cpf[9:]}"
+    patient_id = str(data.get("patient_id") or "").strip()
+    if patient_id:
+        details["Matrícula Feegow"] = patient_id
+    return details
+
+
+def _reception_contact_lines(local_digits: str, formatted: str) -> dict[str, str]:
+    """The phone, and a link that opens the patient's chat with one tap.
+
+    Victor, 15/ago/2026: reception should not have to retype a number to
+    answer a lead. The link carries the form WhatsApp actually addresses —
+    the ninth digit stripped where it has to be — while the printed number
+    stays in the form a human dials.
+    """
+
+    lines: dict[str, str] = {}
+    if formatted:
+        lines["Telefone"] = formatted
+    digits = _digits(local_digits)
+    # 10/11 digits is a Brazilian phone; anything longer is an unresolved LID,
+    # and prefixing 55 to an opaque identity invents a link to nobody.
+    if len(digits) not in (10, 11):
+        return lines
+    try:
+        from gateway.whatsapp_identity import brazilian_whatsapp_number
+
+        target = brazilian_whatsapp_number(f"55{digits}")
+    except Exception:
+        logger.warning("wa.me link normalization failed", exc_info=True)
+        return lines
+    if target:
+        lines["Abrir conversa"] = f"https://wa.me/{target}"
+    return lines
 
 
 def _format_moment(value: Any) -> str:
@@ -2995,12 +3100,26 @@ class WhatsAppAppointmentsHandler:
             chat_key = str(getattr(source, "chat_id", "") or "")
             if not chat_key or self._is_reception_chat(chat_key):
                 return
+            # Reception's WhatsApp is for patients (Victor, 15/ago/2026). The
+            # clinical refusal is sent to anyone who raises a clinical subject,
+            # partner companies included — on 14/ago at 22:06 BRT that is how a
+            # telemedicine partner asking after one of its own members became a
+            # page to reception, one second after the refusal went out. The
+            # partner still gets the refusal; reception is simply not paged.
+            if _contact_is_organization(source):
+                logger.info(
+                    "clinical escalation not queued: sender is an organization, "
+                    "not a patient"
+                )
+                return
             details: dict[str, str] = {}
-            phone = _format_phone(_chat_phone(chat_key))
+            local_digits = _chat_phone(chat_key)
+            phone = _format_phone(local_digits)
             name = _contact_first_name(source)
             if phone:
                 details["Contato"] = f"{name} — {phone}" if name else phone
             details["Recebido"] = self._now().strftime("%d/%m %H:%M")
+            details.update(_reception_contact_lines(local_digits, ""))
             AppointmentStore(self._db_path).enqueue_reception_clinical(
                 chat_key,
                 self._reception_chat_id,
@@ -3091,6 +3210,59 @@ class WhatsAppAppointmentsHandler:
         except Exception:
             logger.warning("greeting lookup failed", exc_info=True)
             return False
+
+    def patient_dossier(self, source: Any) -> dict[str, str]:
+        """What this chat has already told us about the patient.
+
+        A booking request is spread over several messages — the name in one,
+        the CPF in the next, the day they want in a third — but the reception
+        notice built in ``gateway.run`` only ever sees the message in hand.
+        Read on its own that notice says "não informado" four times about a
+        patient who has already answered every question.
+
+        The funnel's flow state is where those answers accumulate, so this
+        hands them over: name, birth date, CPF, Feegow id and the slot picked.
+        Read-only and best-effort — an empty dict simply means the notice
+        falls back to what the current message says.
+        """
+
+        if not self._enabled or not self._db_path.exists():
+            return {}
+        chat_key = str(getattr(source, "chat_id", "") or "")
+        if not chat_key:
+            return {}
+        try:
+            flow = AppointmentStore(self._db_path).load_flow(chat_key)
+        except Exception:
+            logger.warning("patient dossier lookup failed", exc_info=True)
+            return {}
+        if flow is None or not isinstance(flow.data, Mapping):
+            return {}
+        data = flow.data
+        dossier: dict[str, str] = {}
+        for key, field in (
+            ("name", "name"),
+            ("contact_name", "name"),
+            ("birth_date", "birth_date"),
+            ("cpf", "cpf"),
+            ("patient_id", "patient_id"),
+        ):
+            value = str(data.get(key) or "").strip()
+            if value and not dossier.get(field):
+                dossier[field] = value
+        slot = data.get("selected_slot")
+        if isinstance(slot, Mapping):
+            chosen = " às ".join(
+                part
+                for part in (
+                    str(slot.get("display_date") or "").strip(),
+                    str(slot.get("time") or "").strip(),
+                )
+                if part
+            )
+            if chosen:
+                dossier["requested"] = chosen
+        return dossier
 
     def _sign_off(self, message: str) -> str:
         """Append the closing wish to a message that ends the conversation.
@@ -3395,38 +3567,32 @@ class WhatsAppAppointmentsHandler:
         """What reception needs to chase this lead by phone.
 
         Read before ``_respond`` wipes the flow, because the answers the
-        patient already gave — which service, which slot, how far they got —
+        patient already gave — who they are, which slot, how far they got —
         are exactly what makes the call worth making. Best-effort: a notice
         with only a phone number still beats the anonymous one it replaces.
+
+        Carries the patient's identification — name, birth date, CPF, Feegow
+        id — on Victor's instruction of 15/ago/2026. The earlier contract
+        withheld them so the notice could not leak identity, and reception
+        was told to look the patient up in Feegow instead; but a lead that
+        never got as far as a Feegow record has nothing to look up, which was
+        the whole reason this notice exists. Reception is clinic staff who
+        already hold this data in the chart. It stays on this one channel:
+        the notice goes to the reception chat and nowhere else.
         """
 
         details: dict[str, str] = {}
-        phone = _format_phone(_chat_phone(chat_key))
-        if phone:
-            details["Contato"] = phone
+        local_digits = _chat_phone(chat_key)
+        phone = _format_phone(local_digits)
         try:
             flow = store.load_flow(chat_key)
             lead = store.load_lead(chat_key)
         except Exception:
             logger.warning("handoff details unavailable", exc_info=True)
-            return details
+            flow = lead = None
 
-        if flow is not None:
-            name = str(flow.data.get("contact_name") or "").strip()
-            if name and phone:
-                details["Contato"] = f"{name} — {phone}"
-            slot = flow.data.get("selected_slot")
-            if isinstance(slot, Mapping):
-                chosen = " às ".join(
-                    part
-                    for part in (
-                        str(slot.get("display_date") or "").strip(),
-                        str(slot.get("time") or "").strip(),
-                    )
-                    if part
-                )
-                if chosen:
-                    details["Vaga escolhida"] = chosen
+        if flow is not None and isinstance(flow.data, Mapping):
+            details.update(_identification_details(flow.data))
             step = _HANDOFF_STEP_LABELS.get(flow.state)
             if step:
                 details["Parou em"] = step
@@ -3439,6 +3605,24 @@ class WhatsAppAppointmentsHandler:
                 details["Respostas"] = f"de {seen} a {answered}"
             elif seen or answered:
                 details["Respostas"] = str(answered or seen)
+        details.update(_reception_contact_lines(local_digits, phone))
+        return details
+
+    def _booking_details(
+        self, chat_key: str, data: Mapping[str, Any]
+    ) -> dict[str, str]:
+        """Name the patient a completed booking belongs to.
+
+        The flow data is still in hand here — no reload — so this is the same
+        identification the hand-off notice carries, plus the link reception
+        uses to confirm the slot with the patient.
+        """
+
+        details = _identification_details(data)
+        local_digits = _chat_phone(chat_key)
+        details.update(
+            _reception_contact_lines(local_digits, _format_phone(local_digits))
+        )
         return details
 
     def _enter_reconciliation(
@@ -5177,6 +5361,7 @@ class WhatsAppAppointmentsHandler:
                         appointment_id,
                         self._reception_chat_id,
                         now=self._now(),
+                        details=self._booking_details(chat_key, data),
                     )
                 except Exception:
                     logger.warning(

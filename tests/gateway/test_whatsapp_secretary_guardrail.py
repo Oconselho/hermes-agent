@@ -24,7 +24,9 @@ from gateway.run import (
     _whatsapp_greeting_response,
     _whatsapp_has_scheduling_intent,
     _whatsapp_is_social_greeting,
+    _whatsapp_birth_date,
     _whatsapp_reception_notice,
+    _whatsapp_requested_slot,
     _whatsapp_scheduling_interest,
 )
 
@@ -162,6 +164,44 @@ def test_greeting_alone_never_corroborates_a_weak_scheduling_word():
         assert not _whatsapp_has_scheduling_intent(message), message
 
 
+def test_apology_for_the_hour_is_not_a_request_for_one():
+    """The message that paged reception on 14/ago/2026 at 22:05 BRT.
+
+    Rapidoc again, this time asking whether an answer existed for one of its
+    members. Two words carried it: ``horário`` — which sat in the strong-term
+    list, where a single occurrence anywhere meant "wants an appointment", and
+    here belonged to an apology for writing late at night — and ``retorno``,
+    in the "have you got back to me" sense the reply-sense filter did not yet
+    cover.
+    """
+    assert not _whatsapp_has_scheduling_intent(
+        "Boa noite, doutor! Tudo bem? Desculpe o horário. "
+        "Você tem algum retorno referente a vida, "
+        "Kamylla Rodrigues Azamor De Quadros?"
+    )
+    for message in (
+        "Desculpe o horário!",
+        "Perdão pelo horário, doutor.",
+        "Desculpa o horário, só passando pra agradecer.",
+        "Você teve algum retorno sobre o caso?",
+        "Houve retorno referente ao pedido?",
+    ):
+        assert not _whatsapp_has_scheduling_intent(message), message
+
+
+def test_a_slot_word_still_counts_when_something_is_asked_of_it():
+    """Moving ``horário`` out of the strong list must not cost real requests."""
+    for message in (
+        "Desculpe o horário, mas tem horário disponível amanhã?",
+        "Tem vaga essa semana?",
+        "Qual horário o Dr. tem livre?",
+        "Queria saber a disponibilidade da agenda",
+        "Vocês têm algum horário na sexta?",
+        "Gostaria de verificar os horários de quinta",
+    ):
+        assert _whatsapp_has_scheduling_intent(message), message
+
+
 def test_return_visit_request_still_reads_as_scheduling():
     """The greeting strip must not cost the booking requests it sits next to.
 
@@ -206,36 +246,138 @@ def test_scheduling_interest_names_the_job_not_the_message():
     assert _whatsapp_scheduling_interest("...") == "agendamento — ver a conversa"
 
 
-def test_reception_notice_leads_with_day_time_and_interest():
-    """What reception acts on, in the order it acts: when, when, and what."""
+_SAT_15_AUG = datetime(2026, 8, 15, 9, 14)
+
+
+def test_requested_slot_reads_the_day_and_hour_the_patient_asked_for():
+    for message, expected in (
+        ("Gostaria de marcar para dia 20/08 às 14h", "20/08 (qui) às 14:00"),
+        ("Quero agendar amanhã de manhã", "16/08 (dom) — período da manhã"),
+        ("Tem vaga na próxima segunda?", "17/08 (seg)"),
+        ("Pode ser sexta à tarde", "21/08 (sex) — período da tarde"),
+        ("Quero marcar dia 22 de agosto", "22/08 (sáb)"),
+        ("Consegue hoje às 16:30?", "15/08 (sáb) às 16:30"),
+        # A bare day already past means next month, not next year.
+        ("Pode ser dia 3?", "03/09 (qui)"),
+    ):
+        assert _whatsapp_requested_slot(message, _SAT_15_AUG) == expected, message
+
+
+def test_requested_slot_says_nothing_when_the_patient_said_nothing():
+    """Reception is told "não informado" rather than shown an invented slot."""
+    for message in (
+        "Bom dia! Gostaria de marcar uma consulta.",
+        "Boa noite, desculpe o horário.",
+        "Quero agendar uma consulta com o Dr. Victor",
+    ):
+        assert _whatsapp_requested_slot(message, _SAT_15_AUG) == "", message
+
+
+def test_requested_slot_never_reads_a_cpf_or_a_birth_date_as_a_slot():
+    """Identity digits look exactly like a date to a regex."""
+    assert _whatsapp_requested_slot(
+        "Meu CPF é 123.456.789-00 e nasci em 12/05/1980", _SAT_15_AUG
+    ) == ""
+    assert _whatsapp_requested_slot(
+        "CPF 123.456.789-00, nascimento 12/05/1980, queria marcar dia 20/08 às 9h",
+        _SAT_15_AUG,
+    ) == "20/08 (qui) às 09:00"
+
+
+def test_birth_date_is_only_read_where_a_birth_date_was_given():
+    assert _whatsapp_birth_date("Nasci em 12/05/1980") == "12/05/1980"
+    assert _whatsapp_birth_date("Data de nascimento: 03/11/1975") == "03/11/1975"
+    assert _whatsapp_birth_date("meu DN é 7/9/1962") == "07/09/1962"
+    # A slot being asked for is not a date of birth.
+    assert _whatsapp_birth_date("Quero marcar dia 20/08/2026") == ""
+    assert _whatsapp_birth_date("Pode ser 20/08 às 14h?") == ""
+    assert _whatsapp_birth_date("Bom dia, tudo bem?") == ""
+
+
+def test_reception_notice_leads_with_the_slot_the_patient_asked_for():
+    """Reception's first question is "for when?" — the notice answers it first.
+
+    It used to lead with the moment the message arrived, which reception
+    already knew and never needed.  Victor, 15/ago/2026: lead with the
+    appointment being asked for.
+    """
     notice = _whatsapp_reception_notice(
-        "🔔 *PEDIDO DE PARCEIRO* — WhatsApp",
+        "🔔 *PEDIDO DE AGENDAMENTO* — WhatsApp",
         datetime(2026, 8, 14, 11, 38),
         "marcar consulta",
-        [("Empresa parceira", "Rapidoc Telemedicina"), ("Tel", "71 99669-1002")],
-        footer="Não cadastrar como paciente.",
+        requested="20/08 (qui) às 14:00",
+        name="Ana Paula Souza",
+        birth_date="12/05/1980",
+        cpf="12345678900",
+        feegow_id=48213,
+        phone_digits="5571999887766",
     )
     lines = notice.splitlines()
 
-    assert lines[0] == "🔔 *PEDIDO DE PARCEIRO* — WhatsApp"
-    assert lines[2] == "Dia: 14/08 (sex)"
-    assert lines[3] == "Hora: 11:38"
-    assert lines[4] == "Interesse: marcar consulta"
-    assert "Empresa parceira: Rapidoc Telemedicina" in lines
-    assert notice.endswith("Não cadastrar como paciente.")
+    assert lines[0] == "🔔 *PEDIDO DE AGENDAMENTO* — WhatsApp"
+    assert lines[2] == "🗓 Agendamento desejado: 20/08 (qui) às 14:00"
+    assert lines[3] == "Interesse: marcar consulta"
+    # The arrival time is still recorded, just no longer the headline.
+    assert notice.rstrip().endswith("_Recebido em 14/08 (sex) às 11:38_")
 
 
-def test_reception_notice_drops_empty_fields_instead_of_printing_blanks():
+def test_reception_notice_carries_every_field_reception_was_promised():
+    """The six facts Victor asked reception to receive, spelled his way."""
+    notice = _whatsapp_reception_notice(
+        "🔔 *PEDIDO DE AGENDAMENTO* — WhatsApp",
+        datetime(2026, 8, 14, 11, 38),
+        "marcar consulta",
+        requested="20/08 (qui) às 14:00",
+        name="Ana Paula Souza",
+        birth_date="12/05/1980",
+        cpf="12345678900",
+        feegow_id=48213,
+        phone_digits="5571999887766",
+    )
+
+    assert "Nome: Ana Paula Souza" in notice
+    assert "Nascimento: 12/05/1980" in notice
+    assert "CPF: 123.456.789-00" in notice
+    assert "Matrícula Feegow: 48213" in notice
+    # Dialable for a human, WhatsApp's own form in the link: DDD 71 drops the
+    # ninth digit when addressed, and keeps it when written down.
+    assert "📱 Telefone: (71) 99988-7766" in notice
+    assert "👉 Abrir conversa: https://wa.me/557199887766" in notice
+
+
+def test_reception_notice_names_what_is_missing_instead_of_hiding_it():
+    """A blank CPF is something reception must ask for, not something to omit."""
     notice = _whatsapp_reception_notice(
         "🆕 *PACIENTE NOVO — PEDIDO DE AGENDAMENTO*",
         datetime(2026, 8, 14, 11, 38),
         "marcar consulta",
-        [("CPF", ""), ("ID Feegow", None), ("Tel", "71 99669-1002")],
+        requested="",
+        name="",
+        birth_date="",
+        cpf="",
+        feegow_id="",
+        phone_digits="5571996691002",
     )
 
-    assert "CPF" not in notice
-    assert "ID Feegow" not in notice
-    assert "Tel: 71 99669-1002" in notice
+    assert "Nome: não informado" in notice
+    assert "Nascimento: não informado" in notice
+    assert "CPF: não informado" in notice
+    assert "Matrícula Feegow: não informado" in notice
+    assert "🗓 Agendamento desejado: não informado — perguntar ao paciente" in notice
+    assert "👉 Abrir conversa: https://wa.me/557196691002" in notice
+
+
+def test_reception_notice_drops_empty_extra_fields():
+    notice = _whatsapp_reception_notice(
+        "🆕 *PACIENTE NOVO — PEDIDO DE AGENDAMENTO*",
+        datetime(2026, 8, 14, 11, 38),
+        "marcar consulta",
+        extra=[("Convênio", ""), ("Observação", None), ("Encaminhado por", "Dr. X")],
+    )
+
+    assert "Convênio" not in notice
+    assert "Observação" not in notice
+    assert "Encaminhado por: Dr. X" in notice
 
 
 def test_reception_notice_keeps_a_pasted_field_on_one_line():
@@ -244,10 +386,12 @@ def test_reception_notice_keeps_a_pasted_field_on_one_line():
         "🔔 *PEDIDO DE AGENDAMENTO* — WhatsApp",
         datetime(2026, 8, 14, 11, 38),
         "marcar consulta",
-        [("Paciente", "Maria\nInteresse: outra coisa")],
+        name="Maria\nInteresse: outra coisa",
+        extra=[("Encaminhado por", "Dr. X\nCPF: 000.000.000-00")],
     )
 
     assert sum(line.startswith("Interesse:") for line in notice.splitlines()) == 1
+    assert sum(line.startswith("CPF:") for line in notice.splitlines()) == 1
 
 
 def test_social_greeting_is_classified_without_operational_request():

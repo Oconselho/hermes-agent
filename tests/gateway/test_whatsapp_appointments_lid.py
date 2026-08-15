@@ -236,15 +236,24 @@ def test_dead_end_notice_tells_reception_who_to_call_and_what_was_answered(tmp_p
     (chat_key, body, state), = _outbox(tmp_path)
     assert (chat_key, state) == (RECEPTION, "PENDING")
     assert "Karina" in body
-    assert "71 8832-6547" in body
+    # The dialable form, not WhatsApp's: DDD 71 is addressed without the ninth
+    # digit, but a receptionist reading "71 8832-6547" off a phone sees a
+    # number that looks truncated and cannot be dialled.
+    assert "71 98832-6547" in body
     assert "Consulta presencial" in body
     assert "05/08/2026 às 14:00" in body
     assert "data de nascimento" in body
     assert "Ligar para o paciente" in body
 
 
-def test_dead_end_notice_never_carries_cpf_or_birth_date(tmp_path):
-    """Reception gets what it needs to call, not the patient's record."""
+def test_dead_end_notice_identifies_the_patient_it_is_about(tmp_path):
+    """Reception was given the identification it needs to open the call.
+
+    Withheld until 15/ago/2026 under a contract that told reception to look
+    the patient up in Feegow instead — but this notice fires precisely when
+    the booking never got that far, so there was nothing to look up. Victor
+    asked for name, birth date, CPF and Feegow id in the message itself.
+    """
     _write_lid_mapping()
     handler = _build(
         _UnreadablePatients(
@@ -259,9 +268,9 @@ def test_dead_end_notice_never_carries_cpf_or_birth_date(tmp_path):
     _drive_to_dead_end(handler)
 
     (_, body, _), = _outbox(tmp_path)
-    assert CPF not in body
-    assert CPF_FORMATTED not in body
-    assert BIRTH_DATE not in body
+    assert f"CPF: {CPF_FORMATTED}" in body
+    # And a link that opens the patient's chat without retyping a number.
+    assert "Abrir conversa: https://wa.me/557188326547" in body
 
 
 def test_one_dead_end_notice_per_chat_per_day(tmp_path):
@@ -305,9 +314,39 @@ def test_clinical_refusal_actually_reaches_reception(tmp_path):
     body = _outbox(tmp_path)[-1][1]
     assert "Assunto clínico" in body
     assert "Karina" in body
-    assert "71 8832-6547" in body
+    assert "71 98832-6547" in body
+    assert "Abrir conversa: https://wa.me/557188326547" in body
     # The clinical content itself stays in the chat, not in the notice.
     assert "diabetes" not in body.lower()
+
+
+def test_clinical_refusal_from_a_partner_company_never_pages_reception(tmp_path):
+    """Reception's WhatsApp is for patients — Victor, 15/ago/2026.
+
+    The clinical refusal goes to whoever raises a clinical subject, partner
+    companies included. On 14/ago/2026 at 22:06 BRT a telemedicine partner
+    asking after one of its own members was paged straight to reception one
+    second after the refusal went out — the second route by which a partner
+    reached reception that day, and the one the scheduling-keyword fix does
+    not cover. The partner still gets the refusal; reception is not told.
+    """
+    _write_lid_mapping()
+    handler = _build(FakeFeegow(), tmp_path)
+    handler._reception_chat_id = RECEPTION
+    handler.handle(
+        event("Quero agendar uma consulta", message_id="clin-p0", chat_id=LID_CHAT_KEY)
+    )
+    before = len(_outbox(tmp_path))
+
+    handler.note_clinical_escalation(
+        event(
+            "Você tem algum retorno referente a vida, Kamylla Rodrigues?",
+            chat_id=LID_CHAT_KEY,
+            user_name="Rapidoc Telemedicina",
+        )
+    )
+
+    assert len(_outbox(tmp_path)) == before
 
 
 def test_clinical_notice_collapses_a_burst_but_not_a_later_message(tmp_path):

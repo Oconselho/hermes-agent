@@ -83,15 +83,40 @@ class TestInPersonBookingNotifiesReception:
         assert "agendamento" in body.lower()
         assert "confirmar" in body.lower()
 
-    def test_notice_carries_no_patient_data(self, tmp_path):
-        """Same contract as the payment-proof notice: id only."""
+    def test_notice_names_the_patient_it_is_about(self, tmp_path):
+        """Reception is told who booked, not just that someone did.
+
+        This notice carried the appointment id alone until 15/ago/2026, on the
+        reasoning that reception could look the rest up in Feegow. Victor asked
+        for the patient named in the message itself: reception works from
+        WhatsApp on a phone, and "confirmar na Feegow" meant opening a second
+        system to find out who the notice was even about.
+        """
         handler, db_path = _handler(tmp_path, reception_chat_id=RECEPTION)
         _book_in_person(handler)
 
         body = _outbox(db_path)[0][1]
-        for sentinel in (CPF, CPF_FORMATTED, BIRTH_DATE, "Paciente Exemplo",
-                         "71999999999", "old@example.invalid"):
-            assert sentinel not in body, f"PII leak: {sentinel!r}"
+        assert f"CPF: {CPF_FORMATTED}" in body
+        assert f"Nascimento: {BIRTH_DATE}" in body
+        assert "Agendamento desejado" in body
+        # And the link that saves reception from retyping the number.
+        assert "https://wa.me/" in body
+
+    def test_notice_stays_on_the_reception_channel(self, tmp_path):
+        """Identification is for reception only — one chat, no other target."""
+        handler, db_path = _handler(tmp_path, reception_chat_id=RECEPTION)
+        _book_in_person(handler)
+
+        targets = {chat_key for chat_key, _ in _outbox(db_path)}
+        assert targets == {RECEPTION_DELIVERED}
+
+    def test_email_is_never_carried(self, tmp_path):
+        """Named fields only: nothing reception was not asked to be given."""
+        handler, db_path = _handler(tmp_path, reception_chat_id=RECEPTION)
+        _book_in_person(handler)
+
+        body = _outbox(db_path)[0][1]
+        assert "old@example.invalid" not in body
 
     def test_nothing_is_queued_when_reception_is_not_configured(self, tmp_path):
         """Unset reception_chat_id must stay silent, not crash the booking."""
