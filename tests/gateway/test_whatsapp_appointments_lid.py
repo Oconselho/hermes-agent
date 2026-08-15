@@ -54,6 +54,11 @@ LID_CHAT_KEY = f"{LID}@lid"
 PHONE_WITH_COUNTRY = "557188326547"
 PHONE = "7188326547"
 RECEPTION = "5571996691002@s.whatsapp.net"
+# Where clinical questions go since 15/ago/2026 — and, because the secretary
+# answers on Victor's own line, also the number the bridge is logged in as.
+VICTOR = "557188048263@s.whatsapp.net"
+VICTOR_LID_DIGITS = "118347958063114"
+VICTOR_LID = f"{VICTOR_LID_DIGITS}@lid"
 
 PROC1 = {"procedimento_id": 1, "nome": "Consulta", "valor": 600}
 SLOT = {"id": "slot-1", "procedimento_id": 1, "data": "2026-08-05", "horario": "14:00"}
@@ -79,6 +84,25 @@ def _write_lid_mapping(phone=PHONE_WITH_COUNTRY, lid=LID):
 def _build(feegow, tmp_path):
     return WhatsAppAppointmentsHandler(
         payment_config(),
+        db_path=tmp_path / "appointments.sqlite3",
+        proofs_dir=tmp_path / "proofs",
+        feegow_client=feegow,
+        clock=MutableClock(NOW),
+    )
+
+
+def _build_with_clinical_destination(feegow, tmp_path):
+    """A handler wired the way production is: clinical notices go to Victor.
+
+    Goes through the real constructor rather than assigning the attribute, so
+    the config key itself stays covered — that wiring is the part that would
+    silently stop working.
+    """
+    # Victor's own LID, so a self-chat arriving under either spelling is
+    # recognised the way the bridge actually delivers it.
+    _write_lid_mapping(phone="557188048263", lid=VICTOR_LID_DIGITS)
+    return WhatsAppAppointmentsHandler(
+        payment_config(clinical_notice_chat_id=VICTOR),
         db_path=tmp_path / "appointments.sqlite3",
         proofs_dir=tmp_path / "proofs",
         feegow_client=feegow,
@@ -297,10 +321,15 @@ def test_one_dead_end_notice_per_chat_per_day(tmp_path):
 # ------------------------------------------------------------ clinical promise
 
 
-def test_clinical_refusal_actually_reaches_reception(tmp_path):
-    """"Vou encaminhar para a equipe" had no code behind it until now."""
+def test_clinical_refusal_reaches_victor_and_never_reception(tmp_path):
+    """"Vou encaminhar para a equipe" had no code behind it until now.
+
+    And since 15/ago/2026 the code behind it addresses Victor: reception's
+    WhatsApp carries booking requests and nothing else, and a patient raising
+    a symptom is not a booking request.
+    """
     _write_lid_mapping()
-    handler = _build(FakeFeegow(), tmp_path)
+    handler = _build_with_clinical_destination(FakeFeegow(), tmp_path)
     handler._reception_chat_id = RECEPTION
     # The store only exists once the flow has touched it.
     handler.handle(
@@ -311,13 +340,56 @@ def test_clinical_refusal_actually_reaches_reception(tmp_path):
         event("meu marido descobriu diabetes", chat_id=LID_CHAT_KEY, user_name="Karina Costa")
     )
 
-    body = _outbox(tmp_path)[-1][1]
+    chat_key, body, _ = _outbox(tmp_path)[-1]
+    assert chat_key == VICTOR
+    assert RECEPTION not in {row[0] for row in _outbox(tmp_path)}
     assert "Assunto clínico" in body
     assert "Karina" in body
     assert "71 98832-6547" in body
     assert "Abrir conversa: https://wa.me/557188326547" in body
     # The clinical content itself stays in the chat, not in the notice.
     assert "diabetes" not in body.lower()
+
+
+def test_clinical_notice_without_a_destination_never_falls_back_to_reception(tmp_path):
+    """Unset means nobody is paged — not "page reception instead".
+
+    A fallback would quietly undo the one rule this setting exists to enforce,
+    on the exact message class Victor asked to be taken off that number.
+    """
+    _write_lid_mapping()
+    handler = _build(FakeFeegow(), tmp_path)  # no clinical_notice_chat_id
+    handler._reception_chat_id = RECEPTION
+    handler.handle(
+        event("Quero agendar uma consulta", message_id="clin-n0", chat_id=LID_CHAT_KEY)
+    )
+    before = len(_outbox(tmp_path))
+
+    handler.note_clinical_escalation(
+        event("estou com dor", chat_id=LID_CHAT_KEY, user_name="Karina Costa")
+    )
+
+    assert len(_outbox(tmp_path)) == before
+
+
+def test_victors_own_self_chat_never_notifies_itself(tmp_path):
+    """The notice lands on the line the secretary itself answers on.
+
+    Without this, Victor typing anything clinical into his own self-chat would
+    page his own self-chat.
+    """
+    _write_lid_mapping()
+    handler = _build_with_clinical_destination(FakeFeegow(), tmp_path)
+    handler._reception_chat_id = RECEPTION
+    handler.handle(
+        event("Quero agendar uma consulta", message_id="clin-s0", chat_id=LID_CHAT_KEY)
+    )
+    before = len(_outbox(tmp_path))
+
+    handler.note_clinical_escalation(event("dor de cabeça", chat_id=VICTOR))
+    handler.note_clinical_escalation(event("dor de cabeça", chat_id=VICTOR_LID))
+
+    assert len(_outbox(tmp_path)) == before
 
 
 def test_clinical_refusal_from_a_partner_company_never_pages_reception(tmp_path):
@@ -331,7 +403,7 @@ def test_clinical_refusal_from_a_partner_company_never_pages_reception(tmp_path)
     not cover. The partner still gets the refusal; reception is not told.
     """
     _write_lid_mapping()
-    handler = _build(FakeFeegow(), tmp_path)
+    handler = _build_with_clinical_destination(FakeFeegow(), tmp_path)
     handler._reception_chat_id = RECEPTION
     handler.handle(
         event("Quero agendar uma consulta", message_id="clin-p0", chat_id=LID_CHAT_KEY)
@@ -353,7 +425,7 @@ def test_clinical_notice_collapses_a_burst_but_not_a_later_message(tmp_path):
     _write_lid_mapping()
     clock = MutableClock(NOW)
     handler = WhatsAppAppointmentsHandler(
-        payment_config(),
+        payment_config(clinical_notice_chat_id=VICTOR),
         db_path=tmp_path / "appointments.sqlite3",
         proofs_dir=tmp_path / "proofs",
         feegow_client=FakeFeegow(),
@@ -375,7 +447,7 @@ def test_clinical_notice_collapses_a_burst_but_not_a_later_message(tmp_path):
 
 def test_reception_chat_never_notifies_itself(tmp_path):
     """The notification channel is not a patient."""
-    handler = _build(FakeFeegow(), tmp_path)
+    handler = _build_with_clinical_destination(FakeFeegow(), tmp_path)
     handler._reception_chat_id = RECEPTION
     handler.handle(
         event("Quero agendar uma consulta", message_id="self-1", chat_id=LID_CHAT_KEY)

@@ -1849,10 +1849,10 @@ class AppointmentStore:
             )
         return {"id": outbox_id, "chat_key": reception_chat_id, "body": body}
 
-    def enqueue_reception_clinical(
+    def enqueue_clinical_notice(
         self,
         chat_key: str,
-        reception_chat_id: str,
+        notice_chat_id: str,
         *,
         now: datetime,
         details: Mapping[str, str] | None = None,
@@ -1866,19 +1866,28 @@ class AppointmentStore:
         13/ago/2026 was told they had been forwarded to a team that never
         heard of them.
 
+        Goes to Victor, not to reception (Victor, 15/ago/2026): reception's
+        WhatsApp is for booking requests, and a clinical question is not one.
+        The destination is ``clinical_notice_chat_id``; the name of this method
+        no longer says "reception" precisely because it must not drift back.
+
         Bucketed by the hour, not by the day like the booking dead end: a
         burst collapses into one notice, but a patient who writes again three
-        hours later is raising something new and reception has to hear it.
+        hours later is raising something new and it has to be heard.
 
         The patient's own words are never carried. What they wrote is clinical
-        content; reception reads it in the chat, which is where it already is.
+        content; it is read in the chat, which is where it already is.
         """
 
         bucket = now.strftime("%Y-%m-%dT%H")
+        # The idempotency namespace is deliberately unchanged: an hour bucket
+        # already queued under the old destination must not fire a second time
+        # at the new one just because the route was renamed.
         idempotency_key = _opaque_id("reception-clinical", chat_key, bucket)
         outbox_id = _opaque_id("outbox", idempotency_key)
         lines = [
-            "Assunto clínico recebido pela secretária automática no WhatsApp.",
+            "🩺 *Assunto clínico* — pergunta de paciente no WhatsApp da "
+            "secretária.",
             "",
         ]
         lines.extend(f"{label}: {value}" for label, value in (details or {}).items())
@@ -1897,9 +1906,9 @@ class AppointmentStore:
                     (id, idempotency_key, chat_key, body, state, created_at, sent_at)
                 VALUES (?, ?, ?, ?, 'PENDING', ?, NULL)
                 """,
-                (outbox_id, idempotency_key, reception_chat_id, body, now.isoformat()),
+                (outbox_id, idempotency_key, notice_chat_id, body, now.isoformat()),
             )
-        return {"id": outbox_id, "chat_key": reception_chat_id, "body": body}
+        return {"id": outbox_id, "chat_key": notice_chat_id, "body": body}
 
     def claim_expiration(
         self,
@@ -2959,6 +2968,23 @@ class WhatsAppAppointmentsHandler:
             self._reception_chat_id_configured
         )
         self._reception_identities_cache = None
+        # Where a clinical question goes — Victor, not reception (15/ago/2026).
+        # Reception's WhatsApp carries booking requests and nothing else, and a
+        # patient raising a symptom is not a booking request. Normalized
+        # through the same helper as reception so the ninth-digit rule cannot
+        # differ between the two destinations.
+        #
+        # Fails closed on purpose: unset means no notice at all, never a quiet
+        # fallback to reception. A fallback would silently undo the rule this
+        # setting exists to enforce, and it would do it on the one message
+        # class Victor asked to be taken off that number.
+        self._clinical_notice_chat_id_configured = str(
+            settings.get("clinical_notice_chat_id") or ""
+        ).strip()
+        self._clinical_notice_chat_id = _reception_send_target(
+            self._clinical_notice_chat_id_configured
+        )
+        self._clinical_notice_identities_cache = None
         self._flow_ttl_seconds = max(
             60, int(settings.get("flow_ttl_hours", 24)) * 3600
         )
@@ -3077,21 +3103,27 @@ class WhatsAppAppointmentsHandler:
             logger.warning("model greeting not recorded", exc_info=True)
 
     def note_clinical_escalation(self, incoming: Any) -> None:
-        """Queue the reception notice the clinical refusal promises.
+        """Queue the notice the clinical refusal promises — to Victor.
 
         The refusal is produced by the model pipeline, not by this flow, so
         this is the seam where the promise becomes an actual message. Kept
-        here because the outbox — the only delivery path reception is watching
-        — belongs to this store.
+        here because the outbox — the only delivery path being watched —
+        belongs to this store.
 
         Best-effort on the reply path, exactly like ``note_model_greeting``:
         never creates the database, and a failure costs the patient nothing.
         The patient still gets the refusal either way; what fails is only
-        reception hearing about it, and that is logged loudly because it is
-        the whole point of the call.
+        Victor hearing about it, and that is logged loudly because it is the
+        whole point of the call.
         """
 
-        if not self._enabled or not self._reception_chat_id:
+        if not self._enabled:
+            return
+        if not self._clinical_notice_chat_id:
+            logger.warning(
+                "clinical escalation not queued: clinical_notice_chat_id is "
+                "unset, so the promise made to the patient has no destination"
+            )
             return
         if not self._db_path.exists():
             return
@@ -3099,6 +3131,12 @@ class WhatsAppAppointmentsHandler:
             source = getattr(incoming, "source", None)
             chat_key = str(getattr(source, "chat_id", "") or "")
             if not chat_key or self._is_reception_chat(chat_key):
+                return
+            # The destination is Victor's own line — the same line this
+            # secretary answers on — so without this the notice channel would
+            # page itself the moment Victor typed anything clinical into his
+            # own self-chat.
+            if self._is_clinical_notice_chat(chat_key):
                 return
             # Reception's WhatsApp is for patients (Victor, 15/ago/2026). The
             # clinical refusal is sent to anyone who raises a clinical subject,
@@ -3120,9 +3158,9 @@ class WhatsAppAppointmentsHandler:
                 details["Contato"] = f"{name} — {phone}" if name else phone
             details["Recebido"] = self._now().strftime("%d/%m %H:%M")
             details.update(_reception_contact_lines(local_digits, ""))
-            AppointmentStore(self._db_path).enqueue_reception_clinical(
+            AppointmentStore(self._db_path).enqueue_clinical_notice(
                 chat_key,
-                self._reception_chat_id,
+                self._clinical_notice_chat_id,
                 now=self._now(),
                 details=details,
             )
@@ -3289,6 +3327,43 @@ class WhatsAppAppointmentsHandler:
         if not self._reception_chat_id:
             return False
         return _digits(chat_key) in self._reception_identities()
+
+    def _is_clinical_notice_chat(self, chat_key: str) -> bool:
+        """Whether this chat is where clinical notices are delivered.
+
+        Matters more here than for reception: the destination is Victor's own
+        number, which is the very line this secretary runs on, so the chat
+        arrives as the self-chat — under the phone JID, under the LID, or
+        under whatever spelling the bridge resolved it to that day.
+        """
+
+        if not self._clinical_notice_chat_id:
+            return False
+        return _digits(chat_key) in self._clinical_notice_identities()
+
+    def _clinical_notice_identities(self) -> frozenset:
+        """Every digit-form that means "this is the clinical notice channel"."""
+
+        cached = getattr(self, "_clinical_notice_identities_cache", None)
+        if cached is not None:
+            return cached
+        forms = {
+            _digits(self._clinical_notice_chat_id),
+            _digits(self._clinical_notice_chat_id_configured),
+            _digits(_chat_phone(self._clinical_notice_chat_id)),
+        }
+        try:
+            from gateway.whatsapp_identity import expand_whatsapp_aliases
+
+            for alias in expand_whatsapp_aliases(self._clinical_notice_chat_id):
+                forms.add(_digits(alias))
+        except Exception:
+            logger.warning(
+                "clinical notice alias expansion failed", exc_info=True
+            )
+        identities = frozenset(form for form in forms if form)
+        self._clinical_notice_identities_cache = identities
+        return identities
 
     def _reception_identities(self) -> frozenset:
         """Every digit-form that means "this is reception"."""
