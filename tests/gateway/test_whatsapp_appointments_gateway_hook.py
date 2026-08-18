@@ -227,3 +227,59 @@ def test_only_the_sentinel_counts_as_silence():
     assert not gateway_run._is_appointment_silence("")
     assert not gateway_run._is_appointment_silence(None)
     assert not gateway_run._is_appointment_silence("Como posso ajudar?")
+
+
+# --------------------------------------------------------------------------
+# Dúvida comercial de empresa → silêncio (18/ago/2026)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Vende e entrega na mesma frase: é exatamente a dúvida.
+        "Oportunidade imperdível! Segue em anexo o orçamento que conversamos.",
+        "Temos uma solução de captação de pacientes, conforme conversamos.",
+        "Aproveite a condição especial. Segue a proposta conforme solicitado.",
+    ],
+)
+def test_a_pitch_that_also_looks_requested_is_doubt(text):
+    assert gateway_run._whatsapp_commercial_ambiguity(text, "Vou registrar.")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Só vende: não há dúvida, a categoria 8 resolve.
+        "Oportunidade de parceria para aumentar seu faturamento.",
+        # Só entrega: não há dúvida, a categoria 4 resolve.
+        "Segue em anexo a nota fiscal conforme combinado.",
+        "Bom dia, tudo bem?",
+        "",
+    ],
+)
+def test_one_sided_messages_are_not_doubt(text):
+    assert not gateway_run._whatsapp_commercial_ambiguity(text, "Vou registrar.")
+
+
+def test_rejecting_a_requested_delivery_counts_as_doubt():
+    """O erro que não se desfaz: "sem interesse" para a nota que pedimos.
+
+    Aqui o modelo já resolveu a dúvida, e resolveu para o lado caro. A
+    mensagem sozinha não tem vocabulário de venda — o que denuncia o engano é
+    a recusa em cima de uma entrega.
+    """
+
+    assert gateway_run._whatsapp_commercial_ambiguity(
+        "Segue o orçamento que o senhor pediu.",
+        "Agradecemos o contato, mas não temos interesse. Obrigada.",
+    )
+
+
+def test_rejecting_a_cold_pitch_is_not_doubt():
+    """Prospecção pura continua sendo recusada — nada mudou para ela."""
+
+    assert not gateway_run._whatsapp_commercial_ambiguity(
+        "Olá! Trabalho com mentoria para clínicas. Aceita uma parceria?",
+        "Agradecemos o contato, mas não temos interesse. Obrigada.",
+    )

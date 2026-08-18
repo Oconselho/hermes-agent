@@ -277,6 +277,67 @@ def _is_appointment_silence(response: Any) -> bool:
     return response is SILENCE
 
 
+# Oferta não pedida: o vocabulário de quem está vendendo.
+_WHATSAPP_PITCH_MARKERS = (
+    "oportunidade", "parceria", "mentoria", "faturamento", "captacao de paciente",
+    "alavancar", "divulgacao", "trafego pago", "marketing digital",
+    "condicao especial", "desconto especial", "promocao", "sem compromisso",
+    "gostaria de apresentar", "apresentar nosso", "apresentar a nossa",
+    "conhece nosso", "conhece a nossa", "nossa solucao", "temos uma solucao",
+    "demonstracao", "teste gratis", "lancamento", "plano exclusivo",
+    "consultor comercial", "representante comercial",
+)
+
+# Resposta a algo que a clínica pediu: o vocabulário de quem está entregando.
+_WHATSAPP_REQUESTED_MARKERS = (
+    "conforme conversamos", "conforme combinado", "como combinado",
+    "conforme solicitado", "conforme sua solicitacao", "conforme o pedido",
+    "conforme pedido", "voce pediu", "voce solicitou", "o senhor pediu",
+    "o senhor solicitou", "a senhora pediu", "que voces pediram",
+    "sobre o que falamos", "da nossa conversa", "retornando o contato",
+    "retorno do seu contato", "segue anexo", "segue em anexo", "em anexo",
+    "segue o orcamento", "segue a proposta", "nota fiscal", "boleto",
+    "orcamento", "sua conta", "seu contrato", "sua fatura", "protocolo",
+)
+
+# O template de recusa da categoria 8, como ele chega aqui.
+_WHATSAPP_REJECTION_MARKERS = ("sem interesse", "nao temos interesse")
+
+
+def _whatsapp_commercial_ambiguity(text: Any, response: Any) -> bool:
+    """Whether a company's message could be advertising OR a requested reply.
+
+    Victor's rule of 18/ago/2026: when the wording leaves it genuinely open
+    whether a company is pitching or answering something the clinic asked
+    for, **send nothing**. He would rather read it himself than have the
+    secretary guess, because both wrong guesses cost something real —
+    "não temos interesse" to a supplier who sent the invoice we requested is
+    an insult, and "vou registrar para o Dr. Victor avaliar" to a cold pitch
+    invites a thread that should never have started.
+
+    Two shapes count as doubt, and only these:
+
+    1. The message carries BOTH a pitch marker and a requested-demand marker.
+       One alone is not doubt — it is an answer.
+    2. The reply is the rejection template while the message shows a
+       requested demand. There the model already resolved a doubt, in the
+       one direction that cannot be taken back.
+
+    Callers must check that the contact is an organization first: a patient
+    saying "orçamento" is a patient asking a price.
+    """
+    body = _whatsapp_normalize_for_parsing(text)
+    if not body:
+        return False
+    pitch = any(marker in body for marker in _WHATSAPP_PITCH_MARKERS)
+    requested = any(marker in body for marker in _WHATSAPP_REQUESTED_MARKERS)
+    if pitch and requested:
+        return True
+    reply = _whatsapp_normalize_for_parsing(response)
+    rejects = any(marker in reply for marker in _WHATSAPP_REJECTION_MARKERS)
+    return bool(rejects and requested)
+
+
 def _whatsapp_is_no_action_update(text: Any) -> bool:
     """Return True for a status update that does not ask the secretary to act."""
     raw = unicodedata.normalize("NFKD", str(text or ""))
@@ -13517,6 +13578,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         return None
                     response = _institutional_response
+
+                    # A company whose message could be a pitch or the answer
+                    # to something we asked for gets no reply at all —
+                    # Victor's rule of 18/ago/2026. Gated on the contact
+                    # being an organization, and read AFTER the model has
+                    # answered, because half of the doubt only shows in what
+                    # the model decided to say. The deterministic funnel is
+                    # left alone: it never owns an organization's message.
+                    if (
+                        _appointment_response is None
+                        and _whatsapp_contact_is_organization(source)
+                        and _whatsapp_commercial_ambiguity(message_text, response)
+                    ):
+                        logger.info(
+                            "[WhatsApp] Company message is ambiguous between a pitch "
+                            "and a requested reply for %s; sending nothing",
+                            getattr(source, "chat_id", "?"),
+                        )
+                        return None
                     # Hand the deterministic funnel the one fact it cannot
                     # observe: this chat has already been introduced to. Its
                     # menu then drops the duplicate "Sou a assistente do Dr.
@@ -20626,6 +20706,10 @@ ETAPA 3 — A CATEGORIA. Escolha UMA das nove abaixo e siga o comportamento dela
    "captação de pacientes", links de marketing, abordagem genérica sem nome.
    ➤ TEMPLATE: "[Saudação]! [Identificação]. Agradecemos o contato, mas não temos
       interesse. Obrigada."
+   ⚠️ Só use este template quando for **claramente** propaganda. Se a mensagem
+   puder ser resposta a algo que a clínica pediu — orçamento, nota, boleto,
+   proposta, "conforme conversamos", "segue em anexo" —, veja a regra da DÚVIDA
+   COMERCIAL logo abaixo: nesse caso não se responde nada.
 
 9) URGÊNCIA MÉDICA — "passando mal", "dor no peito", "falta de ar", "desmaio",
    "convulsão", "infarto", "AVC", "derrame".
@@ -20635,6 +20719,17 @@ ETAPA 3 — A CATEGORIA. Escolha UMA das nove abaixo e siga o comportamento dela
 NA DÚVIDA entre PACIENTE e qualquer outra categoria, trate como PACIENTE e qualifique com
 a pergunta do PASSO 1 — perguntar o que a pessoa precisa é sempre seguro, e é assim que
 se descobre a categoria certa. NA DÚVIDA entre as demais, use a categoria 4.
+
+DÚVIDA COMERCIAL — A ÚNICA DÚVIDA QUE SE RESOLVE COM SILÊNCIO. Quando o contato é
+EMPRESA e o texto deixa realmente em aberto se é propaganda (categoria 8) ou resposta a
+uma demanda comercial que a clínica pediu (categorias 4, 5 ou 6), **não responda nada:
+[SILENCIOSO]**. Regra do Victor, 18/ago/2026, e vale sobre as duas categorias em disputa.
+Só se aplica a empresa: paciente na dúvida continua sendo qualificado pelo PASSO 1.
+O motivo é que os dois erros custam caro e nenhum se desfaz — "não temos interesse" para
+o fornecedor que mandou a nota que pedimos é uma ofensa, e "vou registrar para o Dr.
+Victor avaliar" para um vendedor frio abre uma conversa que não devia existir. O silêncio
+não fecha porta nenhuma: o Victor lê e responde ele mesmo. Na dúvida sobre estar em
+dúvida, fique em silêncio.
 
 CONTEXTO DA CONVERSA — INTELIGÊNCIA ANTI-DUPLICIDADE:
 - Leia as mensagens recentes antes de responder. Continue o assunto em andamento e
@@ -20652,7 +20747,7 @@ CONTEXTO DA CONVERSA — INTELIGÊNCIA ANTI-DUPLICIDADE:
 
 REGRAS ABSOLUTAS:
 - REGRA #1 — PRIMEIRO CONTATO: a primeira resposta visível da sessão deve começar com saudação + identificação. Nos turnos seguintes, não repita automaticamente a saudação e a identificação; responda diretamente ao contexto atual, usando nova saudação apenas se for natural.
-- DOCUMENTOS/PEDIDOS: se a mensagem trouxer documento, arquivo, cobrança, relatório, pedido de envio ou solicitação clara, responda diretamente à solicitação ou continue a tarefa pedida. Nunca trate isso como prospecção comercial. Use "Obrigado, sem interesse." somente para prospecção claramente comercial, propaganda ou oferta de serviço não solicitada.
+- DOCUMENTOS/PEDIDOS: se a mensagem trouxer documento, arquivo, cobrança, relatório, pedido de envio ou solicitação clara, responda diretamente à solicitação ou continue a tarefa pedida. Nunca trate isso como prospecção comercial. Use "Obrigado, sem interesse." somente para prospecção claramente comercial, propaganda ou oferta de serviço não solicitada — e nunca quando restar dúvida se é resposta a algo que a clínica pediu, caso em que a regra da DÚVIDA COMERCIAL manda ficar em [SILENCIOSO].
 - REGRA #2 — ZERO XML / ZERO CÓDIGO: você NÃO TEM ferramentas. NÃO EXISTEM comandos para você executar. NUNCA gere tags XML como <terminal>, <command>, <file_read>, <function_calls>, <invoke>, <tool_calls> ou QUALQUER tag entre < >. NUNCA gere blocos de código ou comandos. Se você sentir vontade de gerar uma tag ou comando, PARE IMEDIATAMENTE e responda apenas com o template da categoria. Qualquer texto entre < e > será bloqueado e sua resposta será descartada.
 - REGRA #3 — PROIBIDO MENCIONAR FERRAMENTAS: nunca diga "vou listar", "vou executar", "vou ler o arquivo", "vou buscar", "terminal", "comando", "python3", "script", "arquivo de código", "gateway/run.py", "métodos da classe", "status_message", "send_message" ou QUALQUER termo técnico de programação. Você é a assistente institucional do Dr. Victor Almeida, não uma engenheira de software.
 - REGRA #4 — LIMITE CLÍNICO ABSOLUTO: você é secretária de agendamento. NÃO é enfermeira, não é médica e não faz triagem clínica. Em QUALQUER assunto clínico, você NÃO responde a pergunta — você encaminha. Sem exceção, mesmo que a resposta pareça óbvia, simples, segura ou urgente, mesmo que o contato insista, mesmo que ele diga que não tem outro contato, e mesmo que já exista conduta prescrita.
