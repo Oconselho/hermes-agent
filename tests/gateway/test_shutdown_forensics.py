@@ -248,3 +248,111 @@ class TestCheckSystemdTimingAlignment:
         # for whatever unit pytest IS in.  Both are valid; we just ensure
         # the function doesn't raise.
         assert result is None or isinstance(result, dict)
+
+    # -- which systemd manager gets to answer --------------------------------
+    #
+    # ``systemctl show`` answers with DEFAULTS and exit code 0 for a unit the
+    # manager does not have.  In production this made the user manager report
+    # ``TimeoutStopUSec=1min 30s`` for a system unit whose file says 210s, and
+    # the gateway warned "Stale systemd unit detected ... TimeoutStopSec=90s"
+    # on every single startup about a drain that was never at risk.
+
+    class _Completed:
+        def __init__(self, stdout: str, returncode: int = 0) -> None:
+            self.stdout = stdout
+            self.returncode = returncode
+            self.stderr = ""
+
+    @staticmethod
+    def _pretend_inside_unit(monkeypatch, unit="hermes-secretary.service"):
+        """Make /proc/self/cgroup read as if we run inside ``unit``."""
+        import builtins
+        import io
+
+        real_open = builtins.open
+
+        def fake_open(path, *args, **kwargs):
+            if str(path) == "/proc/self/cgroup":
+                return io.StringIO(f"0::/system.slice/{unit}\n")
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", fake_open)
+
+    @classmethod
+    def _fake_systemctl(cls, monkeypatch, user: str, system: str):
+        """Answer as the user manager or the system one.  Records the calls."""
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            return cls._Completed(user if "--user" in cmd else system)
+
+        monkeypatch.setattr(sf.subprocess, "run", fake_run)
+        return calls
+
+    def test_user_manager_default_is_not_trusted_for_a_system_unit(self, monkeypatch):
+        monkeypatch.setenv("INVOCATION_ID", "abc")
+        self._pretend_inside_unit(monkeypatch)
+        calls = self._fake_systemctl(
+            monkeypatch,
+            # rc=0 and perfectly parseable — but about a unit it doesn't have.
+            user="LoadState=not-found\nTimeoutStopUSec=1min 30s\n",
+            system="LoadState=loaded\nTimeoutStopUSec=3min 30s\n",
+        )
+        result = sf.check_systemd_timing_alignment(180.0)
+        assert result is not None
+        assert result["timeout_stop_sec"] == 210.0  # the unit file's value
+        assert result["mismatch"] is False  # 210 >= 180 + 30 headroom
+        assert len(calls) == 2  # the system manager really was asked
+
+    def test_a_genuinely_short_stop_timeout_still_warns(self, monkeypatch):
+        """The alarm must keep working — the bug was the reading, not the rule."""
+        monkeypatch.setenv("INVOCATION_ID", "abc")
+        self._pretend_inside_unit(monkeypatch)
+        self._fake_systemctl(
+            monkeypatch,
+            user="LoadState=not-found\nTimeoutStopUSec=1min 30s\n",
+            system="LoadState=loaded\nTimeoutStopUSec=1min 30s\n",
+        )
+        result = sf.check_systemd_timing_alignment(180.0)
+        assert result is not None
+        assert result["timeout_stop_sec"] == 90.0
+        assert result["mismatch"] is True
+        assert result["expected_min"] == 210.0
+
+    def test_property_order_does_not_decide_the_value(self, monkeypatch):
+        """systemd does not echo properties in the requested order."""
+        monkeypatch.setenv("INVOCATION_ID", "abc")
+        self._pretend_inside_unit(monkeypatch)
+        self._fake_systemctl(
+            monkeypatch,
+            user="LoadState=not-found\nTimeoutStopUSec=1min 30s\n",
+            system="TimeoutStopUSec=3min 30s\nLoadState=loaded\n",
+        )
+        result = sf.check_systemd_timing_alignment(180.0)
+        assert result is not None
+        assert result["timeout_stop_sec"] == 210.0
+
+    def test_a_real_user_unit_is_still_honoured(self, monkeypatch):
+        monkeypatch.setenv("INVOCATION_ID", "abc")
+        self._pretend_inside_unit(monkeypatch)
+        calls = self._fake_systemctl(
+            monkeypatch,
+            user="LoadState=loaded\nTimeoutStopUSec=4min\n",
+            system="LoadState=loaded\nTimeoutStopUSec=1min 30s\n",
+        )
+        result = sf.check_systemd_timing_alignment(180.0)
+        assert result is not None
+        assert result["timeout_stop_sec"] == 240.0
+        assert result["mismatch"] is False
+        assert len(calls) == 1  # answered by the user manager; system not asked
+
+    def test_returns_none_when_no_manager_has_the_unit(self, monkeypatch):
+        monkeypatch.setenv("INVOCATION_ID", "abc")
+        self._pretend_inside_unit(monkeypatch)
+        self._fake_systemctl(
+            monkeypatch,
+            user="LoadState=not-found\nTimeoutStopUSec=1min 30s\n",
+            system="LoadState=not-found\nTimeoutStopUSec=1min 30s\n",
+        )
+        assert sf.check_systemd_timing_alignment(180.0) is None

@@ -363,28 +363,47 @@ def check_systemd_timing_alignment(drain_timeout: float) -> Optional[Dict[str, A
     # Query systemctl for TimeoutStopUSec.  Use --user OR system depending
     # on which manager actually owns the unit.  Try user first since
     # that's the common case for hermes.
+    #
+    # ``LoadState`` is asked for in the same breath, and it is what decides
+    # whether the answer counts: ``systemctl show`` replies with built-in
+    # DEFAULTS and exit code 0 for a unit the manager does not have.  Asking
+    # the user manager about a system unit therefore returns a perfectly
+    # parseable ``TimeoutStopUSec=1min 30s`` (systemd's default) next to
+    # ``LoadState=not-found`` — so this check used to report a 90s stop
+    # timeout for a unit whose file says 210s, and warn every startup about
+    # a drain that was never at risk.  A returncode of 0 does not mean the
+    # manager knows the unit; only ``LoadState=loaded`` does.
     timeout_us: Optional[int] = None
     for flag in (["--user"], []):
         try:
             result = subprocess.run(
-                ["systemctl", *flag, "show", unit_name, "--property=TimeoutStopUSec"],
+                [
+                    "systemctl", *flag, "show", unit_name,
+                    "--property=LoadState",
+                    "--property=TimeoutStopUSec",
+                ],
                 capture_output=True, text=True, timeout=2.0,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             continue
         if result.returncode != 0:
             continue
-        # Output: "TimeoutStopUSec=1min 30s" or "TimeoutStopUSec=90000000"
+        # Collected by KEY, never by line order: systemd does not promise to
+        # echo properties in the order they were requested.
+        fields: Dict[str, str] = {}
         for line in result.stdout.splitlines():
-            if line.startswith("TimeoutStopUSec="):
-                value = line.split("=", 1)[1].strip()
-                # Try numeric microseconds first
-                if value.isdigit():
-                    timeout_us = int(value)
-                else:
-                    timeout_us = _parse_systemd_duration_to_us(value)
-                if timeout_us is not None:
-                    break
+            key, sep, value = line.partition("=")
+            if sep:
+                fields[key.strip()] = value.strip()
+        if fields.get("LoadState") != "loaded":
+            continue  # this manager is answering about a unit it doesn't have
+        # Output: "TimeoutStopUSec=1min 30s" or "TimeoutStopUSec=90000000"
+        value = fields.get("TimeoutStopUSec", "")
+        # Try numeric microseconds first
+        if value.isdigit():
+            timeout_us = int(value)
+        else:
+            timeout_us = _parse_systemd_duration_to_us(value)
         if timeout_us is not None:
             break
 
