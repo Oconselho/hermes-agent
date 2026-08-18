@@ -820,6 +820,54 @@ _DECLARED_TITLES = {
 }
 
 
+# Palavras que denunciam nome de empresa num push name do WhatsApp. Checadas
+# como PALAVRA inteira sobre o nome todo, não como pedaço: "medica" acusa
+# "Sandra - Operação Médica" sem acusar "Medina".
+#
+# ⚠️ Deliberadamente **separado** de ``contact_is_organization``. Aquele decide
+# se a recepção é avisada e se o aviso clínico dispara; alargá-lo faria um
+# paciente com "Saúde" no nome deixar de gerar aviso de agendamento. Aqui o
+# custo de um falso positivo é um pronome a menos — nada mais.
+_COMPANY_NAME_WORDS = frozenset(
+    {
+        "administracao", "administrativo", "agencia", "assessoria", "atacado",
+        "auto", "bike", "boutique", "car", "center", "centro", "comercio",
+        "comunicacao", "consultoria", "consultorio", "consultorios",
+        "contabil", "contabilidade", "corretora", "design", "digital",
+        "distribuidor", "editora", "engenharia", "escritorio", "estudio",
+        "eventos", "express", "gestao", "grafica", "grupo", "host", "imoveis",
+        "industria", "informatica", "lojao", "manutencao", "medica", "midia",
+        "monitoramento", "motos", "odonto", "operacao", "otica", "papelaria",
+        "pet", "pizzaria", "restaurante", "saude", "seguranca", "shop",
+        "sistemas", "solucoes", "supermercado", "tecnologia", "telecom",
+        "transporte", "turismo", "veiculos", "viagens",
+    }
+)
+
+
+def _name_is_company(source: Any) -> bool:
+    """Se o nome exibido é de empresa, e não de pessoa.
+
+    Regra do Victor, 18/ago/2026: **nome de empresa não recebe pronome de
+    tratamento**. "Sr. Lojão" e "Sra. Gráfica" são o que sai de tratar um
+    CNPJ como gente.
+
+    Lê só o nome que o WhatsApp mostra, nunca o corpo da mensagem — um
+    paciente pode muito bem citar uma clínica, e dizer a palavra não pode
+    transformá-lo numa.
+    """
+
+    raw = str(
+        getattr(source, "user_name", "") or getattr(source, "chat_name", "") or ""
+    )
+    if not raw.strip():
+        return False
+    if _contact_is_organization(source):
+        return True
+    words = set(_normalize(raw).replace("-", " ").replace("&", " ").split())
+    return bool(words & _COMPANY_NAME_WORDS)
+
+
 def _declared_title(source: Any) -> str | None:
     """O pronome de tratamento que o próprio contato usa, se houver."""
 
@@ -3492,10 +3540,16 @@ class WhatsAppAppointmentsHandler:
         # Consultório trata paciente por "Sr."/"Sra." — e por "Sr(a)." quando
         # o nome não decide o sexo. Ver ``treatment_title``: a dúvida vira a
         # forma neutra, nunca um palpite.
-        title = (_declared_title(source) if source is not None else None) or (
-            treatment_title(name)
-        )
-        opening = f"{greeting}, {title} {name}!" if name else f"{greeting}!"
+        title = _declared_title(source) if source is not None else None
+        if title is None and not (source is not None and _name_is_company(source)):
+            title = treatment_title(name)
+        if not name:
+            opening = f"{greeting}!"
+        elif title:
+            opening = f"{greeting}, {title} {name}!"
+        else:
+            # Empresa: o nome sai, o pronome não. Ver ``_name_is_company``.
+            opening = f"{greeting}, {name}!"
         return f"{opening} {_INITIAL_MENU_BODY}"
 
     def already_greeted(self, source: Any) -> bool:

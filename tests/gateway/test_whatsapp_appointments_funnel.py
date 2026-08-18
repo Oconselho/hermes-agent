@@ -1118,3 +1118,87 @@ def test_dona_is_a_title_and_not_the_name(tmp_path):
     )
 
     assert reply.startswith("Bom dia, Dona Luiza!")
+
+
+# --------------------------------------------------------------------------
+# Empresa não recebe pronome (18/ago/2026)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "user_name",
+    [
+        "Lojão Das Bicicletas 🚲",
+        "Gráfica Gmota Persona",
+        "Minimal Design",
+        "Bela Bike Shop",
+        "Life Consultórios Torre Londres",
+        "Conquista Administrativo",
+        "Isabela Monitoramento",
+        "Sandra - Operação Médica",
+    ],
+)
+def test_a_company_is_greeted_without_a_treatment_title(tmp_path, user_name):
+    """Regra do Victor: nome de empresa não leva Sr./Sra./Sr(a).
+
+    O nome continua saindo — o que cai é o pronome. "Sr. Lojão" é o que sai
+    de tratar um CNPJ como gente.
+    """
+
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    clock = MutableClock(datetime(2026, 8, 18, 9, 0, tzinfo=BRT))
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True}, db_path=db_path, clock=clock
+    )
+
+    reply = handler.handle(
+        event("quero agendar", message_id="m-1", user_name=user_name)
+    )
+
+    if reply is None:  # já excluído como institucional: melhor ainda
+        return
+    assert reply.startswith("Bom dia, ")
+    for title in ("Sr. ", "Sra. ", "Sr(a). "):
+        assert not reply.startswith(f"Bom dia, {title}"), reply[:60]
+
+
+def test_a_person_keeps_the_treatment_title(tmp_path):
+    """A regra da empresa não pode custar o pronome de uma pessoa."""
+
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    clock = MutableClock(datetime(2026, 8, 18, 9, 0, tzinfo=BRT))
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True}, db_path=db_path, clock=clock
+    )
+
+    reply = handler.handle(
+        event("quero agendar", message_id="m-1", user_name="Eduardo Mandelli")
+    )
+
+    assert reply.startswith("Bom dia, Sr. Eduardo!")
+
+
+def test_a_company_word_inside_a_message_never_demotes_a_patient(tmp_path):
+    """O nome exibido decide, nunca o corpo da mensagem.
+
+    Um paciente pode muito bem falar de onde trabalha; dizer a palavra não
+    pode custar a ele o tratamento. (Palavras como "laboratório" no corpo já
+    excluíam a mensagem por outra regra, anterior a esta — por isso o teste
+    usa termos que só a lista de nome de empresa conhece.)
+    """
+
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    clock = MutableClock(datetime(2026, 8, 18, 9, 0, tzinfo=BRT))
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True}, db_path=db_path, clock=clock
+    )
+
+    reply = handler.handle(
+        event(
+            "quero agendar, trabalho numa grafica e tenho um pet shop",
+            message_id="m-1",
+            user_name="Eduardo Mandelli",
+        )
+    )
+
+    assert reply.startswith("Bom dia, Sr. Eduardo!")
