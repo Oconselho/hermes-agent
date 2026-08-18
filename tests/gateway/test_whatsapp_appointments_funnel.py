@@ -21,6 +21,7 @@ from gateway.platforms.whatsapp_appointments import (
     WhatsAppAppointmentsHandler,
     _response_signature,
     classify_route,
+    treatment_title,
 )
 
 from tests.gateway.appointment_helpers import FakeFeegow, MutableClock, event
@@ -375,7 +376,9 @@ def test_the_opening_uses_the_whatsapp_contact_name(tmp_path):
 
     reply = handler.handle(event("oi", message_id="m-1", user_name="Leonardo Souza"))
 
-    assert reply.startswith("Bom dia, Leonardo!")
+    # Pronome de tratamento a partir de 17/ago/2026: consultório trata
+    # paciente por Sr./Sra., e por "Sr(a)." quando o nome não decide.
+    assert reply.startswith("Bom dia, Sr. Leonardo!")
     assert "Sou a assistente do Dr. Victor Almeida" in reply
 
 
@@ -416,7 +419,14 @@ def test_an_institutional_contact_is_not_greeted_at_all(tmp_path):
     )
 
 
-def test_a_titled_contact_is_greeted_by_the_name_not_the_title(tmp_path):
+def test_a_titled_contact_keeps_the_title_they_chose(tmp_path):
+    """"Dra. Marina" tratada por "Sra. Marina" seria uma demotion.
+
+    O nome do WhatsApp é escrito pelo próprio contato: quando ele traz o
+    título, não há nada a adivinhar. O nome continua sendo o nome, nunca o
+    título — era o que este teste garantia antes e continua garantindo.
+    """
+
     db_path = tmp_path / "state" / "appointments.sqlite3"
     clock = MutableClock(datetime(2026, 8, 13, 14, 0, tzinfo=BRT))
     handler = WhatsAppAppointmentsHandler(
@@ -424,7 +434,7 @@ def test_a_titled_contact_is_greeted_by_the_name_not_the_title(tmp_path):
     )
 
     reply = handler.handle(event("oi", message_id="m-1", user_name="Dra. Marina Alves"))
-    assert reply.startswith("Boa tarde, Marina!")
+    assert reply.startswith("Boa tarde, Dra. Marina!")
 
 
 @pytest.mark.parametrize(
@@ -950,6 +960,89 @@ def test_the_identity_header_does_not_hide_a_repetition():
     assert _response_signature(cold) != _response_signature("Informe o CPF.")
 
 
+# --------------------------------------------------------------------------
+# Pronome de tratamento (17/ago/2026)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("Eduardo", "Sr."),
+        ("Diego", "Sr."),
+        ("Carlos", "Sr."),
+        ("Edimilson", "Sr."),
+        ("Milton", "Sr."),
+        ("Samuel", "Sr."),
+        ("Djalma", "Sr."),
+        ("Aline", "Sra."),
+        ("Daniela", "Sra."),
+        ("Rosangela", "Sra."),
+        ("Thais", "Sra."),
+        ("Isabel", "Sra."),
+        ("Socorro", "Sra."),
+        # Nomes que o Brasil usa para os dois sexos: nunca um palpite.
+        ("Alex", "Sr(a)."),
+        ("Ariel", "Sr(a)."),
+        ("Darci", "Sr(a)."),
+        ("Marion", "Sr(a)."),
+        ("Arlen", "Sr(a)."),
+        # Iniciais e restos ilegíveis descem para o neutro.
+        ("Jo", "Sr(a)."),
+        ("", "Sr(a)."),
+        (None, "Sr(a)."),
+    ],
+)
+def test_treatment_title_never_guesses(name, expected):
+    assert treatment_title(name) == expected
+
+
+def test_the_opening_addresses_the_patient_formally(tmp_path):
+    """Regra do Victor: consultório trata paciente por Sr./Sra."""
+
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    clock = MutableClock(datetime(2026, 8, 17, 18, 25, tzinfo=BRT))
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True}, db_path=db_path, clock=clock
+    )
+
+    reply = handler.handle(
+        event("quero agendar", message_id="m-1", user_name="Eduardo Mandelli")
+    )
+
+    assert reply.startswith("Boa noite, Sr. Eduardo!")
+
+
+def test_an_undecidable_name_is_addressed_neutrally(tmp_path):
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    clock = MutableClock(datetime(2026, 8, 17, 9, 0, tzinfo=BRT))
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True}, db_path=db_path, clock=clock
+    )
+
+    reply = handler.handle(
+        event("quero agendar", message_id="m-1", user_name="Ariel Souza")
+    )
+
+    assert reply.startswith("Bom dia, Sr(a). Ariel!")
+
+
+def test_a_nameless_contact_is_still_greeted(tmp_path):
+    """Sem nome não há pronome — a saudação não pode virar "Bom dia, Sr(a).!"."""
+
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    clock = MutableClock(datetime(2026, 8, 17, 9, 0, tzinfo=BRT))
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True}, db_path=db_path, clock=clock
+    )
+
+    reply = handler.handle(
+        event("quero agendar", message_id="m-1", user_name="+55 71 9999-9999")
+    )
+
+    assert reply.startswith("Bom dia! Sou a assistente")
+
+
 def test_silence_does_not_chain_past_the_window(tmp_path):
     """A âncora é o que está na tela, não o que ficou gravado.
 
@@ -993,3 +1086,35 @@ def test_a_silenced_message_stays_silent_on_redelivery(tmp_path):
 
     clock.value += timedelta(seconds=1)
     assert handler.handle(event("E renovar a receita", message_id="m-2")) is SILENCE
+
+
+def test_a_job_title_is_not_a_name(tmp_path):
+    """"vendedora Mariana" era cumprimentada como "Sra. Vendedora"."""
+
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    clock = MutableClock(datetime(2026, 8, 17, 9, 0, tzinfo=BRT))
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True}, db_path=db_path, clock=clock
+    )
+
+    reply = handler.handle(
+        event("quero agendar", message_id="m-1", user_name="vendedora Mariana")
+    )
+
+    assert reply.startswith("Bom dia! Sou a assistente")
+
+
+def test_dona_is_a_title_and_not_the_name(tmp_path):
+    """"Dona Luiza" era lida como o nome "Dona"."""
+
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    clock = MutableClock(datetime(2026, 8, 17, 9, 0, tzinfo=BRT))
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True}, db_path=db_path, clock=clock
+    )
+
+    reply = handler.handle(
+        event("quero agendar", message_id="m-1", user_name="Dona Luiza")
+    )
+
+    assert reply.startswith("Bom dia, Dona Luiza!")

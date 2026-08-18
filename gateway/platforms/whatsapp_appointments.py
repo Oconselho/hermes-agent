@@ -34,6 +34,7 @@ __all__ = [
     "filter_eligible_slots",
     "is_valid_cpf",
     "run_appointment_watcher",
+    "treatment_title",
     "SILENCE",
 ]
 
@@ -676,8 +677,161 @@ _NON_PERSON_NAME_MARKERS = (
     "financeiro", "hospital", "imobiliaria", "lab", "laboratorio", "loja",
     "ltda", "marketing", "me", "mei", "oficial", "ortopedia", "recepcao",
     "rh", "sa", "salao", "seguros", "servicos", "suporte", "telemedicina",
-    "vendas",
+    "vendas", "vendedor", "vendedora",
 )
+
+
+# ---------------------------------------------------------------------------
+# Pronome de tratamento
+# ---------------------------------------------------------------------------
+#
+# Consultório de médico trata paciente por "Sr." e "Sra.". Regra do Victor
+# (17/ago/2026): reconhecendo o sexo pelo nome, use o pronome; não
+# reconhecendo com clareza, use "Sr(a).". A ordem das três decisões importa —
+# errar o pronome de uma pessoa é pior do que não arriscar, então a dúvida
+# sempre vence e desce para a forma neutra.
+TREATMENT_MALE = "Sr."
+TREATMENT_FEMALE = "Sra."
+TREATMENT_UNKNOWN = "Sr(a)."
+
+# Nomes que o Brasil usa para os dois sexos. Ficam aqui para vencerem as
+# regras de terminação: sem esta lista, "Darci" cairia num palpite.
+_AMBIGUOUS_FIRST_NAMES = frozenset(
+    {
+        "alex", "ariel", "ary", "darci", "darcy", "duda", "eli", "elis",
+        "iraci", "iran", "ivani", "jaci", "jacy", "lindomar", "marion",
+        "nadir", "neri", "remi", "reni", "rian", "sol", "val", "wal",
+    }
+)
+
+# Termina em "a" e é masculino — a exceção que a regra de terminação não vê.
+_MALE_NAMES_ENDING_IN_A = frozenset(
+    {"djalma", "jeova", "juca", "luca", "neca", "nicola", "ubirajara", "zeca"}
+)
+
+# Termina em "o" e é feminino. Poucos, quase todos de devoção mariana.
+_FEMALE_NAMES_ENDING_IN_O = frozenset(
+    {"amparo", "carmo", "consuelo", "rosario", "socorro"}
+)
+
+_MALE_FIRST_NAMES = frozenset(
+    {
+        "abel", "adriel", "airton", "alan", "albert", "alcides", "alef",
+        "aluisio", "amauri", "andre", "antenor", "arthur", "artur", "ataide",
+        "breno", "cesar", "cleber", "cristian", "daniel", "dante", "davi",
+        "david", "denis", "dennis", "dimas", "douglas", "edgar", "edmar",
+        "elder", "elias", "emanuel", "erick", "eric", "euclides", "ezequiel",
+        "felipe", "felix", "filipe", "gabriel", "gilmar", "giovanni",
+        "guilherme", "heitor", "henrique", "hermes", "iago", "igor", "ismael",
+        "israel", "itamar", "ivan", "jacques", "jader", "jaime", "jair",
+        "jean", "joao", "joaquim", "joel", "jonas", "jonathan", "jorge",
+        "jose", "josue", "juan", "kaique", "kevin", "levi", "lincoln",
+        "lourival", "lucas", "luis", "luiz", "manoel", "manuel", "marcel",
+        "marcus", "martim", "matheus", "mateus", "michel", "miguel", "moacir",
+        "moises", "natal", "nestor", "noel", "oscar", "osmar", "percival",
+        "philipe", "pierre", "rafael", "raul", "ramon", "renan", "richard",
+        "romeu", "roney", "ruan", "rubens", "rui", "ruy", "samuel",
+        "sebastiao", "silas", "simao", "tadeu", "thales", "talles", "thomas",
+        "tobias", "tomas", "valdemar", "valdir", "valter", "vanderlei",
+        "vicente", "victor", "vinicius", "vitor", "wagner", "waldir",
+        "wallace", "walter", "wanderley", "welington", "wellington",
+        "wesley", "yuri",
+        # Vistos na agenda real da clínica (replay de 17/ago/2026).
+        "ademir", "aldair", "alexandre", "almir", "clemente", "duarte",
+        "eron", "franklin", "genival", "josimar", "marconi", "ricky",
+        "sidnei", "ulisses", "valmir", "valner",
+    }
+)
+
+_FEMALE_FIRST_NAMES = frozenset(
+    {
+        "abigail", "agnes", "alice", "aline", "amelie", "beatrice", "carmen",
+        "caroline", "cecile", "celeste", "charlene", "clarice", "cleide",
+        "cloe", "conceicao", "cristiane", "daniele", "darlene", "denise",
+        "dulce", "edite", "elaine", "eliane", "elisabete", "elizabete",
+        "elizabeth", "ellen", "eloise", "emilie", "ester", "esther", "eunice",
+        "evelyn", "fabiane", "flor", "florence", "franciele", "gabriele",
+        "gisele", "giselle", "gleide", "grace", "greice", "ines", "ingrid",
+        "irene", "iris", "isabel", "isabelle", "ivone", "jaqueline",
+        "jennifer", "josiane", "jucilene", "judite", "juliane", "karen",
+        "karine", "kelly", "laine", "lais", "leide", "leni", "liliane",
+        "lourdes", "luciene", "lucimar", "madalene", "marcele", "margarete",
+        "mariane", "marilene", "marilyn", "marlene", "marli", "mercedes",
+        "michele", "michelle", "miriam", "mirian", "monique", "nadja",
+        "natalie", "neide", "nicole", "nilce", "noemi", "odete", "patricie",
+        "rachel", "raquel", "regiane", "rosane", "roseane", "roselene",
+        "rosemeire", "roseli", "rosilene", "ruth", "scheila", "selene",
+        "sheila", "silvane", "simone", "solange", "sueli", "suely", "suzane",
+        "tais", "tatiane", "thais", "valdirene", "viviane", "viviani",
+        "yasmin",
+        # Vistos na agenda real da clínica (replay de 17/ago/2026).
+        "adalice", "arielle", "dafne", "dirce", "doralice", "emily",
+        "ivanete", "ivete", "liz", "mariluce", "mary", "nice", "rose",
+        "sirlene", "suelen", "zenaide",
+    }
+)
+
+
+def treatment_title(first_name: Any) -> str:
+    """"Sr.", "Sra." ou "Sr(a)." — nesta ordem de certeza decrescente.
+
+    Falha para o neutro, sempre. "Sr(a). Ariel" é uma formalidade correta;
+    "Sra. Ariel" para um homem é um erro que a pessoa lê como desatenção, e
+    do lado de cá não há nada que desfaça. Por isso a lista de nomes
+    ambíguos é consultada ANTES das terminações: ela existe justamente para
+    impedir que um palpite morfológico atropele um nome que o Brasil usa
+    para os dois sexos.
+
+    A morfologia entra só depois das listas e só nas terminações que o
+    português brasileiro resolve sozinho — "-a" feminino, "-o"/"-os"
+    masculino, "-son"/"-ton" masculino —, cada uma com as suas exceções
+    conhecidas. Qualquer outra terminação não é palpite: é "Sr(a).".
+    """
+
+    name = _normalize(first_name)
+    if not name or len(name) < 3:
+        return TREATMENT_UNKNOWN
+    if name in _AMBIGUOUS_FIRST_NAMES:
+        return TREATMENT_UNKNOWN
+    if name in _MALE_FIRST_NAMES or name in _MALE_NAMES_ENDING_IN_A:
+        return TREATMENT_MALE
+    if name in _FEMALE_FIRST_NAMES or name in _FEMALE_NAMES_ENDING_IN_O:
+        return TREATMENT_FEMALE
+    if name.endswith("a"):
+        return TREATMENT_FEMALE
+    if name.endswith("o") or name.endswith("os"):
+        return TREATMENT_MALE
+    if name.endswith("son") or name.endswith("ton"):
+        return TREATMENT_MALE
+    return TREATMENT_UNKNOWN
+
+
+# O que o próprio contato escreveu antes do nome, no nome que ele mesmo
+# configurou no WhatsApp. "Dra. Marina" tratada por "Sra. Marina" é uma
+# demotion que numa clínica se nota — e aqui não há palpite nenhum a fazer:
+# o título veio da pessoa.
+_DECLARED_TITLES = {
+    "dr": "Dr.",
+    "dra": "Dra.",
+    "dona": "Dona",
+    "sr": "Sr.",
+    "sra": "Sra.",
+    "srta": "Srta.",
+}
+
+
+def _declared_title(source: Any) -> str | None:
+    """O pronome de tratamento que o próprio contato usa, se houver."""
+
+    raw = str(
+        getattr(source, "user_name", "") or getattr(source, "chat_name", "") or ""
+    ).strip()
+    if not raw:
+        return None
+    parts = raw.split()
+    if len(parts) < 2:
+        return None
+    return _DECLARED_TITLES.get(_normalize(parts[0]).rstrip("."))
 
 
 def _contact_first_name(source: Any) -> str | None:
@@ -705,7 +859,7 @@ def _contact_first_name(source: Any) -> str | None:
         return None
     first = raw.split()[0].strip(".,;:!?")
     # "Dr", "Dra", "Sr" and friends title someone else — skip to the name.
-    if _normalize(first).rstrip(".") in {"dr", "dra", "sr", "sra", "srta"}:
+    if _normalize(first).rstrip(".") in _DECLARED_TITLES:
         parts = raw.split()
         if len(parts) < 2:
             return None
@@ -3335,7 +3489,13 @@ class WhatsAppAppointmentsHandler:
 
         greeting = _time_greeting(self._now())
         name = _contact_first_name(source) if source is not None else None
-        opening = f"{greeting}, {name}!" if name else f"{greeting}!"
+        # Consultório trata paciente por "Sr."/"Sra." — e por "Sr(a)." quando
+        # o nome não decide o sexo. Ver ``treatment_title``: a dúvida vira a
+        # forma neutra, nunca um palpite.
+        title = (_declared_title(source) if source is not None else None) or (
+            treatment_title(name)
+        )
+        opening = f"{greeting}, {title} {name}!" if name else f"{greeting}!"
         return f"{opening} {_INITIAL_MENU_BODY}"
 
     def already_greeted(self, source: Any) -> bool:
