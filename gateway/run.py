@@ -125,28 +125,13 @@ def _whatsapp_silent_agent_result() -> Dict[str, Any]:
 # line prepended by the finalizer, one raw — while the 83 exactly-spelled ones
 # were suppressed correctly.
 #
-# Match the whole reply only. A response that merely mentions the word in a
-# sentence is real text and must be delivered untouched; silence is the right
-# outcome only when the marker IS the entire message.
-_WHATSAPP_SILENCE_MARKER_RE = re.compile(
-    r"^[\[\{\(<*_\s]*silencios[oa][\]\}\)>*_\s]*[.!]*$",
-    re.IGNORECASE,
+# The recogniser lives in ``gateway.response_filters`` so that this finalizer
+# and the WhatsApp adapter's outbound backstop ask the SAME question. Two
+# spellings of "is this the marker?" is how it reached contacts twice; the
+# alias keeps the long-standing private name importable.
+from gateway.response_filters import (  # noqa: E402
+    is_whatsapp_silence_marker as _whatsapp_is_silence_marker,
 )
-
-
-def _whatsapp_is_silence_marker(text: Any) -> bool:
-    """True when a WhatsApp reply is only the model's stay-silent marker."""
-    if not text:
-        return False
-    candidate = unicodedata.normalize("NFKD", str(text))
-    candidate = "".join(ch for ch in candidate if not unicodedata.combining(ch))
-    # Strip the invisible/odd-space classes the transport strips anyway, so a
-    # zero-width character cannot smuggle the marker past this check.
-    candidate = re.sub(r"[\u200b\u2060\u2063\ufeff]", "", candidate)
-    candidate = re.sub(
-        r"[\u00a0\u1680\u180e\u2000-\u200a\u202f\u205f\u3000]", " ", candidate
-    )
-    return bool(_WHATSAPP_SILENCE_MARKER_RE.match(candidate.strip()))
 
 
 # A WhatsApp patient often sends an attachment, its caption, and a short
@@ -1830,6 +1815,30 @@ def _sanitize_gateway_final_response(
     if _looks_like_gateway_provider_error(redacted):
         return _gateway_provider_error_reply(redacted)
     return redacted
+
+
+def _queued_followup_resend_text(platform: Any, raw: Any) -> str:
+    """The text to resend before processing a queued follow-up message.
+
+    The agent-result dict carries the model's **raw** reply. The delivery path
+    sanitizes its own local copy, so a resend that reads the dict bypasses
+    every outbound guard — secret redaction and provider-error rewriting
+    included.
+
+    A stay-silent marker is the visible half of that bypass.
+    ``StreamConsumer._suppress_silence_marker`` leaves the delivery flags False
+    on purpose ("nothing was delivered"), so intentional silence *always* looks
+    like an unconfirmed delivery to the resend, which then put a raw
+    ``[SILENCIOSO]`` on the contact's screen — six times between 03 and
+    18/ago/2026, the last three to a partner clinic in one burst of images.
+
+    Returns ``""`` when there is nothing to deliver, so the caller's existing
+    truthiness check on the text is enough to skip the send.
+    """
+
+    if not raw:
+        return ""
+    return _sanitize_gateway_final_response(platform, str(raw)) or ""
 
 
 # Canned institutional replies that ``_sanitize_gateway_final_response`` returns
@@ -22624,12 +22633,23 @@ REGRAS ABSOLUTAS:
                         except Exception as e:
                             logger.debug("Stream consumer wait before queued message failed: %s", e)
                     _previewed = bool(result.get("response_previewed"))
-                    first_response = result.get("final_response", "")
+                    _raw_first_response = result.get("final_response", "")
                     _already_streamed = _stream_confirmed_final_delivery(
                         _sc,
-                        first_response,
+                        _raw_first_response,
                         previewed=_previewed,
                     )
+                    # Sanitize exactly as the delivery path does — this branch
+                    # reads the raw dict, so without this a stay-silent marker
+                    # went straight to the contact.
+                    first_response = _queued_followup_resend_text(
+                        source.platform, _raw_first_response,
+                    )
+                    if _raw_first_response and not first_response:
+                        logger.info(
+                            "Queued follow-up for session %s: stay-silent marker withheld instead of resent.",
+                            session_key or "?",
+                        )
                     if first_response and not _already_streamed:
                         try:
                             logger.info(

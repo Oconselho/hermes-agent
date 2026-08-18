@@ -7,6 +7,7 @@ conversation history.
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from typing import Any
 
@@ -51,6 +52,44 @@ def _canonical_silence_candidates(text: str) -> tuple[str, ...]:
         return (exact,)
     fallback = _canonical_silence_candidate(stripped)
     return (exact, fallback)
+
+
+# ---------------------------------------------------------------------------
+# The WhatsApp stay-silent marker
+# ---------------------------------------------------------------------------
+#
+# The secretary's prompt asks for a bare ``[SILENCIOSO]`` — Portuguese, and NOT
+# a member of ``LIVE_GATEWAY_SILENT_MARKERS`` above, which holds the
+# platform-neutral tokens.  It lives here, next to them, because it has now
+# reached real contacts twice by two different roads, and both times a second
+# copy of "is this the marker?" was part of the story: once because a literal
+# string comparison missed ``[ SILENCIOSO ]`` (four patients, 09–11/ago/2026),
+# once because a resend path never asked at all (six messages, 03–18/ago/2026).
+# One recogniser, imported by everyone who needs it — the gateway finalizer and
+# the WhatsApp adapter's outbound backstop — cannot drift.
+
+# Match the whole reply only. A response that merely mentions the word in a
+# sentence is real text and must be delivered untouched; silence is the right
+# outcome only when the marker IS the entire message.
+_WHATSAPP_SILENCE_MARKER_RE = re.compile(
+    r"^[\[\{\(<*_\s]*silencios[oa][\]\}\)>*_\s]*[.!]*$",
+    re.IGNORECASE,
+)
+
+
+def is_whatsapp_silence_marker(text: Any) -> bool:
+    """True when a WhatsApp reply is only the model's stay-silent marker."""
+    if not text:
+        return False
+    candidate = unicodedata.normalize("NFKD", str(text))
+    candidate = "".join(ch for ch in candidate if not unicodedata.combining(ch))
+    # Strip the invisible/odd-space classes the transport strips anyway, so a
+    # zero-width character cannot smuggle the marker past this check.
+    candidate = re.sub(r"[\u200b\u2060\u2063\ufeff]", "", candidate)
+    candidate = re.sub(
+        r"[\u00a0\u1680\u180e\u2000-\u200a\u202f\u205f\u3000]", " ", candidate
+    )
+    return bool(_WHATSAPP_SILENCE_MARKER_RE.match(candidate.strip()))
 
 
 def is_intentional_silence_response(response: Any) -> bool:

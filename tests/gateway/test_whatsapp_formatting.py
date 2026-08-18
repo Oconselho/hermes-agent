@@ -360,3 +360,94 @@ class TestWhatsAppTier:
     def test_whatsapp_tool_progress_is_new(self):
         from gateway.display_config import resolve_display_setting
         assert resolve_display_setting({}, "whatsapp", "tool_progress") == "new"
+
+
+# ---------------------------------------------------------------------------
+# send() outbound backstop: the stay-silent marker never reaches the bridge
+# ---------------------------------------------------------------------------
+
+class TestSendSilenceMarkerBackstop:
+    """The marker has escaped to real contacts twice, by two different roads.
+
+    09–11/ago/2026: a literal comparison upstream missed ``[ SILENCIOSO ]`` and
+    four patients received it. 03–18/ago/2026: a queued-follow-up resend read
+    the raw agent dict and never asked at all — six messages to three contacts,
+    the last three to a partner clinic mid-burst.
+
+    Both upstream fixes were right, and neither could have stopped the other's
+    road. So the question is asked again here, at the one point every road ends.
+    """
+
+    MARKERS = [
+        "[SILENCIOSO]",
+        "[ SILENCIOSO ]",
+        "[silencioso]",
+        "SILENCIOSO",
+        "**[SILENCIOSO]**",
+        "[ SILENCIÓSO ]",
+        "\n[SILENCIOSO]\n",
+        "[SILENCIOSO].",
+    ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("marker", MARKERS)
+    async def test_marker_never_reaches_the_bridge(self, marker):
+        adapter = _make_adapter()
+        resp = MagicMock(status=200)
+        resp.json = AsyncMock(return_value={"messageId": "msg1"})
+        adapter._http_session.post = MagicMock(return_value=_AsyncCM(resp))
+
+        result = await adapter.send("chat1", marker)
+
+        assert adapter._http_session.post.call_count == 0, "marker hit the bridge"
+        # Same contract as empty content: nothing sent is not a failure, or
+        # callers would treat the silence as an error and retry it.
+        assert result.success
+        assert result.message_id is None
+
+    @pytest.mark.asyncio
+    async def test_the_message_rapidoc_received_is_blocked(self):
+        """Regression pin: 18/ago/2026, 14:02/14:05/14:08 BRT."""
+        adapter = _make_adapter()
+        adapter._http_session.post = MagicMock()
+        result = await adapter.send("197147773423692@lid", "[SILENCIOSO]")
+        assert adapter._http_session.post.call_count == 0
+        assert result.success
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("text", [
+        "Bom dia. Aqui é a assistente do Dr. Victor Almeida.",
+        "O exame precisa ser feito em ambiente silencioso.",
+        "Prefere um horário mais silencioso, no início da manhã?",
+        "Aqui é a assistente do Dr. Victor. [SILENCIOSO] não é para você ver.",
+    ])
+    async def test_real_text_still_goes_out(self, text):
+        """The opposite failure costs more: a real reply swallowed is a patient
+        left unanswered. Only a message that IS the marker is blocked.
+        """
+        adapter = _make_adapter()
+        resp = MagicMock(status=200)
+        resp.json = AsyncMock(return_value={"messageId": "msg1"})
+        adapter._http_session.post = MagicMock(return_value=_AsyncCM(resp))
+
+        result = await adapter.send("chat1", text)
+
+        assert result.success
+        assert adapter._http_session.post.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_the_block_is_logged_loudly(self, caplog):
+        """A silent backstop teaches nothing. The next new road must be visible
+        in the log the moment it appears, instead of years later in a patient's
+        screenshot.
+        """
+        import logging as _logging
+
+        adapter = _make_adapter()
+        adapter._http_session.post = MagicMock()
+        with caplog.at_level(_logging.WARNING):
+            await adapter.send("chat1", "[SILENCIOSO]")
+        assert any(
+            "Blocked stay-silent marker" in r.getMessage()
+            for r in caplog.records
+        ), "the backstop must say so at WARNING level"

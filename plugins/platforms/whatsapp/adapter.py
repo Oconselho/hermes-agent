@@ -32,6 +32,7 @@ from hermes_constants import (
     get_hermes_dir,
     with_hermes_node_path,
 )
+from gateway.response_filters import is_whatsapp_silence_marker
 from gateway.whatsapp_passive_monitor import (
     PassiveMessageStore,
     is_monitored_group,
@@ -877,6 +878,29 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             return SendResult(success=False, error=bridge_exit)
 
         if not content or not content.strip():
+            return SendResult(success=True, message_id=None)
+
+        # Last gate before the bridge: the model's stay-silent marker is an
+        # instruction to the gateway, never text for a contact. The gateway
+        # finalizer already drops it, but it has now escaped by two separate
+        # roads — a literal comparison that missed ``[ SILENCIOSO ]`` (four
+        # patients, 09–11/ago/2026) and a queued-follow-up resend that read the
+        # raw agent dict and never asked (six messages to three contacts,
+        # 03–18/ago/2026, the last three to a partner clinic). Both fixes were
+        # correct and neither could stop the other's road, so the check also
+        # lives HERE, where every road ends.
+        #
+        # ``success=True`` with no message id matches the empty-content
+        # contract just above: nothing was sent, and that is not a failure —
+        # callers must not read it as one and retry.
+        if is_whatsapp_silence_marker(content):
+            logger.warning(
+                "[Whatsapp] Blocked stay-silent marker at the outbound "
+                "boundary (chat=%s, text=%r). The marker should have been "
+                "dropped upstream — this line means a delivery path reached "
+                "the adapter without passing the gateway finalizer.",
+                chat_id, content[:40],
+            )
             return SendResult(success=True, message_id=None)
 
         chat_id = to_whatsapp_jid(chat_id)
