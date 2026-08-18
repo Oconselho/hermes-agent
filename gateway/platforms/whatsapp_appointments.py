@@ -34,9 +34,35 @@ __all__ = [
     "filter_eligible_slots",
     "is_valid_cpf",
     "run_appointment_watcher",
+    "SILENCE",
 ]
 
 logger = logging.getLogger(__name__)
+
+
+class _Silence(str):
+    """O funil atendeu a mensagem e responde nada, de propósito.
+
+    Um paciente que escreve o mesmo pedido em duas linhas seguidas —
+    "Temos que marcar uma consulta nova" e, cinco segundos depois, "E renovar
+    a receita" (17/ago/2026) — recebia o mesmo menu duas vezes, porque cada
+    mensagem entra no fluxo sozinha e cada uma produzia a sua resposta. A
+    resposta que já está na tela dele responde as duas.
+
+    É subclasse de ``str`` e vazia para que um chamador que não conheça o
+    sentinela degrade para "resposta vazia" em vez de estourar num objeto
+    solto. Quem sabe distinguir usa identidade: ``resposta is SILENCE``.
+    ``gateway.run`` faz exatamente isso e devolve ``""`` — o contrato de
+    "não envie nada" que aquele arquivo já usa nas duas supressões vizinhas.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - auxílio de depuração
+        return "<whatsapp_appointments.SILENCE>"
+
+
+SILENCE = _Silence()
 
 
 _BRT = ZoneInfo("America/Bahia")
@@ -873,6 +899,52 @@ class AppointmentStore:
 
         with self._connect() as connection:
             connection.execute("DELETE FROM flow_states WHERE chat_key = ?", (chat_key,))
+
+    def last_response(self, chat_key: str) -> tuple[str, str] | None:
+        """A última resposta que o paciente REALMENTE viu, e quando.
+
+        ``inbox_events`` é o único lugar onde o que o funil DISSE fica
+        gravado — ``flow_states`` guarda o estado, não o texto. É por isso
+        que a checagem de repetição lê daqui: sem ela, o fluxo não tem como
+        saber que a mensagem que vai mandar agora é a que já está na tela.
+
+        Ignora as linhas em branco de propósito. Uma resposta suprimida fica
+        gravada como texto vazio (``mark_silenced``), e ancorar a janela nela
+        encadearia silêncio: cada mensagem nova compararia com a anterior
+        suprimida, e a conversa poderia ficar muda por muito mais tempo do
+        que a janela — visto no replay de 17/ago/2026, onde um "Preciso de
+        urgência" caía num silêncio ancorado 6 minutos antes. A âncora tem
+        que ser o que está na tela.
+
+        Ordena por ``handled_at`` e desempata por ``rowid`` porque duas
+        mensagens de uma mesma rajada podem cair no mesmo segundo.
+        """
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT response, handled_at FROM inbox_events"
+                " WHERE chat_key = ? AND response <> ''"
+                " ORDER BY handled_at DESC, rowid DESC LIMIT 1",
+                (chat_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return str(row[0]), str(row[1])
+
+    def mark_silenced(self, message_id: str) -> None:
+        """Marca uma entrada tratada como "respondida com silêncio".
+
+        A linha continua existindo — é ela que impede a redelivery de
+        responder de novo —, mas com o texto em branco, porque nada foi para
+        a tela do paciente. É o que faz ``last_response`` e a redelivery
+        contarem a mesma história.
+        """
+
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE inbox_events SET response = '' WHERE message_id = ?",
+                (message_id,),
+            )
 
     # ------------------------------------------------------------------
     # CRM funnel
@@ -2335,6 +2407,47 @@ def _normalize(value: Any) -> str:
     return " ".join(without_marks.split())
 
 
+# A abertura fria carrega saudação, nome e identificação antes do corpo da
+# mensagem; a reentrada carrega só o corpo. São a MESMA resposta para quem
+# lê o WhatsApp, e é por isso que a comparação byte a byte não bastava: o
+# menu que o Eduardo recebeu duas vezes em seis segundos diferia exatamente
+# nestes 44 caracteres de cabeçalho.
+_IDENTITY_OPENING_RE = re.compile(
+    r"^[^\n]{0,80}?sou a assistente do dr\.?\s*victor almeida[.!]?\s*",
+    re.IGNORECASE,
+)
+
+
+# A linha que fecha os dois menus numerados — e só eles. É o que marca uma
+# resposta como *prompt parado na tela*: a secretária já perguntou e está
+# esperando um número. Reimprimir isso não informa nada.
+#
+# Uma recusa ("CPF inválido."), uma lista de horários, uma confirmação ou a
+# saída para a recepção não carregam esta linha, e é de propósito: elas são
+# resposta a uma tentativa do paciente, e calar sobre uma tentativa é lido
+# como sistema fora do ar, não como "já respondi".
+_STANDING_PROMPT_MARKER = "Responda com o número da opção desejada."
+
+
+def _is_standing_prompt(text: Any) -> bool:
+    """Se a resposta é um menu numerado à espera de uma escolha."""
+
+    return _STANDING_PROMPT_MARKER in str(text or "")
+
+
+def _response_signature(text: Any) -> str:
+    """O que uma resposta *diz*, sem o cabeçalho de quem a diz.
+
+    Serve a uma única pergunta: "isto é a mesma coisa que eu acabei de
+    mandar?". Descarta a apresentação inicial, acentos, caixa e espaço, e
+    devolve o resto. Duas respostas com a mesma assinatura são, para o
+    paciente, a mesma mensagem repetida.
+    """
+
+    stripped = _IDENTITY_OPENING_RE.sub("", str(text or "").strip())
+    return _normalize(stripped)
+
+
 def _digits(value: Any) -> str:
     return "".join(re.findall(r"\d", str(value or "")))
 
@@ -3007,6 +3120,13 @@ class WhatsAppAppointmentsHandler:
         self._handoff_reentry_seconds = max(
             0, int(settings.get("handoff_reentry_minutes", 30)) * 60
         )
+        # Quanto tempo uma resposta continua valendo como "já dita". Curto de
+        # propósito: cobre a rajada — o paciente que quebra um pedido em duas
+        # ou três linhas — sem calar para quem volta minutos depois sem ter
+        # entendido, que aí merece o menu de novo. Zero desliga a supressão.
+        self._repeat_window_seconds = max(
+            0, int(settings.get("repeat_window_seconds", 120))
+        )
         self._flow_retention_days = max(
             1, int(settings.get("flow_retention_days", 30))
         )
@@ -3477,7 +3597,11 @@ class WhatsAppAppointmentsHandler:
         message_id = _event_identity(incoming, chat_key)
         prior = store.inbox_response(message_id)
         if prior is not None:
-            return prior
+            # Em branco significa "esta mensagem já foi respondida com
+            # silêncio" (ver ``mark_silenced``). Reentregá-la tem que repetir
+            # o silêncio, não devolver uma resposta vazia — que ``gateway.run``
+            # transformaria num aviso de erro para o paciente.
+            return prior if prior else SILENCE
 
         if flow is None:
             # A cold open re-introduces the secretary. ``greeting_ttl_hours``
@@ -3545,13 +3669,40 @@ class WhatsAppAppointmentsHandler:
                 return self._handoff(store, message_id, chat_key)
 
         text = str(getattr(incoming, "text", "") or "").strip()
+        # Lido antes de responder: depois da gravação a "última resposta"
+        # deste chat passa a ser justamente a que estamos avaliando.
         try:
-            return self._advance(store, flow, message_id, chat_key, text)
+            last_reply = store.last_response(chat_key)
+        except Exception:
+            logger.warning("last reply lookup failed", exc_info=True)
+            last_reply = None
+        try:
+            reply = self._advance(store, flow, message_id, chat_key, text)
         except Exception:
             logger.warning(
                 "appointment flow failed; reception notified", exc_info=True
             )
             return self._handoff(store, message_id, chat_key)
+        if self._is_immediate_repeat(store, chat_key, reply, flow, last_reply, route):
+            try:
+                store.mark_silenced(message_id)
+            except Exception:
+                # Sem a marca o silêncio ainda acontece; o que se perde é a
+                # âncora, e a próxima mensagem pode ser silenciada de novo.
+                # Não é motivo para responder repetido agora.
+                logger.warning("silenced reply could not be marked", exc_info=True)
+            logger.info(
+                "appointment flow: reply already on screen for this chat, "
+                "staying silent instead of repeating it"
+            )
+            return SILENCE
+        if isinstance(reply, str) and not reply:
+            # Uma resposta vazia vinda do fluxo só pode ser silêncio: virou o
+            # significado desse valor. Deixá-la sair alcançaria
+            # ``_normalize_empty_agent_response`` e o paciente leria "sua
+            # mensagem não foi processada" por um erro que não é dele.
+            return SILENCE
+        return reply
 
     def _track_lead(
         self,
@@ -3612,6 +3763,67 @@ class WhatsAppAppointmentsHandler:
             data,
             now=self._now(),
         )
+
+    def _is_immediate_repeat(
+        self,
+        store: AppointmentStore,
+        chat_key: str,
+        reply: Any,
+        before: FlowSnapshot | None,
+        last: tuple[str, str] | None,
+        route: Route,
+    ) -> bool:
+        """Se esta resposta é a anterior dita outra vez, sem nada ter mudado.
+
+        Cinco condições, todas obrigatórias:
+
+        1. A mensagem não é um pedido explícito de agendamento. Calar sobre
+           "quero agendar" seria calar sobre a única coisa que este fluxo
+           existe para atender, custe o que custar em repetição.
+        2. A resposta é um menu numerado — um prompt parado na tela, não uma
+           recusa nem um resultado. Ver ``_is_standing_prompt``: dois CPFs
+           inválidos seguidos ouvem "CPF inválido." duas vezes, de propósito,
+           porque cada um é uma tentativa nova do paciente.
+        3. O estado do fluxo não mudou com esta mensagem.
+        4. Os dados do passo não mudaram — o passo continua onde estava, com
+           o que tinha. Silenciar uma mudança de estado esconderia do paciente
+           que a escolha dele foi aceita, o que é pior do que repetir.
+        5. O que seria dito agora é, para quem lê, o que já está na tela — e
+           foi dito há pouco (``repeat_window_seconds``).
+
+        Roda DEPOIS da gravação, de propósito: a mensagem fica marcada como
+        tratada e o estado do fluxo é exatamente o que seria. O que muda é só
+        o envio.
+
+        Melhor esforço: qualquer falha de leitura responde "não é repetição"
+        e a mensagem sai. O custo de errar para este lado é uma repetição; do
+        outro lado é um paciente sem resposta.
+        """
+
+        if self._repeat_window_seconds <= 0 or route is Route.APPOINTMENT:
+            return False
+        if before is None or last is None or not isinstance(reply, str) or not reply:
+            return False
+        if not _is_standing_prompt(reply):
+            return False
+        try:
+            after = store.load_flow(chat_key)
+        except Exception:
+            logger.warning("repeat check failed", exc_info=True)
+            return False
+        if after is None or after.state != before.state or after.data != before.data:
+            return False
+        last_text, handled_at = last
+        if _response_signature(last_text) != _response_signature(reply):
+            return False
+        try:
+            handled = datetime.fromisoformat(handled_at)
+        except ValueError:
+            return False
+        if handled.tzinfo is None:
+            handled = handled.replace(tzinfo=_BRT)
+        elapsed = (self._now() - handled).total_seconds()
+        return 0 <= elapsed <= self._repeat_window_seconds
 
     def _handoff(
         self, store: AppointmentStore, message_id: str, chat_key: str

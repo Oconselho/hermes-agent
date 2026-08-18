@@ -194,3 +194,36 @@ def test_real_gateway_config_requires_enabled_to_be_exactly_true(enabled):
     runner._appointment_handler_ready = False
 
     assert runner._get_appointment_handler() is None
+
+
+# --------------------------------------------------------------------------
+# Silêncio deliberado do funil (17/ago/2026)
+# --------------------------------------------------------------------------
+
+
+def test_the_silence_sentinel_survives_the_ownership_boundary():
+    """O sentinela chega inteiro ao chamador, que é quem sabe lê-lo."""
+
+    from gateway.platforms.whatsapp_appointments import SILENCE
+
+    handler = RecordingHandler(SILENCE)
+    runner = _runner(handler)
+
+    result = asyncio.run(
+        runner._deterministic_appointment_response(_event(), _event().source)
+    )
+
+    assert result is SILENCE
+    assert gateway_run._is_appointment_silence(result)
+
+
+def test_only_the_sentinel_counts_as_silence():
+    """Identidade, não igualdade: o sentinela É uma string vazia.
+
+    Comparar por ``==`` engoliria qualquer resposta vazia vinda de um bug —
+    justamente o caso em que o paciente precisa de um aviso, não de silêncio.
+    """
+
+    assert not gateway_run._is_appointment_silence("")
+    assert not gateway_run._is_appointment_silence(None)
+    assert not gateway_run._is_appointment_silence("Como posso ajudar?")

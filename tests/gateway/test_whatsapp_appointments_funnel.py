@@ -14,10 +14,12 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from gateway.platforms.whatsapp_appointments import (
+    SILENCE,
     AppointmentStore,
     LeadStage,
     Route,
     WhatsAppAppointmentsHandler,
+    _response_signature,
     classify_route,
 )
 
@@ -810,3 +812,184 @@ def test_funnel_failure_never_costs_the_patient_a_reply(tmp_path, monkeypatch):
 
     reply = handler.handle(event("quero agendar", message_id="x-1"))
     assert "**1** - Agendar uma consulta" in reply
+
+
+# --------------------------------------------------------------------------
+# Repetição — uma rajada, uma resposta (17/ago/2026)
+# --------------------------------------------------------------------------
+
+
+def test_a_second_line_of_the_same_request_is_not_answered_twice(tmp_path):
+    """A conversa do Eduardo Mandelli, 17/ago/2026 18:25 BRT.
+
+    Duas mensagens com seis segundos de diferença — "Temos que marcar uma
+    consulta nova pra monitorar o progresso do mounjaro" e "E renovar a
+    receita" — receberam o mesmo menu duas vezes. Cada mensagem entra no
+    fluxo sozinha, e a segunda caiu no ramo que reimprime o menu para
+    qualquer texto que não seja um número.
+
+    A comparação byte a byte não resolveria: a primeira resposta abre com
+    "Boa noite, Sr. Eduardo! Sou a assistente..." e a segunda não. São a
+    mesma mensagem para quem lê.
+    """
+
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    clock = MutableClock(datetime(2026, 8, 17, 18, 25, 38, tzinfo=BRT))
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True}, db_path=db_path, clock=clock
+    )
+
+    first = handler.handle(
+        event(
+            "Temos que marcar uma consulta nova pra monitorar o progresso do mounjaro",
+            message_id="m-1",
+            user_name="Eduardo Mandelli",
+        )
+    )
+    assert "**1** - Agendar uma consulta" in first
+
+    clock.value += timedelta(seconds=6)
+    second = handler.handle(
+        event("E renovar a receita", message_id="m-2", user_name="Eduardo Mandelli")
+    )
+
+    assert second is SILENCE
+    assert second == ""
+
+    # Silêncio no envio, não no estado: a mensagem fica tratada e o menu
+    # segue de pé, então o próximo dígito é lido normalmente.
+    clock.value += timedelta(seconds=20)
+    service_menu = handler.handle(
+        event("1", message_id="m-3", user_name="Eduardo Mandelli")
+    )
+    assert "Teleconsulta" in service_menu
+
+
+def test_the_menu_is_printed_again_for_someone_who_comes_back_later(tmp_path):
+    """A supressão cobre a rajada, não a conversa.
+
+    Quem volta minutos depois sem ter entendido merece o menu de novo — é a
+    diferença entre não se repetir e não responder.
+    """
+
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    clock = MutableClock(datetime(2026, 8, 17, 18, 25, tzinfo=BRT))
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True}, db_path=db_path, clock=clock
+    )
+
+    handler.handle(event("quero agendar", message_id="m-1"))
+
+    clock.value += timedelta(minutes=10)
+    later = handler.handle(event("E renovar a receita", message_id="m-2"))
+
+    assert later is not SILENCE
+    assert "**1** - Agendar uma consulta" in later
+
+
+def test_a_step_that_changed_is_never_silenced(tmp_path):
+    """Repetir uma frase é ruim; esconder uma mudança de estado é pior.
+
+    Dois CPFs inválidos seguidos produzem o mesmo texto — "CPF inválido." —
+    mas o segundo é resposta a uma tentativa nova do paciente. O silêncio ali
+    seria lido como "o sistema caiu", não como "já respondi".
+    """
+
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    clock = MutableClock(datetime(2026, 8, 17, 18, 25, tzinfo=BRT))
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True}, db_path=db_path, clock=clock
+    )
+
+    handler.handle(event("quero agendar", message_id="m-1"))
+    clock.value += timedelta(seconds=4)
+    assert "Informe o CPF do paciente." in handler.handle(
+        event("2", message_id="m-2")
+    )
+
+    clock.value += timedelta(seconds=4)
+    first_try = handler.handle(event("111", message_id="m-3"))
+    assert "CPF" in first_try
+
+    clock.value += timedelta(seconds=4)
+    second_try = handler.handle(event("222", message_id="m-4"))
+
+    assert second_try is not SILENCE
+    assert "CPF" in second_try
+
+
+def test_the_repeat_guard_can_be_turned_off(tmp_path):
+    """``repeat_window_seconds: 0`` devolve o comportamento anterior."""
+
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    clock = MutableClock(datetime(2026, 8, 17, 18, 25, tzinfo=BRT))
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True, "repeat_window_seconds": 0},
+        db_path=db_path,
+        clock=clock,
+    )
+
+    handler.handle(event("quero agendar", message_id="m-1"))
+    clock.value += timedelta(seconds=6)
+    second = handler.handle(event("E renovar a receita", message_id="m-2"))
+
+    assert second is not SILENCE
+    assert "**1** - Agendar uma consulta" in second
+
+
+def test_the_identity_header_does_not_hide_a_repetition():
+    """As duas formas do menu são a mesma mensagem, e a assinatura sabe."""
+
+    cold = (
+        "Boa noite, Sr. Eduardo! Sou a assistente do Dr. Victor Almeida. "
+        "Como posso ajudar?\n\n**1** - Agendar uma consulta"
+    )
+    returning = "Como posso ajudar?\n\n**1** - Agendar uma consulta"
+
+    assert _response_signature(cold) == _response_signature(returning)
+    assert _response_signature(cold) != _response_signature("Informe o CPF.")
+
+
+def test_silence_does_not_chain_past_the_window(tmp_path):
+    """A âncora é o que está na tela, não o que ficou gravado.
+
+    Antes desta regra, cada mensagem nova comparava com a anterior — que
+    também havia sido suprimida — e a janela de dois minutos se estendia
+    indefinidamente. No replay de 17/ago/2026 isso levou um "Preciso de
+    urgência" a um silêncio ancorado seis minutos antes.
+    """
+
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    clock = MutableClock(datetime(2026, 8, 17, 18, 25, tzinfo=BRT))
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True}, db_path=db_path, clock=clock
+    )
+
+    handler.handle(event("quero agendar", message_id="m-1"))
+
+    clock.value += timedelta(seconds=90)
+    assert handler.handle(event("E renovar a receita", message_id="m-2")) is SILENCE
+
+    # +90s da suprimida, mas +180s da última que o paciente realmente viu.
+    clock.value += timedelta(seconds=90)
+    third = handler.handle(event("e o atestado tambem", message_id="m-3"))
+
+    assert third is not SILENCE
+    assert "**1** - Agendar uma consulta" in third
+
+
+def test_a_silenced_message_stays_silent_on_redelivery(tmp_path):
+    """A reentrega repete o silêncio, não devolve uma resposta vazia."""
+
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    clock = MutableClock(datetime(2026, 8, 17, 18, 25, tzinfo=BRT))
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True}, db_path=db_path, clock=clock
+    )
+
+    handler.handle(event("quero agendar", message_id="m-1"))
+    clock.value += timedelta(seconds=6)
+    assert handler.handle(event("E renovar a receita", message_id="m-2")) is SILENCE
+
+    clock.value += timedelta(seconds=1)
+    assert handler.handle(event("E renovar a receita", message_id="m-2")) is SILENCE

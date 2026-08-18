@@ -254,6 +254,29 @@ def _whatsapp_greeting_response(text: Any) -> str:
     return "Olá! Sou a assistente do Dr. Victor Almeida. Como posso ajudar?"
 
 
+def _is_appointment_silence(response: Any) -> bool:
+    """Whether the appointment funnel deliberately answered nothing.
+
+    The funnel owns a message and still has nothing to add when the patient
+    breaks one request across two lines seconds apart: the reply already on
+    their screen answers both. It signals that with a sentinel rather than
+    with ``""``, because a plain empty response reaches
+    ``_normalize_empty_agent_response`` and comes back out as "your message
+    wasn't processed" — turning a deliberate silence into an error the
+    patient did not cause.
+
+    Identity, not equality: the sentinel IS an empty string, so ``==`` would
+    also swallow any genuinely empty reply.
+    """
+    if response is None:
+        return False
+    try:
+        from gateway.platforms.whatsapp_appointments import SILENCE
+    except Exception:
+        return False
+    return response is SILENCE
+
+
 def _whatsapp_is_no_action_update(text: Any) -> bool:
     """Return True for a status update that does not ask the secretary to act."""
     raw = unicodedata.normalize("NFKD", str(text or ""))
@@ -12621,6 +12644,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _appointment_response = await self._deterministic_appointment_response(
             event, source
         )
+
+        # The funnel handled this message and chose silence: the patient sent
+        # the next line of the same thought and the reply already on screen
+        # covers it. ``""`` is this function's existing "send nothing"
+        # contract — the same one the two suppression checks below use.
+        if _is_appointment_silence(_appointment_response):
+            logger.info(
+                "[WhatsApp] Appointment funnel already answered this burst for "
+                "session %s; sending nothing rather than repeating itself",
+                session_key,
+            )
+            return ""
 
         # A bare greeting gets one deterministic secretary introduction. Once
         # that introduction is already visible in the transcript, suppress
