@@ -1618,6 +1618,20 @@ def _sanitize_gateway_final_response(
     ``whatsapp_appointments.py`` and whose numbers come from the hardcoded
     ``_SERVICES`` table and Feegow's own API, never from a model.
 
+    ``quoted_inbound`` marks text that is a VERBATIM QUOTATION of what the
+    contact themself sent — today only the STT transcript echo. Three guards
+    below judge what the secretary ASSERTS: inventing an appointment, quoting
+    a price, issuing clinical conduct. A quotation asserts none of them; it
+    repeats the contact's own words back so they can check what was heard.
+    Running those three over a quotation censors the patient, not the model —
+    on 24/ago/2026 Aline asked by voice whether her daughter could still use
+    an expired insulin sensor, and "usar … sensor da insulina" tripped the
+    clinical-conduct guard, so the echo was dropped and the transcription
+    looked broken. Same thing on 16/ago (Rosangela) and 19/ago (ericoengmat).
+    Everything else — secrets, tool-name leaks, XML, internal reasoning,
+    provider errors, the silence marker — still applies to a quotation,
+    because none of those are ever the contact's words either.
+
     Two guards below exist to stop a *model* from inventing money and
     appointments. They were written in jun/2026, when the secretary was
     LLM-only; the deterministic flow arrived in ago/2026 and inherited them,
@@ -1641,6 +1655,10 @@ def _sanitize_gateway_final_response(
     if not text:
         return text
     platform_value = _gateway_platform_value(platform)
+    # The three guards below exist to police what the MODEL claims. Text the
+    # gateway composed itself, and text that merely quotes the contact, claim
+    # nothing — see the docstring.
+    _model_authored = not trusted_source and not quoted_inbound
     if platform_value == "whatsapp":
         cleaned = _redact_gateway_user_facing_secrets(str(text))
         # ── [SILENCIOSO]: model chose to stay silent (conversation already resolved)
@@ -1776,7 +1794,7 @@ def _sanitize_gateway_final_response(
             r"|\b(amanh[aã]|hoje)\b"
             r"))"
         )
-        if not trusted_source and _fake_appt_re.search(cleaned):
+        if _model_authored and _fake_appt_re.search(cleaned):
             return "Obrigado. O Dr. Victor verificará sua mensagem pessoalmente."
 
         # ── Block any currency/price disclosure ──
@@ -1787,7 +1805,7 @@ def _sanitize_gateway_final_response(
             r"|\b\d{1,6}[.,]\d{2}\b"
             r"|(?:\b(custa|pre[cç]o|valor|pagamento|parcela)\b.{0,40}?\b(\d[\d.,]*)\b)"
         )
-        if not trusted_source and _price_disclosure_re.search(cleaned):
+        if _model_authored and _price_disclosure_re.search(cleaned):
             return "Obrigado. O Dr. Victor verificará sua mensagem pessoalmente."
 
         # ── Block clinical conduct from a scheduling secretary ──
@@ -1842,7 +1860,7 @@ def _sanitize_gateway_final_response(
             r"|\binsulina\s+de\s+backup\b|\bplano\s+de\s+conting[eê]ncia\b"
             r"|\bconforme\s+(?:a\s+)?prescri[cç][aã]o\b|\bconforme\s+prescrit\w*\b"
         )
-        if not trusted_source and _clinical_advice_re.search(cleaned):
+        if _model_authored and _clinical_advice_re.search(cleaned):
             logger.warning(
                 "Suppressed clinical-conduct reply destined for WhatsApp: %s",
                 cleaned[:200].replace("\n", " "),
@@ -1896,6 +1914,11 @@ def _queued_followup_resend_text(platform: Any, raw: Any) -> str:
     return _sanitize_gateway_final_response(platform, str(raw)) or ""
 
 
+# The transcript echo's only marker. Written in words because the WhatsApp
+# branch of the sanitizer strips the emoji one — see
+# ``_whatsapp_safe_transcript_echo``.
+_WHATSAPP_TRANSCRIPT_LABEL = "Transcrição do áudio recebido:"
+
 # Canned institutional replies that ``_sanitize_gateway_final_response`` returns
 # when it refuses the model's text. They are valid ANSWERS but never valid
 # ECHOES — see ``_whatsapp_safe_transcript_echo``.
@@ -1929,15 +1952,32 @@ def _whatsapp_safe_transcript_echo(platform: Any, text: str) -> Optional[str]:
     other platform, and the WhatsApp branch of the sanitizer rewrites text
     (strips emoji, turns ``!`` into ``.``) in ways that belong to the clinic's
     public line and nowhere else. Other surfaces keep the echo they already had.
+
+    Sanitized as ``quoted_inbound``: fail-closed is about what the secretary
+    might LEAK, not about what the contact is allowed to have said. The three
+    authorship guards were silently eating the echo of any voice note that
+    named a medication, a device or a price — a diabetes clinic's most common
+    voice note — which read to Victor as "the transcription stopped working"
+    (24/ago/2026). Everything that could actually leak still runs.
     """
     if _gateway_platform_value(platform) != "whatsapp":
         return text
-    sanitized = _sanitize_gateway_final_response(Platform.WHATSAPP, text)
+    sanitized = _sanitize_gateway_final_response(
+        Platform.WHATSAPP, text, quoted_inbound=True
+    )
     if not sanitized:
         return None
     if sanitized.strip() in _WHATSAPP_SANITIZER_FALLBACKS:
         return None
-    return sanitized
+    # The 🎙️ that marks this text as a transcript sits inside the emoji range
+    # the WhatsApp branch strips, so every echo this line ever sent arrived as
+    # a bare quoted string with an orphan variation selector in front of it —
+    # indistinguishable from the secretary quoting something AT the contact.
+    # The marker is restored in words, which survive the same sanitizer.
+    sanitized = re.sub("[\ufe0f\ufe0e]", "", sanitized).strip()
+    if not sanitized:
+        return None
+    return f"{_WHATSAPP_TRANSCRIPT_LABEL}\n{sanitized}"
 
 
 def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:

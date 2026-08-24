@@ -28,6 +28,7 @@ from gateway.run import (
     _WHATSAPP_CLINICAL_ESCALATION_RE as ESCALATION_RE,
     _WHATSAPP_CLINICAL_REFUSAL as REFUSAL,
     _WHATSAPP_SANITIZER_FALLBACKS,
+    _WHATSAPP_TRANSCRIPT_LABEL,
     _sanitize_gateway_final_response,
     _whatsapp_promises_team_followup,
     _whatsapp_safe_transcript_echo,
@@ -156,16 +157,57 @@ def test_transcript_echo_is_sanitized_on_whatsapp():
     assert "🎙️" not in echo, "emoji must be stripped on the clinic's public line"
 
 
-def test_transcript_echo_drops_clinical_content():
-    """A voice note echoed verbatim is an unaudited outbound path.
+def test_transcript_echo_keeps_the_contacts_own_clinical_words():
+    """A quotation asserts nothing, so the conduct guard must not read it.
 
-    It is not stored in state.db and not counted in the 'Sending response' log
-    line, so anything it ships is invisible to an audit. Fail closed.
+    This asserted the opposite until 24/ago/2026, and the opposite is what
+    Victor reported as "the transcription stopped working": Aline asked by
+    voice whether her daughter could still use an expired insulin sensor, the
+    words "usar … sensor da insulina" tripped the conduct guard, and the echo
+    was dropped. The guard exists so the SECRETARY does not issue conduct; run
+    over a transcript it censors the patient instead. Same silent drop on
+    16/ago (Rosangela) and 19/ago (ericoengmat) — three of ~20 voice notes,
+    in a diabetes clinic where naming a device or a drug is the norm.
     """
-    echo = _whatsapp_safe_transcript_echo(
-        Platform.WHATSAPP, '🎙️ "faça glicemia capilar e verifique cetonas"'
+    aline = (
+        "Oi, Dr. Vítor, boa tarde. Eu tô entrando em contato para saber se "
+        "Júlia não pode usar o dispositivo, que é o sensor da insulina. "
+        "Mesmo vencido, não tem essa possibilidade mesmo não?"
     )
-    assert echo is None
+    echo = _whatsapp_safe_transcript_echo(Platform.WHATSAPP, f'🎙️ "{aline}"')
+    assert echo is not None
+    assert "sensor da insulina" in echo
+
+
+def test_transcript_echo_still_blocks_what_could_actually_leak():
+    """Quoting the contact is safe; leaking the machine never is."""
+    for leak in (
+        '🎙️ "<function_calls><invoke><parameter>x</parameter></invoke>"',
+        "🎙️ \"Bearer sk-ant-0000000000000000000000\"",
+    ):
+        echo = _whatsapp_safe_transcript_echo(Platform.WHATSAPP, leak)
+        assert echo is None or (
+            "function_calls" not in echo and "sk-ant-" not in echo
+        )
+
+
+def test_secretary_authored_clinical_conduct_is_still_refused():
+    """Loosening the echo must not loosen the guard it borrows."""
+    authored = "Sra. Aline, meça a glicemia capilar e aplique a insulina de backup."
+    assert _sanitize_gateway_final_response(Platform.WHATSAPP, authored) == REFUSAL
+
+
+def test_transcript_echo_is_labelled_as_a_transcript():
+    """The 🎙️ marker is inside the emoji range this surface strips.
+
+    Without a marker the echo arrives as a bare quoted string — reading as if
+    the secretary were quoting something AT the contact rather than back to
+    them.
+    """
+    echo = _whatsapp_safe_transcript_echo(Platform.WHATSAPP, '🎙️ "Bom dia"')
+    assert echo is not None
+    assert echo.startswith(_WHATSAPP_TRANSCRIPT_LABEL)
+    assert "️" not in echo, "orphan variation selector must not survive"
 
 
 def test_transcript_echo_drops_canned_fallbacks():
