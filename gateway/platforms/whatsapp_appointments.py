@@ -2184,6 +2184,68 @@ class AppointmentStore:
             )
         return {"id": outbox_id, "chat_key": notice_chat_id, "body": body}
 
+    def enqueue_reception_question(
+        self,
+        chat_key: str,
+        reception_chat_id: str,
+        *,
+        now: datetime,
+        details: Mapping[str, str] | None = None,
+    ) -> dict[str, str] | None:
+        """Make the "a equipe vai retornar" promise true, for reception.
+
+        The third promise this codebase has had to put code behind. The booking
+        dead end got one on 13/ago/2026 and the clinical refusal got one the
+        same week; the plain question — the most common thing a lead actually
+        sends — still had none. On 24/ago/2026 a lead asked how the
+        consultation worked, was told her question would be registered for the
+        team to answer, and reception never heard of her.
+
+        Goes to reception, not to Victor (Victor, 24/ago/2026). The 15/ago rule
+        was that reception's WhatsApp carries patient booking requests and
+        nothing else; this widens it by exactly one step, to the lead who asked
+        a question before booking anything, and no further — a clinical
+        question still goes to Victor's line and a company still reaches
+        neither.
+
+        Bucketed by the hour like the clinical notice rather than by the day
+        like the booking dead end: someone firing off three questions in a row
+        is one lead, but someone who writes again after lunch has been waiting
+        and reception has to see it.
+
+        Carries no patient words, no CPF and no birth date — a question is not
+        a booking, so there is no dossier to attach and nothing here that the
+        chat itself does not already hold under its own access control.
+        """
+
+        bucket = now.strftime("%Y-%m-%dT%H")
+        idempotency_key = _opaque_id("reception-question", chat_key, bucket)
+        outbox_id = _opaque_id("outbox", idempotency_key)
+        lines = [
+            "❓ *Dúvida de lead* — contato no WhatsApp da secretária ainda "
+            "sem agendamento.",
+            "",
+        ]
+        lines.extend(f"{label}: {value}" for label, value in (details or {}).items())
+        if len(lines) > 2:
+            lines.append("")
+        lines.append(
+            "O contato foi informado de que a equipe retornaria com a "
+            "informação. Abrir a conversa no WhatsApp para ler a dúvida e "
+            "responder."
+        )
+        body = "\n".join(lines)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO outbox_events
+                    (id, idempotency_key, chat_key, body, state, created_at, sent_at)
+                VALUES (?, ?, ?, ?, 'PENDING', ?, NULL)
+                """,
+                (outbox_id, idempotency_key, reception_chat_id, body, now.isoformat()),
+            )
+        return {"id": outbox_id, "chat_key": reception_chat_id, "body": body}
+
     def claim_expiration(
         self,
         appointment_id: int | str,
@@ -3489,6 +3551,70 @@ class WhatsAppAppointmentsHandler:
         except Exception:
             logger.warning(
                 "clinical escalation notice could not be queued", exc_info=True
+            )
+
+    def note_question_escalation(self, incoming: Any) -> None:
+        """Queue the notice a "the team will get back to you" promise makes.
+
+        Same seam and same contract as ``note_clinical_escalation`` — the model
+        pipeline produces the promise, this store owns the only outbox anyone
+        watches — but the destination is reception, because a lead asking how
+        the consultation works is reception's work and not Victor's.
+
+        Best-effort: a failure costs the contact nothing, since they already
+        have their reply. What is lost is reception hearing about it, which is
+        the entire point of the call, so it is logged loudly.
+        """
+
+        if not self._enabled:
+            return
+        if not self._reception_chat_id:
+            logger.warning(
+                "lead question escalation not queued: reception_chat_id is "
+                "unset, so the promise made to the contact has no destination"
+            )
+            return
+        if not self._db_path.exists():
+            return
+        try:
+            source = getattr(incoming, "source", None)
+            chat_key = str(getattr(source, "chat_id", "") or "")
+            if not chat_key or self._is_reception_chat(chat_key):
+                return
+            # Victor's own line answers on this same secretary, so without this
+            # anything he typed to himself that read as a promise would page
+            # reception. Mirrors the clinical route for the same reason.
+            if self._is_clinical_notice_chat(chat_key):
+                return
+            # Reception's WhatsApp is for patients (Victor, 15/ago/2026). The
+            # promise templates for a supplier, a bank and a partner platform
+            # never say "equipe", so they should not reach the matcher at all —
+            # this is the second lock, on who the sender is rather than on how
+            # the sentence was phrased, because the phrasing is a model's
+            # choice and this is not.
+            if _contact_is_organization(source):
+                logger.info(
+                    "lead question escalation not queued: sender is an "
+                    "organization, not a patient"
+                )
+                return
+            details: dict[str, str] = {}
+            local_digits = _chat_phone(chat_key)
+            phone = _format_phone(local_digits)
+            name = _contact_first_name(source)
+            if phone:
+                details["Contato"] = f"{name} — {phone}" if name else phone
+            details["Recebido"] = self._now().strftime("%d/%m %H:%M")
+            details.update(_reception_contact_lines(local_digits, ""))
+            AppointmentStore(self._db_path).enqueue_reception_question(
+                chat_key,
+                self._reception_chat_id,
+                now=self._now(),
+                details=details,
+            )
+        except Exception:
+            logger.warning(
+                "lead question notice could not be queued", exc_info=True
             )
 
     def _menu_for(

@@ -29,6 +29,7 @@ from gateway.run import (
     _WHATSAPP_CLINICAL_REFUSAL as REFUSAL,
     _WHATSAPP_SANITIZER_FALLBACKS,
     _sanitize_gateway_final_response,
+    _whatsapp_promises_team_followup,
     _whatsapp_safe_transcript_echo,
 )
 from gateway.config import Platform
@@ -239,3 +240,75 @@ def test_approved_templates_do_not_notify_reception(text):
     not the clinical refusal and reception has nothing to call back about.
     """
     assert not ESCALATION_RE.search(text), f"spurious notice for: {text[:60]!r}"
+
+
+# ── The lead's promise: "vou registrar … para a equipe retornar" ─────────────
+#
+# The third promise this codebase has had to put code behind, and the one that
+# fires most often. On 24/ago/2026 a lead (71 8822-0010) asked "Como funciona a
+# consulta?" and was told her question would be registered for the team to come
+# back on. Nothing was: outbox_events held no row for her, the lead sat at NOVO,
+# and reception never heard of her. Reception's only trigger was
+# _whatsapp_has_scheduling_intent, and asking how a consultation works is not a
+# request for a slot.
+#
+# Victor, 24/ago/2026: a lead with a question reaches reception with the contact
+# and a tap-to-open link, exactly like a booking request does.
+
+# Read back from state.db, session 20260824_194420_c1c24b97 — what was really
+# sent, not the template it was meant to follow.
+DELIVERED_TO_FABIANE = (
+    "Boa tarde! Sou a assistente do Dr. Victor Almeida. Sra. Fabiane, vou "
+    "registrar sua dúvida sobre o funcionamento da consulta para a equipe "
+    "retornar com as informações. Boa semana!"
+)
+
+
+def test_the_reply_that_reached_nobody_now_pages_reception():
+    assert _whatsapp_promises_team_followup(DELIVERED_TO_FABIANE)
+
+
+@pytest.mark.parametrize("reply", [
+    # The pendency template. "Dr." is an honorific, not the end of the clause —
+    # reading its dot as a full stop dropped precisely the template reception
+    # most needs to see.
+    "Sra. Ana, vou registrar o problema do documento para a equipe do "
+    "Dr. Victor resolver.",
+    "Sr. João, vou registrar seu pedido para a equipe retornar com a "
+    "informação sobre o convênio.",
+    "Dra. Marina, vou anotar sua dúvida para a equipe do Dr. Victor "
+    "verificar e retornar.",
+])
+def test_patient_promises_page_reception(reply):
+    assert _whatsapp_promises_team_followup(reply)
+
+
+@pytest.mark.parametrize("reply", [
+    # Categories 3, 4 and 5 name Dr. Victor and never a team. That word is the
+    # discriminator that keeps reception's WhatsApp on patients — the 15/ago
+    # rule this route must not walk back.
+    "Dra. Marina, recebi sua mensagem sobre o encaminhamento. Vou encaminhar "
+    "ao Dr. Victor, que retorna diretamente.",
+    "Bom dia! Recebi a mensagem sobre a nota fiscal. Vou registrar para o "
+    "Dr. Victor avaliar e retornar.",
+    "Recebi a mensagem sobre a fatura. Vou registrar para o Dr. Victor "
+    "tratar diretamente.",
+    # A promise is one clause. Two unrelated sentences are not one.
+    "Vou registrar isso. Outra coisa: a equipe atende das 8h às 18h e "
+    "responde rápido.",
+    "Como posso ajudar?\n\n**1** - Agendar uma consulta\n**2** - Remarcar",
+    "Obrigada. Boa semana!",
+])
+def test_non_patient_replies_never_page_reception(reply):
+    assert not _whatsapp_promises_team_followup(reply)
+
+
+def test_clinical_refusal_is_not_routed_to_reception():
+    """It says "equipe" too, and it already has a destination.
+
+    A clinical question goes to Victor's line (15/ago/2026). Paging reception
+    as well would recreate the 14/ago bug exactly: one message reaching
+    reception through a second, independent route. The call site tests the
+    clinical matcher first and this is why.
+    """
+    assert ESCALATION_RE.search(REFUSAL)

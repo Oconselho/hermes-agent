@@ -1552,9 +1552,64 @@ _WHATSAPP_CLINICAL_ESCALATION_RE = re.compile(
     r"(?i)n[ãa]o\s+presta\s+orienta[çc][ãa]o\s+cl[íi]nica"
 )
 
+# The same defect the clinical route above was written for, one category over.
+# On 24/ago/2026 a lead (71 8822-0010) asked "Como funciona a consulta?" and was
+# told "vou registrar sua dúvida sobre o funcionamento da consulta para a equipe
+# retornar com as informações". Nothing was registered: ``outbox_events`` held no
+# row for her and the lead sat at NOVO. The prompt tells the model to "registre o
+# pedido e diga que a equipe vai retornar", and "registre" produced a sentence,
+# not a notice — reception's only trigger was ``_whatsapp_has_scheduling_intent``,
+# and asking how a consultation works is not a request for a slot.
+#
+# Victor, 24/ago/2026: a lead with a question must reach reception with the
+# contact and a tap-to-open link, exactly like a booking request does.
+#
+# Matched on the PROMISE rather than on the question, because the promise is
+# what the patient was actually given: no promise, no notice, and no notice
+# without a promise. ``equipe`` is the discriminator that keeps this on
+# patients — the colleague, vendor and bank templates (categories 3/4/5) all
+# name Dr. Victor directly and never a team, so they cannot reach reception,
+# which is the 15/ago rule this must not walk back. The clinical refusal does
+# say "equipe", and is excluded at the call site by testing it first: it has
+# its own destination (Victor's line), and a clinical question is not a lead.
+_WHATSAPP_QUESTION_ESCALATION_RE = re.compile(
+    r"(?is)\b(?:registr\w*|anot\w*|encaminh\w*)\b"
+    r"[^.!?\n]{0,140}?\bequipe\b"
+    r"[^.!?\n]{0,80}?"
+    r"\b(?:retorn\w*|resolv\w*|avali\w*|verific\w*|informa\w*"
+    r"|respond\w*|trat\w*|esclarec\w*)\b"
+)
+
+# A Portuguese honorific carries a period that is not the end of a sentence.
+# "para a equipe do Dr. Victor resolver" is one clause, and reading the dot in
+# "Dr." as a full stop is what made the pendency template — the very template
+# reception most needs to see — fall out of the match above. Longest
+# alternative first: `dr` would otherwise consume the "dr" of "dra." and leave
+# a stray "a.".
+_WHATSAPP_HONORIFIC_DOT_RE = re.compile(
+    r"(?i)\b(sr\(a\)|dra|dr|sra|sr|profa|prof|exma|exmo)\."
+)
+
+
+def _whatsapp_promises_team_followup(text: Any) -> bool:
+    """Did this reply promise the contact that the team would get back to them?
+
+    The window regex is sentence-scoped on purpose — a promise has to be one
+    clause, or "registrar" in one sentence and "equipe" three sentences later
+    would count — so honorific dots are flattened first, not treated as ends.
+    """
+    if not text:
+        return False
+    return bool(
+        _WHATSAPP_QUESTION_ESCALATION_RE.search(
+            _WHATSAPP_HONORIFIC_DOT_RE.sub(r"\1", str(text))
+        )
+    )
+
 
 def _sanitize_gateway_final_response(
-    platform: Any, text: str, *, trusted_source: bool = False
+    platform: Any, text: str, *, trusted_source: bool = False,
+    quoted_inbound: bool = False,
 ) -> str:
     """Sanitize final gateway replies before sending them to chat surfaces.
 
@@ -13650,6 +13705,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         except Exception:
                             logger.warning(
                                 "[WhatsApp] clinical escalation notice failed",
+                                exc_info=True,
+                            )
+                    # The same promise, one category over: a lead told that the
+                    # team would come back with an answer (24/ago/2026). Reads
+                    # the delivered text for the same reason the clinical route
+                    # does — the promise is what the contact was actually given.
+                    #
+                    # ``elif``, not a second ``if``: the clinical refusal also
+                    # says "equipe", and it already has a destination. Paging
+                    # reception about it as well would walk back the 15/ago
+                    # rule that a clinical question is not reception's work —
+                    # which is exactly the 14/ago bug, where one message
+                    # reached reception through a second, independent route.
+                    elif _whatsapp_promises_team_followup(response):
+                        try:
+                            _question_handler = self._get_appointment_handler()
+                            if _question_handler is not None:
+                                await asyncio.to_thread(
+                                    _question_handler.note_question_escalation, event
+                                )
+                        except Exception:
+                            logger.warning(
+                                "[WhatsApp] lead question notice failed",
                                 exc_info=True,
                             )
 
