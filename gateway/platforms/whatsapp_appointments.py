@@ -2213,26 +2213,39 @@ class AppointmentStore:
         is one lead, but someone who writes again after lunch has been waiting
         and reception has to see it.
 
-        Carries no patient words, no CPF and no birth date — a question is not
-        a booking, so there is no dossier to attach and nothing here that the
-        chat itself does not already hold under its own access control.
+        **Reception cannot read the conversation** (Victor, 24/ago/2026): the
+        thread lives in HIS WhatsApp, and they have no access to it. So the
+        first version of this notice — which told them to open the chat and
+        read the question — asked for something they cannot do, and the notice
+        was useless the moment it arrived. It now has to carry the substance
+        itself: what the person wants, and what they asked.
+
+        That is a deliberate reversal of the "no patient words" rule the
+        clinical notice keeps. The reasoning there was that the words are in
+        the chat, which is under its own access control; here the whole point
+        is that the destination has NO access to that chat. The question is
+        carried trimmed, and identity digits are blanked before it goes — a
+        lead who opens with a CPF should not have it retyped into a second
+        channel. CPF and birth date are still never fields of their own: a
+        question is not a booking, so there is no dossier to attach.
         """
 
         bucket = now.strftime("%Y-%m-%dT%H")
         idempotency_key = _opaque_id("reception-question", chat_key, bucket)
         outbox_id = _opaque_id("outbox", idempotency_key)
         lines = [
-            "❓ *Dúvida de lead* — contato no WhatsApp da secretária ainda "
-            "sem agendamento.",
+            "❓ *Lead quer agendar* — contato no WhatsApp da secretária ainda "
+            "sem consulta marcada.",
             "",
         ]
         lines.extend(f"{label}: {value}" for label, value in (details or {}).items())
         if len(lines) > 2:
             lines.append("")
         lines.append(
-            "O contato foi informado de que a equipe retornaria com a "
-            "informação. Abrir a conversa no WhatsApp para ler a dúvida e "
-            "responder."
+            "Tem interesse em marcar consulta e quer tirar dúvidas antes."
+        )
+        lines.append(
+            "Chamar pelo link acima para esclarecer e concluir o agendamento."
         )
         body = "\n".join(lines)
         with self._connect() as connection:
@@ -3147,6 +3160,41 @@ def _identification_details(data: Mapping[str, Any]) -> dict[str, str]:
     return details
 
 
+_QUESTION_IDENTITY_DIGITS_RE = re.compile(
+    r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b"
+    r"|\b\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}\b"
+)
+
+
+def _question_summary(text: Any, *, limit: int = 160) -> str:
+    """What the lead asked, in one line reception can read on a phone.
+
+    Reception has no access to the conversation, so this is the only place
+    the question exists for them (Victor, 24/ago/2026). Identity digits go
+    first: a CPF and a birth date both look like a date to a regex, and
+    neither belongs in a notice that exists to say "call this person back".
+
+    Repeated lines collapse — WhatsApp users press send twice, and the lead
+    this was written for did exactly that ("Boa tarde! Como funciona a
+    consulta?" twice, six seconds apart). Empty in, empty out: a notice with
+    no question still beats no notice.
+    """
+
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    raw = _QUESTION_IDENTITY_DIGITS_RE.sub("…", raw)
+    seen: list[str] = []
+    for line in (part.strip() for part in raw.splitlines()):
+        if line and line not in seen:
+            seen.append(line)
+    collapsed = " ".join(seen)
+    collapsed = re.sub(r"\s+", " ", collapsed).strip()
+    if len(collapsed) > limit:
+        collapsed = collapsed[: limit - 1].rstrip() + "…"
+    return collapsed
+
+
 def _reception_contact_lines(local_digits: str, formatted: str) -> dict[str, str]:
     """The phone, and a link that opens the patient's chat with one tap.
 
@@ -3605,7 +3653,17 @@ class WhatsAppAppointmentsHandler:
             if phone:
                 details["Contato"] = f"{name} — {phone}" if name else phone
             details["Recebido"] = self._now().strftime("%d/%m %H:%M")
-            details.update(_reception_contact_lines(local_digits, ""))
+            contact_lines = _reception_contact_lines(local_digits, "")
+            # "Abrir conversa" is the right words for the clinical notice, which
+            # goes to Victor's own line where the thread actually is. Reception
+            # has no access to that thread — for them the link is how they
+            # START one, from their own number.
+            if "Abrir conversa" in contact_lines:
+                contact_lines["Chamar no WhatsApp"] = contact_lines.pop("Abrir conversa")
+            details.update(contact_lines)
+            asked = _question_summary(getattr(incoming, "text", ""))
+            if asked:
+                details["Perguntou"] = asked
             AppointmentStore(self._db_path).enqueue_reception_question(
                 chat_key,
                 self._reception_chat_id,

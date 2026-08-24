@@ -225,3 +225,75 @@ class TestReceptionAddress:
 
         assert handler._reception_chat_id == ""
         assert not handler._is_reception_chat(RECEPTION)
+
+
+# ── The lead-question notice must stand on its own ──────────────────────────
+#
+# Victor, 24/ago/2026: "a equipe da recepção não tem acesso a meu wapp, logo a
+# mensagem 'Abrir a conversa no WhatsApp para ler a dúvida e responder' não faz
+# sentido." The thread lives in HIS WhatsApp. The first version of this notice
+# told reception to go read it, which is the one thing they cannot do — so the
+# notice has to carry the substance itself.
+
+class TestLeadQuestionNoticeIsSelfContained:
+    def _body(self, tmp_path, details):
+        from gateway.platforms.whatsapp_appointments import AppointmentStore
+
+        store = AppointmentStore(tmp_path / "appointments.sqlite3")
+        queued = store.enqueue_reception_question(
+            "26281055928386@lid",
+            RECEPTION,
+            now=datetime(2026, 8, 24, 16, 44, tzinfo=ZoneInfo("America/Bahia")),
+            details=details,
+        )
+        return queued["body"]
+
+    def test_never_asks_reception_to_open_a_chat_it_cannot_reach(self, tmp_path):
+        body = self._body(tmp_path, {"Contato": "Fabiane — 71 98822-0010"})
+
+        assert "Abrir a conversa" not in body
+        assert "ler a dúvida" not in body
+
+    def test_says_what_the_lead_wants_and_what_they_asked(self, tmp_path):
+        body = self._body(tmp_path, {
+            "Contato": "Fabiane — 71 98822-0010",
+            "Chamar no WhatsApp": "https://wa.me/557188220010",
+            "Perguntou": "como funciona a consulta",
+        })
+
+        assert "marcar consulta" in body
+        assert "tirar dúvidas" in body
+        # Reception's only route to the person, and the only place the
+        # question exists for them.
+        assert "https://wa.me/557188220010" in body
+        assert "como funciona a consulta" in body
+
+
+class TestQuestionSummary:
+    def test_collapses_the_double_send_that_started_this(self):
+        """Sent twice, six seconds apart, by the lead this was written for."""
+        from gateway.platforms.whatsapp_appointments import _question_summary
+
+        doubled = "Boa tarde! Como funciona a consulta?\nBoa tarde! Como funciona a consulta?"
+        assert _question_summary(doubled) == "Boa tarde! Como funciona a consulta?"
+
+    def test_identity_digits_never_reach_the_notice(self):
+        """A CPF and a birth date both look like a date to a regex."""
+        from gateway.platforms.whatsapp_appointments import _question_summary
+
+        summary = _question_summary("Meu CPF é 123.456.789-00, nasci 12/05/1980")
+        assert "123.456.789-00" not in summary
+        assert "12/05/1980" not in summary
+
+    def test_long_question_is_trimmed_not_dropped(self):
+        from gateway.platforms.whatsapp_appointments import _question_summary
+
+        summary = _question_summary("preciso saber " * 40)
+        assert 0 < len(summary) <= 160
+
+    @pytest.mark.parametrize("empty", ["", "   ", None])
+    def test_no_question_is_not_an_error(self, empty):
+        """A notice with only a phone number still beats no notice."""
+        from gateway.platforms.whatsapp_appointments import _question_summary
+
+        assert _question_summary(empty) == ""
