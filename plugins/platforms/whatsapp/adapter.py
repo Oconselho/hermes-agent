@@ -32,7 +32,10 @@ from hermes_constants import (
     get_hermes_dir,
     with_hermes_node_path,
 )
-from gateway.response_filters import is_whatsapp_silence_marker
+from gateway.response_filters import (
+    is_internal_control_artifact,
+    is_whatsapp_silence_marker,
+)
 from gateway.whatsapp_passive_monitor import (
     PassiveMessageStore,
     is_monitored_group,
@@ -893,12 +896,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # ``success=True`` with no message id matches the empty-content
         # contract just above: nothing was sent, and that is not a failure —
         # callers must not read it as one and retry.
-        if is_whatsapp_silence_marker(content):
+        if is_whatsapp_silence_marker(content) or is_internal_control_artifact(content):
             logger.warning(
-                "[Whatsapp] Blocked stay-silent marker at the outbound "
-                "boundary (chat=%s, text=%r). The marker should have been "
-                "dropped upstream — this line means a delivery path reached "
-                "the adapter without passing the gateway finalizer.",
+                "[Whatsapp] Blocked an internal control token at the outbound "
+                "boundary (chat=%s, text=%r). It should have been dropped "
+                "upstream — this line means a delivery path reached the "
+                "adapter without passing the gateway finalizer.",
                 chat_id, content[:40],
             )
             return SendResult(success=True, message_id=None)

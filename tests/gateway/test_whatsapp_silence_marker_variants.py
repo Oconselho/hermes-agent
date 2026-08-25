@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import pytest
 
+from gateway.response_filters import is_internal_control_artifact
 from gateway.run import (
     _queued_followup_resend_text,
     _sanitize_gateway_final_response,
@@ -305,3 +306,98 @@ def test_the_identity_prefixed_spaced_form_alcina_received():
 
     assert _whatsapp_is_silence_marker(assembled) is False
     assert _sanitize_gateway_final_response("whatsapp", marker) is None
+
+
+# ---------------------------------------------------------------------------
+# The class, not the spelling
+# ---------------------------------------------------------------------------
+#
+# Victor, 25/ago/2026, after the third leak: "a decisão [ S I L E N C I O S O ]
+# é pensamento e não pode ser mostrado ao contato. apenas executar a ação de
+# ficar em silêncio."
+#
+# He is right that recognising one more spelling is not the fix. Every leak so
+# far came from a recogniser that was a LIST, and a list is always a step
+# behind the model. So the guard below asks a structural question — is the
+# whole reply a delimited token instead of something a person would say? — and
+# the failure mode flips: an unrecognised token now becomes silence, not a
+# delivery.
+
+
+UNKNOWN_CONTROL_TOKENS = [
+    "[QUIETO]",
+    "[NAO RESPONDER]",
+    "[NÃO RESPONDER]",
+    "[SEM RESPOSTA]",
+    "[IGNORAR]",
+    "[NO_ANSWER]",
+    "[skip]",
+    "{silence}",
+    "<sem_resposta>",
+    "(empty)",
+    "**[AGUARDAR]**",
+    "[ Q U I E T O ]",
+]
+
+
+@pytest.mark.parametrize("token", UNKNOWN_CONTROL_TOKENS)
+def test_a_token_we_never_taught_it_is_still_never_delivered(token):
+    """The whole point: no list of spellings is consulted here."""
+    assert is_internal_control_artifact(token) is True
+    assert _sanitize_gateway_final_response("whatsapp", token) is None
+    assert _queued_followup_resend_text("whatsapp", token) == ""
+
+
+# Prose in brackets is prose. The secretary may legitimately say these, and
+# suppressing them would be the opposite failure: a real answer lost.
+BRACKETED_PROSE = [
+    "(Já enviei.)",
+    "(Se preferir, posso pedir à recepção.)",
+    "(71996691002)",
+    "(71) 99669-1002",
+    "[Confirmo o horário das 14h, tudo certo para amanhã.]",
+]
+
+
+@pytest.mark.parametrize("text", BRACKETED_PROSE)
+def test_prose_in_brackets_is_still_delivered(text):
+    assert is_internal_control_artifact(text) is False
+    assert _sanitize_gateway_final_response("whatsapp", text) is not None
+
+
+@pytest.mark.parametrize("text", REAL_TEXT)
+def test_the_structural_guard_never_touches_ordinary_replies(text):
+    assert is_internal_control_artifact(text) is False
+
+
+def test_the_two_guards_are_complementary_not_redundant():
+    """One knows the word and accepts any decoration; the other knows the
+    shape and accepts any word. Neither subsumes the other, and that is why
+    both are kept.
+    """
+    # Shape-only: the structural guard has never heard of "QUIETO".
+    assert is_internal_control_artifact("[QUIETO]") is True
+    assert _whatsapp_is_silence_marker("[QUIETO]") is False
+
+    # Word-only: a bare marker has no delimiters at all, so the structural
+    # guard does not see a token — the word guard is what catches it.
+    assert _whatsapp_is_silence_marker("silencioso") is True
+    assert is_internal_control_artifact("silencioso") is False
+
+    # And a bare ordinary word must survive both: "Obrigada." is a real reply,
+    # which is exactly why the structural guard requires the delimiters.
+    assert _whatsapp_is_silence_marker("Obrigada.") is False
+    assert is_internal_control_artifact("Obrigada.") is False
+    assert _sanitize_gateway_final_response("whatsapp", "Obrigada.") is not None
+
+
+def test_the_adapter_backstop_asks_both_questions_too():
+    from plugins.platforms.whatsapp.adapter import (
+        is_internal_control_artifact as adapter_structural,
+        is_whatsapp_silence_marker as adapter_word,
+    )
+
+    assert adapter_structural is is_internal_control_artifact
+    assert adapter_word is _whatsapp_is_silence_marker
+    for token in UNKNOWN_CONTROL_TOKENS + SPACED_OUT_VARIANTS:
+        assert adapter_structural(token) or adapter_word(token)

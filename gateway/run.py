@@ -130,6 +130,7 @@ def _whatsapp_silent_agent_result() -> Dict[str, Any]:
 # spellings of "is this the marker?" is how it reached contacts twice; the
 # alias keeps the long-standing private name importable.
 from gateway.response_filters import (  # noqa: E402
+    is_internal_control_artifact as _is_internal_control_artifact,
     is_whatsapp_silence_marker as _whatsapp_is_silence_marker,
 )
 
@@ -1663,6 +1664,25 @@ def _sanitize_gateway_final_response(
         cleaned = _redact_gateway_user_facing_secrets(str(text))
         # ── [SILENCIOSO]: model chose to stay silent (conversation already resolved)
         if _whatsapp_is_silence_marker(cleaned):
+            return None
+        # ── Any OTHER whole-message control token. The marker above is one
+        # decision we know the name of; this catches the ones we do not.
+        # Victor's rule, 25/ago/2026: a decision is thinking and must never be
+        # shown to the contact — carrying the action out is the whole job.
+        #
+        # This inverts the failure mode that produced every leak so far. It
+        # used to be: recogniser does not know this spelling → deliver it.
+        # Now: it looks like a token → stay silent, and say so loudly, because
+        # a decision we cannot name is something we need to find out about
+        # rather than something the contact should read.
+        if _is_internal_control_artifact(cleaned):
+            logger.warning(
+                "[WhatsApp] Suppressed an unrecognised control token instead of "
+                "delivering it: %r. The contact correctly received nothing. If "
+                "this is a real decision the model is trying to signal, teach "
+                "the recogniser in gateway/response_filters.py about it.",
+                cleaned.strip()[:60],
+            )
             return None
         # ── Effectively-empty reply: strip invisible format chars and odd
         # unicode spaces (the same classes the WhatsApp transport strips on

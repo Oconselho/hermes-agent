@@ -7,6 +7,7 @@ conversation history.
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from typing import Any
 
@@ -100,6 +101,73 @@ def is_whatsapp_silence_marker(text: Any) -> bool:
     # secretary does — she has no message that reduces to this one adjective.
     core = "".join(ch for ch in candidate if ch.isalnum())
     return core.upper() in _WHATSAPP_SILENCE_WORDS
+
+
+# ---------------------------------------------------------------------------
+# Control tokens in general: a decision written where a sentence belongs
+# ---------------------------------------------------------------------------
+#
+# ``[SILENCIOSO]`` is one instance of a class, and the class is the real bug.
+# The model writes an internal DECISION into the reply channel and the gateway
+# is supposed to read it and act. Every leak so far came from the recogniser
+# being a LIST OF SPELLINGS, and a list is always one step behind the model:
+# literal ``[SILENCIOSO]`` (jun–ago), then ``[ SILENCIOSO ]`` (four patients,
+# 09–11/ago), then ``[ S I L E N C I O S O ]`` (five contacts, 09–25/ago).
+# Tomorrow it is ``[QUIETO]`` or ``[NAO RESPONDER]`` and the list is behind
+# again.
+#
+# Victor's rule, 25/ago/2026: *the decision is thinking, it must never be shown
+# to the contact — just carry the action out.* So the question here is
+# STRUCTURAL, not lexical: is the whole reply a delimited token rather than
+# something a person would say? If it is, the contact gets silence whether or
+# not we recognise the word inside.
+#
+# That inverts the failure mode, which is the point. Before: unrecognised
+# token → delivered. After: unrecognised token → silence, and a loud log line
+# so a decision we do not know about is something we find out about.
+#
+# Why the shape is safe to suppress: across all 757 replies the secretary has
+# ever sent, the only whole-message delimited tokens are the 153 silence
+# markers and 10 ``(empty)`` placeholders (never delivered — no
+# ``Sending response (7 chars)`` exists in any log). Not one real reply has
+# this shape. She answers in sentences.
+_CONTROL_TOKEN_RE = re.compile(
+    r"^[*_~`\s]*"                    # markdown emphasis the model adds sometimes
+    r"[\[\{(<]"                       # opening delimiter
+    r"([^\[\]\{\}()<>]{1,40})"         # the token itself, short and unnested
+    r"[\]\})>]"                       # closing delimiter
+    r"[*_~`\s]*[.!]*$"
+)
+
+# Sentence punctuation INSIDE the delimiters means it is prose in brackets, not
+# a token — "(Já enviei.)" and "(Se preferir, falo com a recepção.)" are things
+# the secretary may legitimately say. A control token has no sentence in it.
+_SENTENCE_PUNCTUATION = frozenset(".,;:?!")
+
+
+def is_internal_control_artifact(text: Any) -> bool:
+    """True when the whole reply is a control token rather than a message.
+
+    Deliberately narrower than :func:`is_whatsapp_silence_marker`: that one
+    knows the word and accepts any decoration, this one knows the shape and
+    accepts any word. Together they cover both "a spelling we did not predict"
+    and "a token we did not predict".
+    """
+    if not text:
+        return False
+    candidate = unicodedata.normalize("NFKD", str(text))
+    candidate = "".join(ch for ch in candidate if not unicodedata.combining(ch))
+    match = _CONTROL_TOKEN_RE.match(candidate.strip())
+    if not match:
+        return False
+    inside = match.group(1)
+    if any(ch in _SENTENCE_PUNCTUATION for ch in inside):
+        return False
+    core = "".join(ch for ch in inside if ch.isalnum())
+    # A bare number in brackets is not a decision — "(71996691002)" is data.
+    if not core or not any(ch.isalpha() for ch in core):
+        return False
+    return len(core) <= 20
 
 
 def is_intentional_silence_response(response: Any) -> bool:

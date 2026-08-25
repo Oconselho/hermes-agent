@@ -448,6 +448,32 @@ class TestSendSilenceMarkerBackstop:
         with caplog.at_level(_logging.WARNING):
             await adapter.send("chat1", "[SILENCIOSO]")
         assert any(
-            "Blocked stay-silent marker" in r.getMessage()
+            "Blocked an internal control token" in r.getMessage()
             for r in caplog.records
         ), "the backstop must say so at WARNING level"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("token", [
+        "[QUIETO]",
+        "[NAO RESPONDER]",
+        "[SEM RESPOSTA]",
+        "(empty)",
+        "[ S I L E N C I O S O ]",
+    ])
+    async def test_a_token_we_never_taught_it_is_blocked_here_too(self, token):
+        """25/ago/2026. The backstop stopped asking "is this THE marker?" and
+        started asking "is this a control token at all?".
+
+        Recognising one more spelling was never going to hold: the marker
+        escaped three times in three weeks, each time in a spelling the
+        recogniser's list did not have. The contact must never read a decision
+        the model wrote for us, whatever the model decided to call it.
+        """
+        adapter = _make_adapter()
+        adapter._http_session.post = MagicMock()
+
+        result = await adapter.send("chat1", token)
+
+        assert adapter._http_session.post.call_count == 0, "token hit the bridge"
+        assert result.success
+        assert result.message_id is None
