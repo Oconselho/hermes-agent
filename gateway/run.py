@@ -130,9 +130,68 @@ def _whatsapp_silent_agent_result() -> Dict[str, Any]:
 # spellings of "is this the marker?" is how it reached contacts twice; the
 # alias keeps the long-standing private name importable.
 from gateway.response_filters import (  # noqa: E402
+    DELIVER as _DELIVER,
+    GATEWAY_SILENCE_KEY as _GATEWAY_SILENCE_KEY,
+    SILENCE_REASON_MARKER as _SILENCE_REASON_MARKER,
     is_internal_control_artifact as _is_internal_control_artifact,
     is_whatsapp_silence_marker as _whatsapp_is_silence_marker,
+    reads_as_human_message as _reads_as_human_message,
+    whatsapp_reply_disposition as _whatsapp_reply_disposition,
 )
+
+
+def _normalize_whatsapp_silence_decision(result: Any, source: Any) -> None:
+    """Turn a decision the model WROTE into a fact on the result envelope.
+
+    This is the door, and it is the whole architectural point of the change.
+
+    The gateway already had an out-of-band way to say "this turn sends
+    nothing" — ``_whatsapp_silent_agent_result`` puts it in the envelope, and
+    ``is_intentional_silence_agent_result`` reads it there. Gateway-originated
+    silence (cooldowns, spam) has always used it. Only MODEL-originated silence
+    was different: it travelled as a magic string inside the very field that
+    holds the text for the contact. In-band signalling, and it failed the way
+    in-band signalling always fails — the signal got delivered as content.
+
+    Every leak was a symptom of that one choice. The token was still a string
+    in flight at the queued-follow-up resend (six messages, 03–18/ago/2026,
+    which read the raw dict), still a string at the finalizer (four patients,
+    09–11/ago), still a string at the adapter. Each fix taught one more road to
+    recognise it, because the string kept travelling.
+
+    So it stops travelling. Called once, immediately after the agent returns
+    and BEFORE anything reads the dict — the resend branch included — this
+    replaces the text with "" and stamps the reason on the envelope. From here
+    down there is no token to recognise, on any road, because there is no token.
+
+    Failed turns are left alone on purpose: a failure is not a decision, and
+    the error path must stay free to surface it.
+    """
+    if not isinstance(result, dict):
+        return
+    if _gateway_platform_value(getattr(source, "platform", None)) != "whatsapp":
+        return
+    if result.get("failed"):
+        return
+    raw = result.get("final_response")
+    if not isinstance(raw, str) or not raw.strip():
+        return
+    disposition = _whatsapp_reply_disposition(raw)
+    if disposition == _DELIVER:
+        return
+    result["final_response"] = ""
+    result[_GATEWAY_SILENCE_KEY] = disposition
+    if disposition == _SILENCE_REASON_MARKER:
+        # The model doing its job, ~150 times a month. No noise.
+        logger.debug("[WhatsApp] Turn says nothing (%s).", disposition)
+    else:
+        logger.warning(
+            "[WhatsApp] Withheld a reply that is not a message for a person "
+            "(%s): %r. Nothing was sent, which is the safe outcome. If this "
+            "was real text the contact needed, the prose contract in "
+            "gateway/response_filters.py is what withheld it.",
+            disposition, raw.strip()[:80],
+        )
 
 
 # A WhatsApp patient often sends an attachment, its caption, and a short
@@ -1694,6 +1753,21 @@ def _sanitize_gateway_final_response(
         _visible = re.sub(r"[\u00a0\u1680\u180e\u2000-\u200a\u202f\u205f\u3000]", " ", _visible)
         if not _visible.strip():
             return None  # SILENCE: nothing visible to send
+        # ── The positive contract. Everything above this line is a blocklist,
+        # and a blocklist only ever refuses what someone already watched leak.
+        # This asks whether the text reads like something the secretary would
+        # SAY; if it does not, it is machinery and the contact does not get it,
+        # named or not. The door above should mean this never fires for a model
+        # reply — it is here because the door only covers the agent path, and
+        # every other road ends here.
+        if not _reads_as_human_message(_visible):
+            logger.warning(
+                "[WhatsApp] Withheld a reply that does not read as a message "
+                "for a person: %r. Nothing was sent. This is the positive "
+                "contract in gateway/response_filters.py, not a named guard.",
+                _visible.strip()[:80],
+            )
+            return None  # SILENCE: not a message for a person
         # Block leaked tool names (colon format: "terminal: cmd")
         if re.search(r"(?im)^\s*(terminal|execute_code|search_files|read_file|browser_[a-z_]+|skill_view|session_search)\s*:", cleaned):
             return "Recebi sua mensagem. O Dr. Victor verificará assim que possível."
@@ -21851,6 +21925,13 @@ REGRAS ABSOLUTAS:
                 except Exception:
                     pass
                 reset_current_session_key(_approval_session_token)
+            # ── THE DOOR ─────────────────────────────────────────────────
+            # Model output becomes a gateway result here, and this is the last
+            # moment only one piece of code is holding it. Convert a written
+            # decision into an envelope fact now, so no road downstream — the
+            # queued-follow-up resend at the bottom of this function included —
+            # can ever mistake it for something to say.
+            _normalize_whatsapp_silence_decision(result, source)
             result_holder[0] = result
 
             # Signal the stream consumer that the agent is done

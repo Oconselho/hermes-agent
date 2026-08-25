@@ -170,6 +170,89 @@ def is_internal_control_artifact(text: Any) -> bool:
     return len(core) <= 20
 
 
+# ---------------------------------------------------------------------------
+# The positive contract: is this a message for a person?
+# ---------------------------------------------------------------------------
+#
+# Everything above is a blocklist — a list of things that must not go out. A
+# blocklist is structurally always behind the model: it can only refuse what
+# someone already watched leak. Three leaks in three weeks, each one a spelling
+# the list did not have yet, and each fix taught it exactly one more.
+#
+# This asks the opposite question, and it is the one a delivery boundary should
+# have been asking all along: does this read like something the secretary would
+# SAY? Whatever fails that is not delivered — a token, a constant, a sentinel,
+# a fragment of machinery nobody has thought of yet — without anyone having to
+# name it first.
+#
+# The discriminator comes from the data, not from taste. Across the 762 replies
+# the secretary has ever produced, every real one carries lowercase letters
+# (the smallest, "Olá. Envie seu recado.", has 15) and every internal artifact
+# carries none: ``NO_REPLY``, ``[SILENT]``, ``SECRETARY_MODEL_TEST_OK``,
+# ``[SILENCIOSO]``. Portuguese written to a person has lowercase in it; machine
+# tokens are SHOUTED, by a convention older than this codebase.
+#
+# But "no lowercase" alone would be too greedy, and a test caught it doing
+# exactly that: a bare "71 99669-1002" has no lowercase either, and a phone
+# number is terse, not machinery. So the rule is narrower and says only what
+# the evidence supports — **a reply that contains WORDS but not one lowercase
+# letter is a machine token**. Text with no word in it at all (a number, a
+# time, an emoji) is not judged here; the other guards decide.
+#
+# The residual cost, stated plainly: a legitimate reply written entirely in
+# capitals would be withheld. None of the 762 is one, the secretary is
+# prompted to write formally, and every suppression is logged at WARNING — so
+# that failure lands in the log where it can be seen, instead of on a
+# patient's screen where it cannot.
+_WORD_RUN_RE = re.compile(r"[^\W\d_]{2,}", re.UNICODE)
+
+_INVISIBLE_RE = re.compile(
+    r"[\u200b\u2060\u2063\ufeff\u00ad\u00a0\u1680\u180e\u2000-\u200a\u202f\u205f\u3000]"
+)
+
+
+def reads_as_human_message(text: Any) -> bool:
+    """False only for text that is clearly machinery rather than speech."""
+    if not text:
+        return False
+    candidate = str(text)
+    if not _WORD_RUN_RE.search(candidate):
+        # No word in it at all — "71 99669-1002", "14h", an emoji. Terse, but
+        # nothing here says machine. Let the other guards judge it.
+        return True
+    return any(ch.islower() for ch in candidate)
+
+
+# Why a disposition and not a bool: the caller has to log WHY nothing was sent.
+# "silence-marker" is the model doing its job ~150 times a month and deserves no
+# noise; anything else is a thing we did not know about and must be loud.
+SILENCE_REASON_EMPTY = "empty"
+SILENCE_REASON_MARKER = "silence-marker"
+SILENCE_REASON_CONTROL_TOKEN = "control-token"
+SILENCE_REASON_NOT_A_MESSAGE = "not-a-message"
+DELIVER = "deliver"
+
+
+def whatsapp_reply_disposition(text: Any) -> str:
+    """Decide what to do with a model reply: deliver it, or why not.
+
+    The order matters only for the log line — every non-``deliver`` outcome is
+    the same action, which is to send nothing.
+    """
+    if text is None:
+        return SILENCE_REASON_EMPTY
+    stripped = _INVISIBLE_RE.sub("", str(text)).strip()
+    if not stripped:
+        return SILENCE_REASON_EMPTY
+    if is_whatsapp_silence_marker(stripped):
+        return SILENCE_REASON_MARKER
+    if is_internal_control_artifact(stripped):
+        return SILENCE_REASON_CONTROL_TOKEN
+    if not reads_as_human_message(stripped):
+        return SILENCE_REASON_NOT_A_MESSAGE
+    return DELIVER
+
+
 def is_intentional_silence_response(response: Any) -> bool:
     """Return True only when ``response`` is exactly a silence marker.
 
@@ -187,12 +270,22 @@ def is_intentional_silence_response(response: Any) -> bool:
     return any(candidate in LIVE_GATEWAY_SILENT_MARKERS for candidate in _canonical_silence_candidates(stripped))
 
 
+# The envelope key the gateway stamps once, at the door, when it has already
+# decided this turn says nothing. See ``_normalize_whatsapp_silence_decision``
+# in gateway/run.py: after that stamp the decision is a FACT ON THE RESULT, not
+# a string in flight, and no downstream road can mistake it for text to send.
+GATEWAY_SILENCE_KEY = "gateway_intentional_silence"
+
+
 def is_intentional_silence_agent_result(agent_result: dict | None, response: Any) -> bool:
     """Silence markers suppress delivery only for successful agent turns."""
     if not isinstance(agent_result, dict):
         return False
     if agent_result.get("failed"):
         return False
+    # Stamped at the door: the decision was made before anyone read the text.
+    if agent_result.get(GATEWAY_SILENCE_KEY):
+        return True
     return is_intentional_silence_response(response)
 
 

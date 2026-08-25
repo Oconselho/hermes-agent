@@ -25,8 +25,14 @@ from __future__ import annotations
 
 import pytest
 
-from gateway.response_filters import is_internal_control_artifact
+from gateway.response_filters import (
+    is_intentional_silence_agent_result,
+    is_internal_control_artifact,
+    reads_as_human_message,
+    whatsapp_reply_disposition,
+)
 from gateway.run import (
+    _normalize_whatsapp_silence_decision,
     _queued_followup_resend_text,
     _sanitize_gateway_final_response,
     _whatsapp_finalize_secretary_response,
@@ -401,3 +407,205 @@ def test_the_adapter_backstop_asks_both_questions_too():
     assert adapter_word is _whatsapp_is_silence_marker
     for token in UNKNOWN_CONTROL_TOKENS + SPACED_OUT_VARIANTS:
         assert adapter_structural(token) or adapter_word(token)
+
+
+# ---------------------------------------------------------------------------
+# The door: a decision stops being a string in flight
+# ---------------------------------------------------------------------------
+#
+# Everything above this line is remediation — guards that recognise a token
+# while it travels toward the contact. Victor, 25/ago/2026: "chega de
+# remediação."
+#
+# The gateway always had an out-of-band channel for "this turn sends nothing":
+# ``_whatsapp_silent_agent_result`` puts it in the envelope and
+# ``is_intentional_silence_agent_result`` reads it there. Gateway-originated
+# silence used it from the start. Model-originated silence did not — it rode
+# inside the field that holds the contact's text. That is in-band signalling,
+# and it failed the way in-band signalling always fails.
+#
+# ``_normalize_whatsapp_silence_decision`` runs once, where the agent's result
+# is born, before any road reads it. After it, the token does not exist.
+
+
+class _WhatsAppSource:
+    class _Platform:
+        value = "whatsapp"
+
+    platform = _Platform()
+
+
+class _TelegramSource:
+    class _Platform:
+        value = "telegram"
+
+    platform = _Platform()
+
+
+DECISIONS_THE_MODEL_MIGHT_WRITE = (
+    SILENT_VARIANTS + UNKNOWN_CONTROL_TOKENS + ["NO_REPLY", "SECRETARY_MODEL_TEST_OK"]
+)
+
+
+@pytest.mark.parametrize("written", DECISIONS_THE_MODEL_MIGHT_WRITE)
+def test_the_decision_never_survives_the_door_as_text(written):
+    result = {"final_response": written, "messages": [], "api_calls": 1}
+
+    _normalize_whatsapp_silence_decision(result, _WhatsAppSource())
+
+    assert result["final_response"] == "", "the token is still a string in flight"
+    assert result["gateway_intentional_silence"], "the decision must be on the envelope"
+    # And the envelope is what the delivery path reads, so the empty text is
+    # never mistaken for a model failure and rewritten into an error message.
+    assert is_intentional_silence_agent_result(result, result["final_response"]) is True
+
+
+@pytest.mark.parametrize("written", DECISIONS_THE_MODEL_MIGHT_WRITE)
+def test_the_road_that_leaked_in_agosto_has_nothing_left_to_read(written):
+    """03–18/ago/2026: the queued-follow-up resend read the RAW agent dict and
+    resent it verbatim — six messages to three contacts.
+
+    That road was fixed by teaching it to sanitize. This is the stronger
+    statement: there is nothing there to sanitize any more.
+    """
+    result = {"final_response": written, "messages": [], "api_calls": 1}
+    _normalize_whatsapp_silence_decision(result, _WhatsAppSource())
+
+    assert _queued_followup_resend_text("whatsapp", result["final_response"]) == ""
+
+
+@pytest.mark.parametrize("real", [
+    "Bom dia. Recebi seu exame.",
+    "Olá. Envie seu recado.",
+    "Obrigada.",
+    "A recepção atende pelo WhatsApp: 71 99669-1002.",
+    "O exame precisa ser feito em ambiente silencioso.",
+])
+def test_real_speech_passes_the_door_untouched(real):
+    result = {"final_response": real, "messages": [], "api_calls": 1}
+    _normalize_whatsapp_silence_decision(result, _WhatsAppSource())
+    assert result["final_response"] == real
+    assert "gateway_intentional_silence" not in result
+
+
+def test_a_failed_turn_is_not_a_decision():
+    """A failure must stay visible: the error path exists to surface it, and
+    silently swallowing it would hide outages behind "the model chose silence".
+    """
+    result = {"final_response": "[SILENCIOSO]", "failed": True, "messages": []}
+    _normalize_whatsapp_silence_decision(result, _WhatsAppSource())
+    assert result["final_response"] == "[SILENCIOSO]"
+    assert "gateway_intentional_silence" not in result
+    assert is_intentional_silence_agent_result(result, "[SILENCIOSO]") is False
+
+
+def test_only_whatsapp_is_normalised():
+    """The marker is the WhatsApp secretary's contract. Other platforms keep
+    their own text untouched — this door is not a global rewrite.
+    """
+    result = {"final_response": "[SILENCIOSO]", "messages": []}
+    _normalize_whatsapp_silence_decision(result, _TelegramSource())
+    assert result["final_response"] == "[SILENCIOSO]"
+
+
+def test_the_door_is_idempotent():
+    """It runs once per turn today, but a second call must not invent silence
+    out of the empty string it just wrote.
+    """
+    result = {"final_response": "[SILENCIOSO]", "messages": []}
+    _normalize_whatsapp_silence_decision(result, _WhatsAppSource())
+    first = dict(result)
+    _normalize_whatsapp_silence_decision(result, _WhatsAppSource())
+    assert result == first
+
+
+# ---------------------------------------------------------------------------
+# The positive contract
+# ---------------------------------------------------------------------------
+#
+# Calibrated on all 762 replies the secretary has ever produced: every real one
+# carries lowercase letters, every internal artifact carries none.
+
+
+# Words, but not one lowercase letter among them. That is the whole test.
+NOT_MESSAGES_FOR_A_PERSON = [
+    "NO_REPLY",
+    "NO REPLY",
+    "SILENT",
+    "SECRETARY_MODEL_TEST_OK",
+    "[SILENCIOSO]",
+    "ERROR",
+    "OK_DONE",
+    "XYZZY_PLUGH",
+]
+
+
+@pytest.mark.parametrize("artifact", NOT_MESSAGES_FOR_A_PERSON)
+def test_machinery_is_not_a_message(artifact):
+    assert reads_as_human_message(artifact) is False
+    assert _sanitize_gateway_final_response("whatsapp", artifact) is None
+
+
+# Terse, but not machinery: no word in them at all, so the prose contract
+# abstains and lets the shape guards judge. A bare phone number withheld would
+# be the opposite failure \u2014 a patient who asked for a number and got silence.
+TERSE_BUT_REAL = [
+    "71 99669-1002",
+    "(71996691002)",
+    "14h",
+    "\ud83d\udc4d",
+]
+
+
+@pytest.mark.parametrize("text", TERSE_BUT_REAL)
+def test_the_prose_contract_abstains_on_wordless_replies(text):
+    assert reads_as_human_message(text) is True
+
+
+def test_the_spaced_marker_is_caught_by_shape_not_by_prose():
+    """Worth pinning because it looks like an omission and is not.
+
+    "[ S I L E N C I O S O ]" has no run of two consecutive letters, so the
+    prose contract abstains on it exactly as it abstains on a phone number.
+    The word guard is what stops it \u2014 which is the layering working, each test
+    answering the question it is competent to answer.
+    """
+    spaced = "[ S I L E N C I O S O ]"
+    assert reads_as_human_message(spaced) is True
+    assert _whatsapp_is_silence_marker(spaced) is True
+    assert _sanitize_gateway_final_response("whatsapp", spaced) is None
+
+
+@pytest.mark.parametrize("real", REAL_TEXT + [
+    "Olá. Envie seu recado.",
+    "Recebido. O Dr. Victor verificará.",
+    "A recepção atende pelo WhatsApp: 71 99669-1002.",
+    "Combinado, Nilvo! Tenha uma excelente semana! 👍",
+])
+def test_every_real_reply_reads_as_a_message(real):
+    assert reads_as_human_message(real) is True
+
+
+def test_the_contract_is_positive_not_a_longer_blocklist():
+    """The point of the whole change: a token nobody has ever seen, that no
+    guard names, is still withheld — because it is not prose, not because it
+    is on a list.
+    """
+    invented = "XYZZY_PLUGH_42"
+    assert whatsapp_reply_disposition(invented) == "not-a-message"
+    assert _whatsapp_is_silence_marker(invented) is False
+    assert is_internal_control_artifact(invented) is False
+    assert _sanitize_gateway_final_response("whatsapp", invented) is None
+
+
+def test_the_withholding_is_logged_loudly(caplog):
+    """Silence toward the contact, noise in the log. A reply withheld without a
+    trace would be the same mistake in the other direction.
+    """
+    import logging as _logging
+
+    with caplog.at_level(_logging.WARNING):
+        assert _sanitize_gateway_final_response("whatsapp", "SECRETARY_MODEL_TEST_OK") is None
+    assert any(
+        "does not read as a message" in r.getMessage() for r in caplog.records
+    ), "a withheld reply must be visible in the log"
