@@ -8,7 +8,15 @@ and 11/ago/2026 — three as
 prepends identity on a fresh conversation) and one bare, once identity had
 already been disclosed earlier in the session.
 
-The variants below are the real one from production plus the spellings a model
+Then the same model spaced out the letters — ``[ S I L E N C I O S O ]`` — and
+the regex written for the first leak, which described the decoration *around*
+the word, had nothing to say about a separator INSIDE it. Five of those
+between 09 and 25/ago/2026; four reached contacts. So the recogniser stopped
+enumerating shapes and started erasing decoration: keep letters and digits,
+require the remainder to BE the word. ``SPACED_OUT_VARIANTS`` below is that
+class, and it is deliberately wider than what production has shown.
+
+The variants are the real ones from production plus the spellings a model
 plausibly reaches for. The second half of the file is the other half of the
 contract: text that merely *mentions* the word is real text and must survive.
 """
@@ -51,6 +59,29 @@ SILENT_VARIANTS = [
 ]
 
 
+# The second spelling that reached contacts: the letters themselves pulled
+# apart. The first entry is byte-for-byte what Nilvo Luiz Cassol received on
+# 25/ago/2026 at 13:07 BRT; the rest are the same idea with other separators,
+# because the point of the fix is that the separator does not matter.
+SPACED_OUT_VARIANTS = [
+    "[ S I L E N C I O S O ]",   # 25/ago/2026 13:07 BRT — 23 chars, delivered
+    "S I L E N C I O S O",
+    "[S I L E N C I O S O]",
+    "[ s i l e n c i o s o ]",
+    "S.I.L.E.N.C.I.O.S.O",
+    "S-I-L-E-N-C-I-O-S-O",
+    "S_I_L_E_N_C_I_O_S_O",
+    "[ S  I  L  E  N  C  I  O  S  O ]",
+    "Sil enc ioso",
+    "[ S I L E N C I O S A ]",
+    "**S I L E N C I O S O**",
+    "[ S I L E N C I O S O ].",
+    "[\u00a0S\u00a0I\u00a0L\u00a0E\u00a0N\u00a0C\u00a0I\u00a0O\u00a0S\u00a0O\u00a0]",  # non-breaking spaces
+]
+
+SILENT_VARIANTS += SPACED_OUT_VARIANTS
+
+
 @pytest.mark.parametrize("variant", SILENT_VARIANTS)
 def test_marker_variants_are_recognised(variant):
     assert _whatsapp_is_silence_marker(variant) is True
@@ -63,6 +94,12 @@ def test_marker_variants_never_reach_a_patient(variant):
 
 REAL_TEXT = [
     "Bom dia! Aqui é a assistente do Dr. Victor Almeida.",
+    # Erasing decoration must not start swallowing prose: each of these keeps
+    # at least one letter the marker does not have, so the equality fails.
+    "silencioso2",
+    "S I L E N C I O S O agora",
+    "Não silencioso",
+    "silenciosos",
     "O consultório fica em silêncio após as 18h.",
     "O exame precisa ser feito em ambiente silencioso.",
     "Prefere um horário mais silencioso, no início da manhã?",
@@ -190,3 +227,81 @@ def test_the_resend_applies_the_same_sanitizer_as_the_delivery_path():
     for probe in SILENT_VARIANTS + REAL_TEXT:
         delivered = _sanitize_gateway_final_response("whatsapp", probe)
         assert _queued_followup_resend_text("whatsapp", probe) == (delivered or "")
+
+
+# ---------------------------------------------------------------------------
+# The third road: the letters pulled apart
+# ---------------------------------------------------------------------------
+#
+# 09/ago 10:45, 17/ago 13:15, 20/ago 08:35, 22/ago 22:20 and 25/ago 13:07 BRT
+# (all times BRT). Four were delivered — Samuel Bach/Rapidoc, Lígia Souza,
+# 5511995631610 and Nilvo Luiz Cassol. Three of those four happened AFTER the
+# 18/ago fix, which is what makes this its own road rather than a relapse.
+
+
+@pytest.mark.parametrize("variant", SPACED_OUT_VARIANTS)
+def test_spaced_out_letters_are_the_marker(variant):
+    assert _whatsapp_is_silence_marker(variant) is True
+
+
+@pytest.mark.parametrize("variant", SPACED_OUT_VARIANTS)
+def test_spaced_out_letters_never_reach_a_contact(variant):
+    assert _sanitize_gateway_final_response("whatsapp", variant) is None
+
+
+@pytest.mark.parametrize("variant", SPACED_OUT_VARIANTS)
+def test_spaced_out_letters_are_not_resent_before_a_queued_followup(variant):
+    assert _queued_followup_resend_text("whatsapp", variant) == ""
+
+
+def test_the_exact_string_nilvo_received():
+    """Regression pin: 23 characters, 25/ago/2026 13:07 BRT, chat 557799711049.
+
+    He had just written "Obrigado não é urgente ok" — a message the secretary
+    was right to stay silent on. The silence decision was correct; only its
+    spelling escaped.
+    """
+    leaked = "[ S I L E N C I O S O ]"
+    assert len(leaked) == 23
+    assert _whatsapp_is_silence_marker(leaked) is True
+    assert _sanitize_gateway_final_response("whatsapp", leaked) is None
+    assert _queued_followup_resend_text("whatsapp", leaked) == ""
+
+
+def test_the_adapter_backstop_also_blocks_the_spaced_form():
+    """Both roads share one recogniser, so fixing it fixes both at once.
+
+    That was the design decision of 18/ago/2026 and this is the first time it
+    paid off: the adapter's outbound block imports the same function, so it
+    needed no change of its own.
+    """
+    from plugins.platforms.whatsapp.adapter import (
+        is_whatsapp_silence_marker as adapter_recogniser,
+    )
+
+    assert adapter_recogniser is _whatsapp_is_silence_marker
+    for variant in SPACED_OUT_VARIANTS:
+        assert adapter_recogniser(variant) is True
+
+
+def test_the_identity_prefixed_spaced_form_alcina_received():
+    """09/ago/2026 10:45 BRT — 66 chars, and the shape that hid the delivery.
+
+    The log reads ``response ready ... 23 chars`` then
+    ``Sending response (66 chars)``, which looks at a glance like the marker
+    was stopped and something else sent. It was not: 42 (the identity line) +
+    1 + 23 (the marker) = 66. The finalizer had assembled identity around a
+    marker the sanitizer let through — exactly the shape of the 09–11/ago
+    leaks, in the spelling the 18/ago fix did not cover.
+
+    So the assembled line must still be ordinary text (suppressing it would
+    hide real replies), and the bare marker must stop before the identity step
+    can build it.
+    """
+    identity = "Aqui é a assistente do Dr. Victor Almeida."
+    marker = "[ S I L E N C I O S O ]"
+    assembled = f"{identity} {marker}"
+    assert len(assembled) == 66
+
+    assert _whatsapp_is_silence_marker(assembled) is False
+    assert _sanitize_gateway_final_response("whatsapp", marker) is None

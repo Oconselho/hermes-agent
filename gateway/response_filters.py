@@ -7,7 +7,6 @@ conversation history.
 
 from __future__ import annotations
 
-import re
 import unicodedata
 from typing import Any
 
@@ -71,10 +70,22 @@ def _canonical_silence_candidates(text: str) -> tuple[str, ...]:
 # Match the whole reply only. A response that merely mentions the word in a
 # sentence is real text and must be delivered untouched; silence is the right
 # outcome only when the marker IS the entire message.
-_WHATSAPP_SILENCE_MARKER_RE = re.compile(
-    r"^[\[\{\(<*_\s]*silencios[oa][\]\}\)>*_\s]*[.!]*$",
-    re.IGNORECASE,
-)
+#
+# This recogniser ERASES decoration instead of enumerating it, and that is the
+# whole lesson of the third leak. Version one compared the literal
+# ``[SILENCIOSO]``. Version two (18/ago/2026) became a regex that allowed
+# brackets, emphasis and spaces *around* the word. gpt-5.6-luna then wrote the
+# letters themselves apart — ``[ S I L E N C I O S O ]`` — and a pattern
+# describing wrappers has nothing to say about a separator INSIDE the word.
+# Five of those, 09/ago–25/ago/2026; four were delivered, the last to a patient
+# on 25/ago 13:07 BRT.
+#
+# So the test is now: drop everything that is not a letter or a digit, and
+# require what is left to BE the word. That subsumes by construction every
+# shape the previous versions listed — brackets, braces, angle brackets,
+# markdown emphasis, trailing punctuation, every class of space, zero-width
+# smuggling — plus the separations nobody thought to list.
+_WHATSAPP_SILENCE_WORDS = frozenset({"SILENCIOSO", "SILENCIOSA"})
 
 
 def is_whatsapp_silence_marker(text: Any) -> bool:
@@ -83,13 +94,12 @@ def is_whatsapp_silence_marker(text: Any) -> bool:
         return False
     candidate = unicodedata.normalize("NFKD", str(text))
     candidate = "".join(ch for ch in candidate if not unicodedata.combining(ch))
-    # Strip the invisible/odd-space classes the transport strips anyway, so a
-    # zero-width character cannot smuggle the marker past this check.
-    candidate = re.sub(r"[\u200b\u2060\u2063\ufeff]", "", candidate)
-    candidate = re.sub(
-        r"[\u00a0\u1680\u180e\u2000-\u200a\u202f\u205f\u3000]", " ", candidate
-    )
-    return bool(_WHATSAPP_SILENCE_MARKER_RE.match(candidate.strip()))
+    # Keep letters and digits, drop everything else. Digits are kept on purpose
+    # so ``silencioso2`` stays ordinary text; the safety comes from requiring
+    # the remainder to equal the word exactly, which no real reply from the
+    # secretary does — she has no message that reduces to this one adjective.
+    core = "".join(ch for ch in candidate if ch.isalnum())
+    return core.upper() in _WHATSAPP_SILENCE_WORDS
 
 
 def is_intentional_silence_response(response: Any) -> bool:
