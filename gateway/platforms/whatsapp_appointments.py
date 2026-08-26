@@ -2259,6 +2259,68 @@ class AppointmentStore:
             )
         return {"id": outbox_id, "chat_key": reception_chat_id, "body": body}
 
+    def enqueue_doctor_promise(
+        self,
+        chat_key: str,
+        notice_chat_id: str,
+        *,
+        now: datetime,
+        details: Mapping[str, str] | None = None,
+    ) -> dict[str, str] | None:
+        """Make "vou registrar para o Dr. Victor avaliar e retornar" true.
+
+        The fourth promise this codebase has had to put code behind, and the
+        one that had gone unnoticed longest because it is the sentence the
+        secretary says most often to everyone who is not booking a
+        consultation. On 26/ago/2026 RICKY asked for a psychiatry referral and
+        was told exactly this; nothing was queued, and the request reached
+        nobody.
+
+        Goes to Victor's own line, never to reception. Reception's WhatsApp
+        carries patients (Victor, 15/ago/2026) and this sentence does not
+        belong to patients — a replay of August found it promised to a
+        supplier, a speaking invitation and a telemedicine partner as readily
+        as to a patient asking for a document. Sorting those apart is a
+        judgement, and Victor is the one who makes it; the notice's whole job
+        is to put it in front of him.
+
+        Bucketed by the hour, like the clinical notice and the lead question,
+        so a burst collapses into one line while someone who writes again
+        after lunch is heard again.
+
+        Carries what the contact asked, trimmed and with identity digits
+        blanked, for the same reason the lead question does — it is what makes
+        the notice triageable at a glance. Unlike that one it also keeps the
+        chat link, because this destination *can* open the thread: it is the
+        same WhatsApp the conversation is already in.
+        """
+
+        bucket = now.strftime("%Y-%m-%dT%H")
+        idempotency_key = _opaque_id("victor-promise", chat_key, bucket)
+        outbox_id = _opaque_id("outbox", idempotency_key)
+        lines = [
+            "📌 *Promessa de retorno* — a secretária disse que o senhor "
+            "avaliaria e retornaria.",
+            "",
+        ]
+        lines.extend(f"{label}: {value}" for label, value in (details or {}).items())
+        if len(lines) > 2:
+            lines.append("")
+        lines.append(
+            "A recepção não foi avisada: este contato não é atendimento dela."
+        )
+        body = "\n".join(lines)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO outbox_events
+                    (id, idempotency_key, chat_key, body, state, created_at, sent_at)
+                VALUES (?, ?, ?, ?, 'PENDING', ?, NULL)
+                """,
+                (outbox_id, idempotency_key, notice_chat_id, body, now.isoformat()),
+            )
+        return {"id": outbox_id, "chat_key": notice_chat_id, "body": body}
+
     def claim_expiration(
         self,
         appointment_id: int | str,
@@ -3673,6 +3735,68 @@ class WhatsAppAppointmentsHandler:
         except Exception:
             logger.warning(
                 "lead question notice could not be queued", exc_info=True
+            )
+
+    def note_doctor_escalation(self, incoming: Any) -> None:
+        """Queue the notice a "Dr. Victor vai avaliar e retornar" promise makes.
+
+        Same seam and same best-effort contract as the two routes above. The
+        destination is ``clinical_notice_chat_id`` — Victor's own line — and
+        never reception, which is the whole reason this is a third route
+        instead of a wider version of the second one.
+
+        **There is deliberately no organization lock here**, and that is the
+        one line to read before changing this method. The other two routes
+        drop companies because they end at reception, and reception's WhatsApp
+        is for patients (Victor, 15/ago/2026). This one ends at Victor, who
+        already answers suppliers, partner platforms and banks on this very
+        number — dropping them here would recreate, at his own line, exactly
+        the silent unkept promise this route exists to close. A company that
+        was told Dr. Victor would come back is owed that as much as a patient
+        is.
+        """
+
+        if not self._enabled:
+            return
+        if not self._clinical_notice_chat_id:
+            logger.warning(
+                "doctor promise not queued: clinical_notice_chat_id is unset, "
+                "so the promise made to the contact has no destination"
+            )
+            return
+        if not self._db_path.exists():
+            return
+        try:
+            source = getattr(incoming, "source", None)
+            chat_key = str(getattr(source, "chat_id", "") or "")
+            if not chat_key or self._is_reception_chat(chat_key):
+                return
+            # Victor's line answers on this same secretary, so without this the
+            # notice channel would page itself the moment he typed a promise
+            # into his own self-chat — which the August replay shows happening
+            # twice, on 03/ago and 12/ago. Mirrors both routes above.
+            if self._is_clinical_notice_chat(chat_key):
+                return
+            details: dict[str, str] = {}
+            local_digits = _chat_phone(chat_key)
+            phone = _format_phone(local_digits)
+            name = _contact_first_name(source)
+            if phone:
+                details["Contato"] = f"{name} — {phone}" if name else phone
+            details["Recebido"] = self._now().strftime("%d/%m %H:%M")
+            asked = _question_summary(getattr(incoming, "text", ""))
+            if asked:
+                details["Pediu"] = asked
+            details.update(_reception_contact_lines(local_digits, ""))
+            AppointmentStore(self._db_path).enqueue_doctor_promise(
+                chat_key,
+                self._clinical_notice_chat_id,
+                now=self._now(),
+                details=details,
+            )
+        except Exception:
+            logger.warning(
+                "doctor promise notice could not be queued", exc_info=True
             )
 
     def _menu_for(

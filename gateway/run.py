@@ -1676,6 +1676,62 @@ def _whatsapp_promises_team_followup(text: Any) -> bool:
     )
 
 
+# The third shape of the same promise, found on 26/ago/2026. RICKY (73
+# 8131-2183) asked for a psychiatry referral and was told "vou registrar seu
+# pedido de encaminhamento para psiquiatria para o Dr. Victor avaliar e
+# retornar". Nothing was registered: ``outbox_events`` held no row for him and
+# the lead sat at QUALIFICANDO, where it had been since 21/ago.
+#
+# The matcher above could not have caught it, and widening it would have been
+# the wrong repair. Its discriminator is the word ``equipe``, chosen on
+# 24/ago precisely because the colleague, vendor, bank, partner and press
+# templates all name Dr. Victor directly — so letting "Dr. Victor" through to
+# RECEPTION would re-open the 14/ago bug that the 15/ago rule closed. Replaying
+# every model reply since 01/ago bears that out: 21 of them promise Dr. Victor
+# personally, and they are a mixture — patients (RICKY, Niara's teaching
+# certificate, Graciela's instalments) sitting beside a supplier's insulin
+# sensors, a speaking invitation and Rapidoc.
+#
+# So this is a separate route with a separate destination rather than a wider
+# regex: a promise that names Dr. Victor is kept by VICTOR'S OWN LINE — the
+# destination the clinical refusal already uses, and the one person who can
+# triage all 21. Reception's WhatsApp stays exactly what Victor made it on
+# 15/ago, patients only, and no promise is left with nobody behind it.
+#
+# ``equipe`` is deliberately absent from the alternation: the patient pendency
+# template says "para a equipe do Dr. Victor resolver" and belongs to
+# reception, so the call site tests the team route FIRST and this one receives
+# only what that route did not want.
+#
+# Longest alternative first, for the reason spelled out on
+# ``_WHATSAPP_HONORIFIC_DOT_RE``: ``dr`` would otherwise consume the "dr" of
+# "dra" and leave a stray "a" where the name has to be.
+_WHATSAPP_DOCTOR_ESCALATION_RE = re.compile(
+    r"(?is)\b(?:registr\w*|anot\w*|encaminh\w*)\b"
+    r"[^.!?\n]{0,140}?\b(?:doutora|doutor|dra|dr)\s+victor\b"
+    r"[^.!?\n]{0,80}?"
+    r"\b(?:retorn\w*|resolv\w*|avali\w*|verific\w*|informa\w*"
+    r"|respond\w*|trat\w*|esclarec\w*)\b"
+)
+
+
+def _whatsapp_promises_doctor_followup(text: Any) -> bool:
+    """Did this reply promise the contact that Dr. Victor himself would answer?
+
+    Flattens honorific dots for the same reason the team matcher does, except
+    that here it is load-bearing rather than defensive: the promise names
+    "Dr. Victor", so without the flattening the sentence window would end at
+    that very dot and no promise could ever match.
+    """
+    if not text:
+        return False
+    return bool(
+        _WHATSAPP_DOCTOR_ESCALATION_RE.search(
+            _WHATSAPP_HONORIFIC_DOT_RE.sub(r"\1", str(text))
+        )
+    )
+
+
 def _sanitize_gateway_final_response(
     platform: Any, text: str, *, trusted_source: bool = False,
     quoted_inbound: bool = False,
@@ -13979,6 +14035,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         except Exception:
                             logger.warning(
                                 "[WhatsApp] lead question notice failed",
+                                exc_info=True,
+                            )
+                    # The same promise a third time, naming Dr. Victor instead
+                    # of a team (26/ago/2026). Last in the chain on purpose:
+                    # the clinical refusal and the patient pendency template
+                    # both also name him, and both already have a destination
+                    # they must keep. This one takes only what the two above
+                    # declined, and sends it to Victor's own line rather than
+                    # to reception — the sentence is what a supplier, a
+                    # partner platform and a patient asking for a document all
+                    # get, so reception is the wrong room for it and Victor is
+                    # the only one who can tell them apart.
+                    elif _whatsapp_promises_doctor_followup(response):
+                        try:
+                            _doctor_handler = self._get_appointment_handler()
+                            if _doctor_handler is not None:
+                                await asyncio.to_thread(
+                                    _doctor_handler.note_doctor_escalation, event
+                                )
+                        except Exception:
+                            logger.warning(
+                                "[WhatsApp] doctor promise notice failed",
                                 exc_info=True,
                             )
 
