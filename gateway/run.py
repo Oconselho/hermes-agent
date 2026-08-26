@@ -12270,7 +12270,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _multimodal_cfg = {}
             _multimodal_enabled = bool(_multimodal_cfg.get("enabled", False))
             _gemini_items = self._whatsapp_gemini_media_items(event) if _multimodal_enabled else []
-            if _gemini_items:
+            # Lido ANTES do funil (26/ago/2026)? Então `event.text` já carrega
+            # a leitura e `message_text` foi construído a partir dele, com os
+            # prefixos desta função por cima. Reenriquecer aqui embrulharia a
+            # leitura dentro dela mesma, pagaria o Gemini de novo e mandaria o
+            # eco 🎙️ duplicado. Falta só o eco — que continua morando aqui,
+            # num lugar só, porque é daqui que ele sempre saiu.
+            _already_read = getattr(event, "_hermes_whatsapp_reading", None)
+            if _already_read is not None:
+                _successful_transcripts = _already_read[1]
+                _whatsapp_gemini_processed = True
+                if _successful_transcripts and self._should_echo_stt_transcripts():
+                    _echo_adapter = self._adapter_for_source(source)
+                    _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+                    if _echo_adapter:
+                        for _tx in _successful_transcripts:
+                            _safe_echo = _whatsapp_safe_transcript_echo(source.platform, f'🎙️ "{_tx}"')
+                            if not _safe_echo:
+                                logger.warning(
+                                    "Suppressed unsafe Gemini transcript echo for %s",
+                                    source.chat_id or "unknown",
+                                )
+                                continue
+                            try:
+                                await _echo_adapter.send(
+                                    source.chat_id, _safe_echo, metadata=_echo_meta,
+                                )
+                            except Exception as _echo_exc:
+                                logger.debug(
+                                    "Gemini transcript echo failed (non-fatal): %s",
+                                    _echo_exc,
+                                )
+            elif _gemini_items:
                 message_text, _successful_transcripts = await self._enrich_message_with_gemini_multimodal(
                     message_text,
                     _gemini_items,
@@ -12902,6 +12933,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Load conversation history from transcript
         history = self.session_store.load_transcript(session_entry.session_id)
+
+        # O que a pessoa DISSE, e não o rótulo do anexo que ela mandou.
+        #
+        # Tudo daqui para baixo — o funil, as duas supressões, o modelo — lê
+        # `event.text`. Para um áudio isso valia literalmente "[ptt received]"
+        # até este ponto, porque a leitura do Gemini só acontecia ~500 linhas
+        # adiante, dentro de `_prepare_inbound_message_text`. O funil então
+        # classificava OUT_OF_SCOPE e devolvia None, e um pedido de consulta
+        # falado NUNCA chegava ao fluxo de agendamento (Georges Rocha,
+        # 26/ago/2026: "eu tô precisando agendar uma consulta com você").
+        #
+        # A leitura é memoizada no evento; quem vier depois reusa. Ver
+        # `_whatsapp_attachment_reading`.
+        _reading = await self._whatsapp_attachment_reading(event, source)
+        if _reading is not None:
+            event.text = _reading[0]
+            logger.info(
+                "[WhatsApp] Read %d attachment(s) before routing for session %s",
+                len(self._whatsapp_gemini_media_items(event)), session_key,
+            )
 
         # The deterministic patient workflow gets first refusal on this
         # message, and it is resolved HERE — above the two suppression checks
@@ -17404,6 +17455,65 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as exc:
             logger.debug("image_routing: decision failed, falling back to text — %s", exc)
             return "text"
+
+    async def _whatsapp_attachment_reading(
+        self, event: MessageEvent, source: SessionSource,
+    ) -> tuple[str, list[str]] | None:
+        """A leitura dos anexos deste evento pelo Gemini, no máximo uma vez.
+
+        Devolve ``(texto_enriquecido, transcrições)``, ou ``None`` quando não
+        há nada para ler — outra plataforma, sem anexo, multimodal desligado.
+        Nesses casos todo chamador mantém exatamente o comportamento de antes.
+
+        **Por que memoizado NO EVENTO, e por que isto existe.** Dois pontos do
+        pipeline precisam da leitura e nenhum dos dois pode ser o único:
+
+        * o funil determinístico de agendamento — e as duas supressões ao lado
+          dele — precisam ver o que a pessoa DISSE, porque é ``classify_route``
+          que decide se existe pedido de consulta;
+        * ``_prepare_inbound_message_text`` monta com ela o turno do modelo.
+
+        Até 26/ago/2026 só o segundo lia. O funil roda ~500 linhas antes da
+        transcrição e recebia o placeholder literal — ``[ptt received]`` —, que
+        ``classify_route`` classifica como ``OUT_OF_SCOPE``. **Consequência: um
+        pedido de agendamento feito por áudio era invisível para o fluxo de
+        agendamento, sempre.** O Georges Rocha (71 8850-3616) disse "eu tô
+        precisando agendar uma consulta com você" e recebeu a recusa clínica
+        do modelo, porque o funil nunca soube que ele tinha falado.
+
+        Chamar duas vezes seria pior que o bug: embrulharia a leitura dentro
+        dela mesma, pagaria o Gemini duas vezes e mandaria o eco 🎙️ duplicado
+        ao contato. Daí o memo, e daí ele viver no EVENTO — é o objeto que os
+        dois chamadores compartilham, e ele morre junto com o turno.
+        """
+
+        platform = getattr(source, "platform", None)
+        if platform is None or getattr(platform, "value", platform) != "whatsapp":
+            return None
+        cached = getattr(event, "_hermes_whatsapp_reading", None)
+        if cached is not None:
+            return cached
+        try:
+            multimodal = _load_gateway_config().get("multimodal", {})
+            if not isinstance(multimodal, dict) or not multimodal.get("enabled", False):
+                return None
+            items = self._whatsapp_gemini_media_items(event)
+            if not items:
+                return None
+            reading = await self._enrich_message_with_gemini_multimodal(
+                event.text or "", items,
+            )
+        except Exception:
+            # Falha aberta: sem a leitura o contato ainda é atendido pelo
+            # modelo, que é exatamente o que acontecia antes desta função
+            # existir. Engolir a mensagem seria o dano maior.
+            logger.exception(
+                "[WhatsApp] Gemini attachment reading failed; the message "
+                "continues on the model path without it",
+            )
+            return None
+        setattr(event, "_hermes_whatsapp_reading", reading)
+        return reading
 
     @staticmethod
     def _whatsapp_gemini_media_items(event: MessageEvent) -> list[dict[str, str]]:
