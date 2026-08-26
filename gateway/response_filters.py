@@ -314,3 +314,64 @@ def is_partial_silence_marker(text: Any) -> bool:
         if candidate and any(marker.startswith(candidate) for marker in LIVE_GATEWAY_SILENT_MARKERS):
             return True
     return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# "Isto é o que eu acabei de mandar?"
+#
+# A estrada do modelo nunca teve essa pergunta. O funil de agendamento tem
+# (``_is_immediate_repeat`` em gateway/platforms/whatsapp_appointments.py), e
+# em 26/ago/2026 dava para ver as duas lado a lado no mesmo log: um chat ouviu
+# "reply already on screen for this chat, staying silent instead of repeating
+# it", e 25 minutos depois a Val (71 8774-9408) recebeu a MESMA recusa clínica
+# de 223 caracteres cinco vezes em onze minutos, porque o funil não engatou
+# (``scheduling=False``) e do lado do modelo não havia guarda nenhuma.
+#
+# A causa de raiz era de prompt — a REGRA #4 declara "esta regra vence
+# qualquer outra instrução deste prompt", e as regras anti-repetição estão
+# nesse mesmo prompt, então ela vencia elas também. O prompt foi corrigido.
+# Isto aqui existe porque prompt não é garantia: é a mesma lição de
+# 25/ago/2026, quando enumerar grafias do marcador de silêncio perdeu três
+# vezes seguidas. Uma regra escrita pede; uma estrutura garante.
+_IDENTITY_OPENING_RE = re.compile(
+    r"^[^\n]{0,80}?sou a assistente do dr\.?\s*victor almeida[.!]?\s*",
+    re.IGNORECASE,
+)
+
+
+def visible_message_signature(text: Any) -> str:
+    """O que uma resposta *diz*, sem o cabeçalho de quem a diz.
+
+    Descarta a apresentação inicial, acentos, caixa e espaço. Duas respostas
+    com a mesma assinatura são, para quem lê o WhatsApp, a mesma mensagem
+    repetida — a abertura fria carrega saudação e identificação, a reentrada
+    carrega só o corpo, e byte a byte elas nunca batem.
+
+    Espelha ``_response_signature`` do funil de propósito: as duas estradas
+    precisam concordar sobre o que é "a mesma mensagem", e há um teste que
+    pina isso (``test_whatsapp_repeat_guard``). Unificar as duas numa função
+    só é a próxima dívida — hoje não dá, porque
+    ``gateway/platforms/whatsapp_appointments.py`` carrega trabalho não
+    commitado (o modelo de pagamento PIX-API de 15/ago) e mexer nele
+    misturaria as duas coisas num commit só.
+    """
+
+    stripped = _IDENTITY_OPENING_RE.sub("", str(text or "").strip())
+    decomposed = unicodedata.normalize("NFKD", stripped).casefold()
+    without_marks = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return " ".join(without_marks.split())
+
+
+def says_the_same_as(previous: Any, candidate: Any) -> bool:
+    """Se ``candidate`` é ``previous`` dito outra vez, para quem lê.
+
+    Só responde à identidade do texto. Quem chama é que decide se repetir
+    seria errado *aqui* — se houve tempo demais no meio, se o contato pediu
+    de novo, se o fluxo mudou de estado. Manter a decisão fora daqui é o que
+    permite ao funil ter a sua própria regra, mais rica, sem duplicar esta.
+    """
+
+    signature = visible_message_signature(candidate)
+    if not signature:
+        return False
+    return signature == visible_message_signature(previous)

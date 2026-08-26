@@ -136,7 +136,16 @@ from gateway.response_filters import (  # noqa: E402
     is_internal_control_artifact as _is_internal_control_artifact,
     is_whatsapp_silence_marker as _whatsapp_is_silence_marker,
     reads_as_human_message as _reads_as_human_message,
+    says_the_same_as as _says_the_same_as,
     whatsapp_reply_disposition as _whatsapp_reply_disposition,
+)
+
+# Quanto tempo uma resposta continua "na tela" para efeito de repetição.
+# 120s é a mesma janela que o funil de agendamento usa
+# (``repeat_window_seconds``), de propósito: as duas estradas devem discordar
+# sobre O QUE calar, nunca sobre POR QUANTO TEMPO.
+_WHATSAPP_REPEAT_WINDOW_SECONDS = float(
+    os.environ.get("HERMES_WHATSAPP_REPEAT_WINDOW_SECONDS", "120") or 120
 )
 
 
@@ -4724,6 +4733,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._session_run_generation: Dict[str, int] = {}
         # WhatsApp secretary: owner identity and cooldown tracking
         self._whatsapp_owner_digits = os.getenv("WHATSAPP_OWNER_DIGITS", "557188048263")
+        # O que a secretária entregou por último em cada chat, e quando:
+        # ``chat_id → (texto, time.monotonic())``. Só a estrada do modelo
+        # escreve aqui; o funil de agendamento tem a sua própria memória, no
+        # banco, e uma regra de repetição mais rica que esta. Em memória de
+        # propósito — um restart apaga tudo, e depois de um restart repetir
+        # uma vez é o comportamento certo, porque ninguém sabe mais o que
+        # ficou na tela do contato.
+        self._whatsapp_last_reply: Dict[str, tuple[str, float]] = {}
         self._owner_last_reply_timestamps: Dict[str, float] = {}
         self._owner_last_whatsapp_activity: float = 0.0
         # Startup restore gate: while restart-interrupted sessions are being
@@ -13795,6 +13812,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             getattr(source, "chat_id", "?"),
                         )
                         return None
+                    # A MESMA resposta outra vez não é resposta. A Val
+                    # (71 8774-9408) recebeu a recusa clínica de 223
+                    # caracteres CINCO vezes em onze minutos, em 26/ago/2026,
+                    # uma para cada anexo que mandou. A causa estava no
+                    # prompt — a REGRA #4 se declara vencedora sobre "qualquer
+                    # outra instrução deste prompt", e as regras anti-repetição
+                    # moram nesse mesmo prompt —, e a `reasoning` do 2º turno
+                    # ainda registrou o modelo cogitando o silêncio
+                    # ("Deciding on silent clinical response") antes de a
+                    # REGRA #4 passar por cima. O prompt foi corrigido; isto
+                    # aqui é a estrutura por trás dele, porque instrução pede
+                    # e estrutura garante — a mesma lição de 25/ago/2026.
+                    #
+                    # Só a estrada do modelo. O funil de agendamento passa
+                    # longe daqui (`_appointment_response is not None`): ele
+                    # tem `_is_immediate_repeat`, que sabe o que esta função
+                    # não pode saber — se o estado do fluxo mudou, se a
+                    # resposta é um menu parado na tela ou uma recusa que o
+                    # paciente merece ouvir duas vezes ("CPF inválido.").
+                    # Guardar em cima dele silenciaria justamente essas.
+                    _repeat_key = str(getattr(source, "chat_id", "") or "")
+                    if _appointment_response is None and _repeat_key:
+                        _previous = self._whatsapp_last_reply.get(_repeat_key)
+                        if _previous is not None:
+                            _last_text, _last_ts = _previous
+                            _elapsed = time.monotonic() - _last_ts
+                            if (
+                                0 <= _elapsed <= _WHATSAPP_REPEAT_WINDOW_SECONDS
+                                and _says_the_same_as(_last_text, response)
+                            ):
+                                logger.info(
+                                    "[WhatsApp] Reply already on screen for %s "
+                                    "(%.0fs ago, %d chars); staying silent "
+                                    "instead of repeating it",
+                                    _repeat_key, _elapsed, len(response),
+                                )
+                                return None
+                        _now_mono = time.monotonic()
+                        self._whatsapp_last_reply[_repeat_key] = (response, _now_mono)
+                        # Uma entrada por chat, e nada fora da janela serve
+                        # para mais nada. Sem isto o dicionário cresce com o
+                        # número de contatos de toda a vida do processo.
+                        if len(self._whatsapp_last_reply) > 256:
+                            self._whatsapp_last_reply = {
+                                _k: _v
+                                for _k, _v in self._whatsapp_last_reply.items()
+                                if _now_mono - _v[1] <= _WHATSAPP_REPEAT_WINDOW_SECONDS
+                            }
+
                     # Hand the deterministic funnel the one fact it cannot
                     # observe: this chat has already been introduced to. Its
                     # menu then drops the duplicate "Sou a assistente do Dr.
@@ -20982,7 +21048,12 @@ REGRAS ABSOLUTAS:
   Nesses casos responda SOMENTE isto, sem acrescentar nenhuma orientação:
   "[Saudação]! [Identificação]. Este canal não presta orientação clínica. Vou encaminhar sua mensagem para a equipe do Dr. Victor. Em caso de urgência, procure atendimento médico imediatamente ou ligue 192."
   Encaminhar para a recepção ou para emergência NÃO é orientação clínica — é o que você deve fazer.
-  ⚠️ Esta regra vence qualquer outra instrução deste prompt, inclusive "responda ao ponto quando for seguro". Em assunto clínico, NADA é seguro para você responder.
+  ⚠️ Esta regra vence qualquer outra instrução deste prompt sobre O QUE DIZER de assunto clínico, inclusive "responda ao ponto quando for seguro". Em assunto clínico, NADA é seguro para você responder.
+  ⚠️ Ela NÃO vence as regras sobre QUANDO FALAR. Repetir esta recusa não é mais seguro do que dizê-la uma vez — é só ruído na tela de quem já a leu. Se ela já está na conversa para o mesmo assunto, as mensagens seguintes desse assunto são [SILENCIOSO], anexo por anexo inclusive. Em 26/ago/2026 um contato recebeu esta recusa CINCO vezes em onze minutos, uma para cada arquivo que mandou.
+  ⚠️ PEDIDO ADMINISTRATIVO COM ANEXO CLÍNICO. Pedir um documento não é pedir conduta. Quando o contato pede relatório, laudo, declaração, atestado, receita, adequação de documento, envio de arquivo ou qualquer papel — e NÃO pergunta o que fazer, que dose usar, o que um exame significa ou se um quadro é grave —, o assunto dele é administrativo, mesmo que os anexos estejam cheios de diagnóstico. Nesse caso diga o que RECEBEU, em termos administrativos, antes de encaminhar:
+  "[Saudação]! [Identificação]. Recebi seu pedido de [pedido concreto, em uma linha] e os anexos. Este canal não presta orientação clínica, mas vou encaminhar tudo para a equipe do Dr. Victor avaliar e retornar. Em caso de urgência, procure atendimento médico imediatamente ou ligue 192."
+  Nomear o pedido é administrativo e é permitido. O que continua PROIBIDO, sem exceção, é a lista acima: nenhuma palavra sobre diagnóstico, dose, conduta, valor de exame ou gravidade, nem repetir o que os anexos dizem. Você diz que recebeu — nunca o que está escrito.
+  ⚠️ A frase "Este canal não presta orientação clínica" é obrigatória nos dois modelos, literal. Ela é o que faz o Dr. Victor ser avisado deste contato; sem ela o aviso não sai e o encaminhamento que você prometeu não acontece.
 - Quando usar uma saudação, use a forma correta baseada no horário de Salvador ({_brt_str}, UTC-3).
 - ENCERRAMENTO — vale para QUALQUER assunto, não só agenda. Quando a sua resposta fecha
   a conversa (nada mais é esperado do contato), termine com {_closing_wish}
