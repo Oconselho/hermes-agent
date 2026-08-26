@@ -1831,6 +1831,30 @@ class TextDebounceState:
     last_ts: float
 
 
+@dataclass
+class InboundBurstState:
+    """Uma rajada do mesmo contato esperando virar UM turno.
+
+    Irmã de ``TextDebounceState``, e deliberadamente separada dela. Aquela
+    roda enquanto o agente está OCUPADO, só aceita ``MessageType.TEXT`` e
+    mede em fração de segundo (0,35s, teto de 1s) — é um amortecedor de
+    digitação. Esta roda enquanto o agente está PARADO, aceita anexo, e mede
+    em dezenas de segundos: é o intervalo em que uma pessoa manda o pedido e
+    depois os arquivos.
+
+    A distinção não é acadêmica. Em 26/ago/2026 a Val mandou um pedido em
+    texto e quatro anexos em onze minutos, e recebeu cinco respostas — o
+    amortecedor de digitação não encostou em nenhuma delas, porque quatro
+    eram documento/imagem e porque entre elas o agente já tinha terminado.
+    """
+
+    event: MessageEvent
+    task: asyncio.Task | None
+    first_ts: float
+    last_ts: float
+    count: int
+
+
 _PLAINTEXT_GATEWAY_RESTART_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^(?:please\s+)?restart\s+(?:the\s+)?gateway[.!?\s]*$", re.IGNORECASE),
     re.compile(r"^(?:please\s+)?restart\s+(?:the\s+)?hermes\s+gateway[.!?\s]*$", re.IGNORECASE),
@@ -2382,6 +2406,37 @@ class BasePlatformAdapter(ABC):
             "HERMES_GATEWAY_BUSY_TEXT_HARD_CAP_SECONDS", 1.0
         )
         self._text_debounce: dict[str, TextDebounceState] = {}
+        # Agrupamento de rajada com o agente PARADO. Zero = desligado, e é o
+        # default de propósito: isto atrasa a PRIMEIRA resposta de todo
+        # contato, então nenhuma superfície ganha o comportamento sem alguém
+        # ter escrito o número no config da plataforma. Hoje só a secretária
+        # do WhatsApp escreve (`platforms.whatsapp.extra`, 26/ago/2026).
+        #
+        # ``getattr`` e não ``self.config.extra``: metade da suíte constrói
+        # adaptador com um ``SimpleNamespace`` no lugar do ``PlatformConfig``,
+        # e um ``__init__`` que exige o campo derruba testes que não têm nada
+        # a ver com rajada. Um número ilegível no config vale zero — desligado
+        # — porque a alternativa é o gateway não subir por causa de um typo
+        # num campo opcional.
+        def _burst_setting(key: str, env: str) -> float:
+            extra = getattr(self.config, "extra", None) or {}
+            try:
+                configured = float(extra.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "[%s] %s is not a number; inbound burst grouping stays off",
+                    self.name, key,
+                )
+                configured = 0.0
+            return max(0.0, _float_env(env, configured))
+
+        self._inbound_burst_seconds: float = _burst_setting(
+            "inbound_burst_seconds", "HERMES_GATEWAY_INBOUND_BURST_SECONDS",
+        )
+        self._inbound_burst_max_seconds: float = _burst_setting(
+            "inbound_burst_max_seconds", "HERMES_GATEWAY_INBOUND_BURST_MAX_SECONDS",
+        )
+        self._inbound_burst: dict[str, InboundBurstState] = {}
         # Background message-processing tasks spawned by handle_message().
         # Gateway shutdown cancels these so an old gateway instance doesn't keep
         # working on a task after --replace or manual restarts.
@@ -4232,6 +4287,148 @@ class BasePlatformAdapter(ABC):
             )
         return result
 
+    def _inbound_burst_store(self) -> dict[str, InboundBurstState]:
+        store = getattr(self, "_inbound_burst", None)
+        if store is None:
+            store = {}
+            self._inbound_burst = store
+        return store
+
+    def _is_inbound_burst_candidate(self, event: MessageEvent) -> bool:
+        """Se esta mensagem pode esperar as irmãs antes de virar um turno.
+
+        Comando fica de fora: ``/status`` existe justamente para responder
+        quando o resto não está respondendo, e segurá-lo por 45s seria tirar
+        do operador a única coisa que ele tem quando desconfia do gateway.
+        Mensagem interna também fica de fora — ela não vem de ninguém que
+        esteja esperando resposta na tela.
+        """
+
+        if self._inbound_burst_seconds <= 0:
+            return False
+        if getattr(event, "internal", False):
+            return False
+        try:
+            if event.is_command():
+                return False
+        except Exception:
+            return False
+        return True
+
+    async def _hold_inbound_burst(self, session_key: str, event: MessageEvent) -> None:
+        """Segura a mensagem e espera a rajada fechar antes de abrir o turno.
+
+        Borda de saída: cada mensagem nova ESTENDE a espera, e o turno só
+        abre quando o contato fica quieto por ``inbound_burst_seconds`` ou
+        quando o teto ``inbound_burst_max_seconds`` vence — o que vier
+        primeiro. É esse desenho que junta o pedido da Val com os anexos que
+        vieram treze segundos depois; a borda de entrada (responder já e
+        agrupar o resto) não juntaria, porque cada anexo dela chegou depois
+        de a resposta anterior já ter saído.
+
+        O custo é real e está do lado de fora desta função: a PRIMEIRA
+        resposta de todo contato passa a demorar a janela inteira. Foi
+        decisão do Victor em 26/ago/2026, com o número na mão.
+        """
+
+        store = self._inbound_burst_store()
+        state = store.get(session_key)
+
+        if state is not None and not self._can_merge_text_debounce_events(state.event, event):
+            # Sessão compartilhada: a rajada é de OUTRA pessoa. Fecha a que
+            # está aberta agora e deixa a nova começar a sua, para que a fala
+            # de um não seja anexada à do outro.
+            await self._flush_inbound_burst_now(session_key)
+            # O ``await`` acima abre uma janela: outra corrotina pode ter
+            # aberto uma rajada nova para esta sessão nesse meio-tempo. Se
+            # ela também é de outro remetente, esta mensagem vai para a fila
+            # de follow-up em vez de ser descartada — o turno atual a
+            # responde a seguir, e ninguém fica sem resposta.
+            state = store.get(session_key)
+            if state is not None and not self._can_merge_text_debounce_events(state.event, event):
+                merge_pending_message_event(
+                    self._pending_messages, session_key, event, merge_text=True,
+                )
+                return
+
+        now = time.monotonic()
+        if state is None:
+            state = InboundBurstState(
+                event=event, task=None, first_ts=now, last_ts=now, count=1,
+            )
+            store[session_key] = state
+        else:
+            # ``merge_pending_message_event`` funde no lugar quando dá, e
+            # SUBSTITUI quando não dá. Por isso a leitura de volta: com um
+            # dicionário descartável, a substituição — o caso em que o bloco
+            # vira a mensagem nova sozinha — se perderia calada, e perder a
+            # mensagem de um paciente é o erro caro desta função inteira.
+            _merged = {session_key: state.event}
+            merge_pending_message_event(
+                _merged, session_key, event, merge_text=True,
+            )
+            state.event = _merged[session_key]
+            state.last_ts = now
+            state.count += 1
+
+        if state.task is not None and not state.task.done():
+            state.task.cancel()
+
+        window_deadline = state.last_ts + self._inbound_burst_seconds
+        cap = self._inbound_burst_max_seconds or self._inbound_burst_seconds
+        hard_cap_deadline = state.first_ts + max(cap, self._inbound_burst_seconds)
+        delay = max(0.0, min(window_deadline, hard_cap_deadline) - now)
+        logger.debug(
+            "[%s] Holding inbound burst for %s: %d message(s), flushing in %.1fs",
+            self.name, session_key, state.count, delay,
+        )
+        state.task = asyncio.create_task(self._flush_inbound_burst(session_key, delay))
+
+    async def _flush_inbound_burst(self, session_key: str, delay: float) -> None:
+        try:
+            await asyncio.sleep(delay)
+            await self._flush_inbound_burst_now(session_key)
+        except asyncio.CancelledError:
+            return
+        finally:
+            current = asyncio.current_task()
+            state = self._inbound_burst_store().get(session_key)
+            if state is not None and state.task is current:
+                state.task = None
+
+    async def _flush_inbound_burst_now(self, session_key: str) -> bool:
+        """Abre o turno com a rajada inteira, ou devolve a mensagem à fila.
+
+        Se o agente ficou ocupado enquanto a rajada era montada — outra
+        estrada abriu o turno no meio —, o bloco não pode ser jogado fora:
+        vai para ``_pending_messages``, que é a fila que cascateia quando o
+        turno atual termina. Perder a mensagem seria o erro caro; respondê-la
+        um turno depois não é.
+        """
+
+        state = self._inbound_burst_store().pop(session_key, None)
+        if state is None:
+            return False
+        if state.task is not None and not state.task.done():
+            state.task.cancel()
+        if session_key in self._active_sessions:
+            merge_pending_message_event(
+                self._pending_messages, session_key, state.event, merge_text=True,
+            )
+            logger.debug(
+                "[%s] Inbound burst for %s arrived while the session went "
+                "active; queued as a follow-up turn instead",
+                self.name, session_key,
+            )
+            return True
+        if state.count > 1:
+            logger.info(
+                "[%s] Coalesced %d messages from %s into one turn",
+                self.name, state.count, session_key,
+            )
+        self._start_session_processing(state.event, session_key)
+        return True
+
     def _can_merge_text_debounce_events(self, existing: MessageEvent, event: MessageEvent) -> bool:
         """Return True when two text debounce events came from the same sender."""
 
@@ -4872,6 +5069,16 @@ class BasePlatformAdapter(ABC):
                 )
             return  # Don't process now - will be handled after current task finishes
         
+        # Sessão parada, e a plataforma pediu para agrupar rajada: segura a
+        # mensagem e espera as irmãs. Fica DEPOIS do guarda de sessão ativa
+        # de propósito — enquanto o agente trabalha, quem enfileira é
+        # ``_pending_messages``, que já sabe fundir; esta espera existe só
+        # para o intervalo em que ninguém está trabalhando e cada mensagem
+        # abriria um turno próprio.
+        if self._is_inbound_burst_candidate(event):
+            await self._hold_inbound_burst(session_key, event)
+            return
+
         # Mark session as active BEFORE spawning background task to close
         # the race window where a second message arriving before the task
         # starts would also pass the _active_sessions check and spawn a
@@ -5535,6 +5742,29 @@ class BasePlatformAdapter(ABC):
             if state.task is not None and not state.task.done():
                 state.task.cancel()
         self._text_debounce_store().clear()
+        # Rajada segurada no momento do shutdown. Conferido em 26/ago/2026:
+        # o bridge do WhatsApp NÃO reenvia o que já entregou ao gateway, e
+        # uma mensagem segurada aqui nunca chegou ao runner, então também não
+        # está no ``state.db``. Ela se perde — janela máxima de
+        # ``inbound_burst_max_seconds``.
+        #
+        # WARNING, e com o chat na linha: é a única forma de o operador saber
+        # a quem responder à mão. Preferir isto a segurar o teardown é
+        # deliberado — um teardown travado corta TODAS as sessões em trânsito,
+        # que é o dano maior. Se este aviso virar rotina, a janela está grande
+        # demais para o custo dela.
+        _held = self._inbound_burst_store()
+        if _held:
+            logger.warning(
+                "[%s] Shutdown while holding %d inbound burst(s); these "
+                "messages were never processed and are NOT replayed on the "
+                "next start — answer them by hand: %s",
+                self.name, len(_held), ", ".join(sorted(_held)),
+            )
+        for state in list(_held.values()):
+            if state.task is not None and not state.task.done():
+                state.task.cancel()
+        _held.clear()
 
     def has_pending_interrupt(self, session_key: str) -> bool:
         """Check if there's a pending interrupt for a session."""
