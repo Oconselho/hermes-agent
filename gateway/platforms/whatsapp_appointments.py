@@ -2266,6 +2266,7 @@ class AppointmentStore:
         *,
         now: datetime,
         details: Mapping[str, str] | None = None,
+        reason: str | None = None,
     ) -> dict[str, str] | None:
         """Make "vou registrar para o Dr. Victor avaliar e retornar" true.
 
@@ -2296,7 +2297,12 @@ class AppointmentStore:
         """
 
         bucket = now.strftime("%Y-%m-%dT%H")
-        idempotency_key = _opaque_id("victor-promise", chat_key, bucket)
+        # O motivo entra na chave: na mesma hora, "pediu um documento" e "foi
+        # perguntada sobre agendar" são dois fatos, e o balde por hora
+        # engoliria o segundo.
+        idempotency_key = _opaque_id(
+            "victor-promise", chat_key, bucket, str(reason or "")
+        )
         outbox_id = _opaque_id("outbox", idempotency_key)
         lines = [
             "📌 *Promessa de retorno* — a secretária disse que o senhor "
@@ -2306,6 +2312,11 @@ class AppointmentStore:
         lines.extend(f"{label}: {value}" for label, value in (details or {}).items())
         if len(lines) > 2:
             lines.append("")
+        # O motivo entra ANTES da linha da recepção porque é a informação
+        # nova: desde 31/ago/2026 esta linha recebe também o que a recepção
+        # deixou de receber, e sem o motivo os dois casos chegam idênticos.
+        if reason:
+            lines.append(str(reason))
         lines.append(
             "A recepção não foi avisada: este contato não é atendimento dela."
         )
@@ -3737,7 +3748,9 @@ class WhatsAppAppointmentsHandler:
                 "lead question notice could not be queued", exc_info=True
             )
 
-    def note_doctor_escalation(self, incoming: Any) -> None:
+    def note_doctor_escalation(
+        self, incoming: Any, reason: str | None = None
+    ) -> None:
         """Queue the notice a "Dr. Victor vai avaliar e retornar" promise makes.
 
         Same seam and same best-effort contract as the two routes above. The
@@ -3793,6 +3806,7 @@ class WhatsAppAppointmentsHandler:
                 self._clinical_notice_chat_id,
                 now=self._now(),
                 details=details,
+                reason=reason,
             )
         except Exception:
             logger.warning(

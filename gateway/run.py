@@ -1732,6 +1732,226 @@ def _whatsapp_promises_doctor_followup(text: Any) -> bool:
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 31/ago/2026 — o repasse de lead passa a ler a conversa, não só a última frase
+#
+# Às 15:08 BRT a recepção recebeu "❓ Lead quer agendar — Amil" sobre a Mara,
+# enfermeira do convênio, cuja conversa inteira era o transmissor Medtronic da
+# bomba do Victor: em falta, 20 dias de prazo, "me manda o pedido de novo".
+# Consulta não aparece em nenhuma das quatro mensagens.
+#
+# Três defeitos numa linha só, e vale nomear os três porque cada um sobreviveria
+# ao conserto dos outros:
+#
+# 1. O gatilho foi a resposta DA SECRETÁRIA ("vou encaminhá-la à equipe do Dr.
+#    Victor para avaliar e retornar"), não o pedido da contato. O que a Mara
+#    escreveu nunca foi lido para decidir destino.
+# 2. O aviso afirma "Tem interesse em marcar consulta" como texto literal, sem
+#    nada por trás.
+# 3. `contact_is_organization` é lista de 16 palavras (convenio, operadora,
+#    clinica…) e o contato se chama "Amil". A maior operadora do país passou
+#    como paciente.
+#
+# E o funil já sabia: `scheduling=False` nas quatro mensagens, lead parado em
+# NOVO. Duas partes do mesmo processo discordaram e nada as consultou.
+#
+# A trava é o que o Victor pediu — ler o contexto — e é determinística de
+# propósito: o funil é determinístico e fail-closed, o LLM só fala. Uma
+# pergunta a modelo aqui traria latência e um modo de falha novo numa rota que
+# disparou 8 vezes em um mês.
+#
+# O que NÃO fazer, e é a armadilha óbvia: amarrar a rota em
+# `_whatsapp_has_scheduling_intent`. Isso reabriria 24/ago — "Como funciona a
+# consulta?" não é pedido de vaga (o "a consulta" precisa de corroboração que
+# "funciona" não dá) e era exatamente o caso que esta rota nasceu para
+# resolver. O discriminador certo é mais fraco e mais largo: a conversa fala
+# de consulta/atendimento em ALGUM momento? A Mara nunca falou; a lead de
+# 24/ago falou na primeira frase.
+
+# Documento, laudo, relatório — a demanda que é do Victor e não da recepção
+# (Victor, 31/ago/2026: "mesmo que não seja da lista de parceiros/empresas").
+# Precisa do par verbo-de-demanda + substantivo-de-documento na MESMA oração,
+# pela mesma razão das três rotas de promessa: "recebi sua receita" é relato,
+# "me manda a receita" é demanda, e só a segunda cria trabalho para alguém.
+_WHATSAPP_DOCUMENT_NOUNS = (
+    r"documento?s?|laudos?|relat[óo]rios?|atestados?|declara[çc][ãõa]o|declara[çc][õo]es"
+    r"|receitas?|prescri[çc][ãõa]o|prescri[çc][õo]es|encaminhamentos?|prontu[áa]rios?"
+    r"|exames?|resultados?|guias?|autoriza[çc][ãõa]o|autoriza[çc][õo]es|formul[áa]rios?"
+    r"|comprovantes?|recibos?|nota\s+fiscal|notas\s+fiscais|pedidos?|or[çc]amentos?"
+    # "Requisição pra Michele fazer colonoscopia" (14/ago) chegou ao Victor pela
+    # rota "fora" — destino certo, motivo errado. O substantivo entra para o
+    # aviso dizer a verdade quando o verbo de demanda estiver junto.
+    r"|requisi[çc][ãõa]o|requisi[çc][õo]es"
+    r"|parecer|pareceres|libera[çc][ãõa]o|justificativas?"
+)
+_WHATSAPP_DOCUMENT_VERBS = (
+    r"mand\w*|envi\w*|reenvi\w*|encaminh\w*|assin\w*|emit\w*|liber\w*|forne[çc]\w*"
+    r"|providenci\w*|preench\w*|refa[çz]\w*|renov\w*|atualiz\w*|corrig\w*"
+    r"|precis\w*|preciso|quer\w*|gostaria|solicit\w*|pe[çd]\w*|aguard\w*|falta\w*"
+)
+_WHATSAPP_DOCUMENT_DEMAND_RE = re.compile(
+    r"(?is)(?:"
+    r"\b(?:" + _WHATSAPP_DOCUMENT_VERBS + r")\b[^.!?\n]{0,60}?\b(?:"
+    + _WHATSAPP_DOCUMENT_NOUNS + r")\b"
+    r"|"
+    r"\b(?:" + _WHATSAPP_DOCUMENT_NOUNS + r")\b[^.!?\n]{0,60}?\b(?:"
+    + _WHATSAPP_DOCUMENT_VERBS + r")\b"
+    r")"
+)
+
+# "Pedido de agendamento" é vaga, não papel. A palavra `pedido` está na lista
+# acima porque foi ela que a Mara usou ("me manda o pedido de novo"), e sem
+# esta exclusão ela sequestraria toda marcação de consulta para a linha do
+# Victor — o oposto exato do que a recepção existe para fazer.
+_WHATSAPP_DOCUMENT_FALSE_FRIEND_RE = re.compile(
+    r"(?is)\bpedidos?\s+(?:de\s+)?"
+    r"(?:agendamento|consulta|marca[çc][ãa]o|hor[áa]rio|vaga|retorno)\b"
+)
+
+# A conversa trata de ser atendido? Larga de propósito — é a pergunta "isto é
+# assunto de consultório para um paciente?", não "esta pessoa quer uma vaga
+# agora?". A segunda é `_whatsapp_has_scheduling_intent` e já tem dono.
+_WHATSAPP_CONSULTATION_SUBJECT_RE = re.compile(
+    r"(?is)\b(?:consultas?|consult[óo]rio|atendimentos?|atender|atende|agendar|agenda"
+    r"|agendamentos?|marca[çc][ãa]o|marcar|remarcar|hor[áa]rios?|vagas?|dispon[íi]vel"
+    r"|disponibilidade|teleconsultas?|telemedicina|primeira\s+vez|retorno\s+da\s+consulta"
+    r"|valor\s+da\s+consulta|pre[çc]o\s+da\s+consulta|quanto\s+custa|conv[êe]nio"
+    r"|particular|endocrino\w*|nutri\w*)\b"
+)
+
+
+def _whatsapp_contact_thread_texts(
+    history: Any, current_text: Any = ""
+) -> List[str]:
+    """O que a CONTATO escreveu nesta conversa, da primeira à última.
+
+    Só o papel ``user``: o que a secretária disse é a promessa, e usar a fala
+    dela para julgar a intenção da contato é justamente o defeito de 31/ago.
+    A mensagem corrente entra no fim porque nem sempre já está no histórico —
+    depende de quando o turno gravou.
+    """
+    texts: List[str] = []
+    for message in (history or []):
+        try:
+            if message.get("role") != "user":
+                continue
+        except AttributeError:
+            continue
+        text = _whatsapp_history_text(message).strip()
+        if text:
+            texts.append(text)
+    current = str(current_text or "").strip()
+    if current and (not texts or texts[-1] != current):
+        texts.append(current)
+    return texts
+
+
+def _whatsapp_demands_document(texts: Any) -> bool:
+    """Alguém está pedindo um papel — receita, laudo, relatório, pedido."""
+    for text in texts or ():
+        cleaned = _WHATSAPP_DOCUMENT_FALSE_FRIEND_RE.sub(" ", str(text or ""))
+        if _WHATSAPP_DOCUMENT_DEMAND_RE.search(cleaned):
+            return True
+    return False
+
+
+def _whatsapp_lead_handoff_route(history: Any, current_text: Any) -> str:
+    """Para onde vai a promessa "a equipe retorna" — lendo a conversa inteira.
+
+    Devolve uma de quatro rotas, e a ordem é a decisão:
+
+    ``"agendamento"``
+        A contato pediu vaga em algum momento. Fato medido, não suposto: é a
+        recepção, como sempre foi.
+    ``"confirmar"``
+        A conversa é de consultório mas ninguém pediu vaga ainda — a lead de
+        24/ago ("Como funciona a consulta?"). Victor, 31/ago/2026: *"a
+        secretária tem de confirmar interesse em agendamento antes do repasse
+        como lead"*. Então pergunta-se, e a recepção só recebe depois do sim.
+    ``"documento"``
+        Demanda de papel. Vai para a linha do Victor por decisão dele de
+        31/ago/2026, mesmo quando o remetente não está em nenhuma lista de
+        empresa — foi a lista de 16 palavras que deixou a "Amil" passar.
+    ``"fora"``
+        A conversa nunca falou de atendimento. Insumo, fornecedor, cobrança.
+        Linha do Victor.
+
+    Fail-closed: só ``"agendamento"`` chega à recepção, e ele exige evidência
+    positiva no que a contato escreveu. Todo o resto tem destino, porque uma
+    promessa sem ninguém atrás é o defeito que esta arquitetura já pagou
+    quatro vezes para aprender.
+    """
+    texts = _whatsapp_contact_thread_texts(history, current_text)
+    if any(_whatsapp_has_scheduling_intent(text) for text in texts):
+        return "agendamento"
+    if _whatsapp_demands_document(texts):
+        return "documento"
+    joined = " \n ".join(texts)
+    if _WHATSAPP_CONSULTATION_SUBJECT_RE.search(joined):
+        return "confirmar"
+    return "fora"
+
+
+# O motivo, escrito no aviso que chega à linha do Victor. Ele recebia
+# "📌 Promessa de retorno" para tudo; agora vê em uma linha por que aquilo não
+# era da recepção, que é a triagem que só ele pode fazer.
+_WHATSAPP_LEAD_ROUTE_REASONS = {
+    "documento": (
+        "Demanda de documento/relatório — do senhor, não da recepção "
+        "(regra de 31/ago/2026)."
+    ),
+    "confirmar": (
+        "A secretária perguntou se a pessoa quer agendar. A recepção só é "
+        "avisada depois do sim."
+    ),
+    "fora": (
+        "A conversa nunca falou de consulta ou atendimento — não é lead de "
+        "agendamento."
+    ),
+}
+
+
+# A pergunta que tira o lead. Uma frase, sem menu e sem repetir a saudação: ela
+# é anexada a uma resposta que já cumprimentou. Estrutura em vez de instrução —
+# a mesma lição de 25/ago/2026, e a razão de a REGRA #4 do prompt não ser
+# lugar para isto.
+# Sem pronome de propósito. A casa já decidiu em 18/ago/2026 que o tratamento
+# é Sr./Sra./Sr(a). conforme o que se sabe do contato — e aqui não se sabe nada:
+# esta frase é anexada a uma resposta que o modelo já escreveu, então repetir um
+# tratamento seria adivinhar gênero no meio da fala dele. Pergunta sem sujeito
+# resolve, e soa melhor em português.
+_WHATSAPP_INTEREST_QUESTION = (
+    "Enquanto isso, gostaria de agendar uma consulta com o Dr. Victor?"
+)
+
+# Já perguntamos? Não se pergunta duas vezes na mesma resposta, e o modelo
+# muitas vezes já perguntou sozinho.
+_WHATSAPP_ASKS_ABOUT_BOOKING_RE = re.compile(
+    r"(?is)\?[^?]*$|(?:gostaria|deseja|quer|posso)\b[^.!?\n]{0,60}?"
+    r"\b(?:agendar|marcar|consulta|hor[áa]rio)\b"
+)
+
+
+def _whatsapp_with_interest_question(response: Any) -> str:
+    """Anexa a pergunta de interesse, sem duplicar uma que já está lá."""
+    text = str(response or "").rstrip()
+    if not text:
+        return text
+    # A alavanca do ROLLBACK: esvaziar a constante cala SÓ a pergunta e deixa o
+    # roteamento de pé. Sem esta linha, esvaziá-la deixaria um ponto solto no
+    # fim da fala — uma alavanca documentada que não funciona é pior que nenhuma.
+    if not _WHATSAPP_INTEREST_QUESTION:
+        return text
+    if re.search(
+        r"(?is)(?:gostaria|deseja|quer|podemos|posso)\b[^.!?\n]{0,80}?"
+        r"\b(?:agendar|marcar|consulta|hor[áa]rio|vaga)\b",
+        text,
+    ):
+        return text
+    separator = " " if text.endswith((".", "!", "?")) else ". "
+    return f"{text}{separator}{_WHATSAPP_INTEREST_QUESTION}"
+
+
 def _sanitize_gateway_final_response(
     platform: Any, text: str, *, trusted_source: bool = False,
     quoted_inbound: bool = False,
@@ -14026,11 +14246,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # which is exactly the 14/ago bug, where one message
                     # reached reception through a second, independent route.
                     elif _whatsapp_promises_team_followup(response):
+                        # Até 31/ago/2026 esta linha ia direto para a recepção,
+                        # e o aviso afirmava "Tem interesse em marcar consulta"
+                        # sem que nada tivesse verificado. Agora a conversa
+                        # inteira decide o destino — ver
+                        # `_whatsapp_lead_handoff_route`. Só "agendamento"
+                        # chega à recepção; as outras três rotas têm destino,
+                        # nenhuma cai no vazio.
+                        _lead_route = _whatsapp_lead_handoff_route(
+                            history, message_text
+                        )
+                        logger.info(
+                            "[WhatsApp] lead handoff route=%s for %s",
+                            _lead_route, getattr(source, "chat_id", "?"),
+                        )
+                        if _lead_route == "confirmar" and not _whatsapp_contact_is_organization(
+                            source
+                        ):
+                            # Victor, 31/ago/2026: "todo lead deve ser tirado
+                            # para avaliar interesse em agendamento". A
+                            # pergunta é anexada aqui e não pedida ao prompt
+                            # porque instrução pede e estrutura garante.
+                            #
+                            # A trava de organização entra SÓ aqui, e só para
+                            # calar a pergunta: perguntar a um fornecedor se
+                            # ele quer marcar consulta é constrangedor. Ela é
+                            # a lista de 16 palavras que falhou em 31/ago, e é
+                            # por isso que não guarda o roteamento — um falso
+                            # negativo aqui custa uma frase estranha, não um
+                            # lead falso na recepção.
+                            response = _whatsapp_with_interest_question(response)
                         try:
                             _question_handler = self._get_appointment_handler()
-                            if _question_handler is not None:
+                            if _question_handler is None:
+                                pass
+                            elif _lead_route == "agendamento":
                                 await asyncio.to_thread(
                                     _question_handler.note_question_escalation, event
+                                )
+                            else:
+                                # Tudo que a recepção não recebe ainda é uma
+                                # promessa feita a alguém, e vai para a linha
+                                # do Victor com o motivo escrito — é ele quem
+                                # separa fornecedor de paciente, e agora ele vê
+                                # por que a mensagem chegou.
+                                await asyncio.to_thread(
+                                    _question_handler.note_doctor_escalation,
+                                    event,
+                                    _WHATSAPP_LEAD_ROUTE_REASONS.get(_lead_route),
                                 )
                         except Exception:
                             logger.warning(
