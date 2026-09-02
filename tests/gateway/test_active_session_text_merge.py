@@ -103,6 +103,13 @@ def _make_adapter() -> BasePlatformAdapter:
     adapter._busy_text_mode = "queue"
     adapter._busy_text_debounce_seconds = 0.1
     adapter._busy_text_hard_cap_seconds = 1.0
+    # Portão de rajada (commit 25e28334a4, 26/ago/2026) lê estes atributos
+    # no início de handle_message(); o stub pula o __init__ real, então
+    # declara aqui com o agrupamento DESLIGADO (0.0), preservando o
+    # comportamento pré-feature que estes testes exercitam.
+    adapter._inbound_burst_seconds = 0.0
+    adapter._inbound_burst_max_seconds = 0.0
+    adapter._inbound_burst = {}
     adapter._text_debounce = {}
     adapter._auto_tts_default = False
     adapter._auto_tts_enabled_chats = set()
