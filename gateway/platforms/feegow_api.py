@@ -283,6 +283,32 @@ class FeegowClient:
             return response.text[:500]
 
     @staticmethod
+    def _grouped_rows(value: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+        """Rows of a ``{grupo: [linhas]}`` envelope, or ``None`` if not grouped.
+
+        The 02/set/2026 ``company/list-unity`` answer nests its rows in
+        ``content.matriz`` and ``content.unidades`` (dicts of lists) instead
+        of a flat list. A grouped envelope has EVERY value as a list: return
+        the concatenation of the groups, keeping only dict rows and dropping
+        exact duplicates (the matriz row may also appear as a unit). Return
+        ``[]`` when the groups exist but are empty — a real empty inventory,
+        not an unreadable shape — and ``None`` when any value is a scalar,
+        which is a single-object row (the new ``patient/search`` payload has
+        ``telefones``/``email`` lists next to scalar fields) and must reach
+        the caller as one row, never collapse to nothing.
+        """
+        if not value or not all(
+            isinstance(item, (list, tuple)) for item in value.values()
+        ):
+            return None
+        rows: List[Dict[str, Any]] = []
+        for group in value.values():
+            for item in group:
+                if isinstance(item, dict) and item not in rows:
+                    rows.append(item)
+        return rows
+
+    @staticmethod
     def _collection_content(result: Any) -> List[Dict[str, Any]]:
         """Unwrap Feegow's ``success/content`` read envelope."""
         if isinstance(result, (list, tuple)):
@@ -299,6 +325,9 @@ class FeegowClient:
             if isinstance(value, (list, tuple)):
                 return [item for item in value if isinstance(item, dict)]
             if isinstance(value, dict):
+                grouped = FeegowClient._grouped_rows(value)
+                if grouped is not None:
+                    return grouped
                 nested = FeegowClient._collection_content(value)
                 return nested or [value]
         return [result] if result else []
@@ -513,13 +542,59 @@ class FeegowClient:
         logger.info("Feegow: searching patients with %s", list(params.keys()))
 
         def read() -> List[Dict[str, Any]]:
-            return self._collection_content(
+            return self._normalize_patient_rows(
                 self._request("GET", "patient/search", params=params)
             )
 
         if strict:
             return read()
         return self._safe_call(read, fallback=[])
+
+    @staticmethod
+    def _normalize_patient_rows(result: Any) -> List[Dict[str, Any]]:
+        """Normalize every ``patient/search`` shape into canonical rows.
+
+        The 02/set/2026 API answers this endpoint with ONE object — scalar
+        fields plus list-valued ``telefones``/``celulares``/``email`` and a
+        nested ``documentos`` dict — where legacy answers carried a flat
+        list of rows with top-level ``paciente_id``/``cpf``/``telefone``.
+        Legacy rows pass through unchanged; the new object is rewritten to
+        the canonical keys the gateway and the empty-turn supervisor read
+        (``paciente_id``, ``cpf``, ``telefone``, ``email``), preserving the
+        first non-empty value of each list. Nested ``documentos.cpf`` also
+        feeds the canonical ``cpf`` so identity gates keep matching.
+        """
+        rows = FeegowClient._collection_content(result)
+        normalized: List[Dict[str, Any]] = []
+        for row in rows:
+            if "paciente_id" in row or "patient_id" in row:
+                normalized.append(row)
+                continue
+            if "id" not in row:
+                normalized.append(row)
+                continue
+            item = dict(row)
+
+            def first(value: Any) -> Any:
+                if isinstance(value, (list, tuple)):
+                    for entry in value:
+                        if entry not in (None, ""):
+                            return entry
+                    return None
+                return value
+
+            documents = item.get("documentos")
+            cpf = first(item.get("cpf"))
+            if cpf in (None, "") and isinstance(documents, dict):
+                cpf = first(documents.get("cpf"))
+            item["cpf"] = cpf
+            item["telefone"] = first(item.get("telefone")) or first(
+                item.get("celulares")
+            )
+            item["email"] = first(item.get("email"))
+            item["paciente_id"] = item.get("id")
+            normalized.append(item)
+        return normalized
 
     def create_patient(
         self,
