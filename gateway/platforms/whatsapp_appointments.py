@@ -19,6 +19,7 @@ import sqlite3
 import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -32,8 +33,10 @@ __all__ = [
     "classify_route",
     "drain_appointment_outbox",
     "filter_eligible_slots",
+    "policy_eligible_slots",
     "is_valid_cpf",
     "run_appointment_watcher",
+    "service_price_centavos",
     "treatment_title",
     "SILENCE",
 ]
@@ -102,6 +105,10 @@ class FlowState(str, Enum):
     """Persisted states in the deterministic in-person scheduling flow."""
 
     AWAITING_APPOINTMENT_ACTION = "AWAITING_APPOINTMENT_ACTION"
+    # A message sent by the secretary can itself be the question that opens a
+    # booking. Its answer may simply be "sim" plus a preferred period, so it
+    # must not be re-classified as a cold, out-of-context inbound message.
+    AWAITING_APPOINTMENT_OFFER_REPLY = "AWAITING_APPOINTMENT_OFFER_REPLY"
     AWAITING_SERVICE = "AWAITING_SERVICE"
     AWAITING_SLOT = "AWAITING_SLOT"
     AWAITING_CPF = "AWAITING_CPF"
@@ -136,6 +143,237 @@ class FlowState(str, Enum):
     RECONCILIATION_REQUIRED = "RECONCILIATION_REQUIRED"
 
 
+
+# ---------------------------------------------------------------------------
+# Pergunta no meio do formulário
+# ---------------------------------------------------------------------------
+# Todo passo do funil valida UM formato e devolve o mesmo erro para tudo que
+# não seja aquele formato. Medido no banco em 03/set/2026: das 46 mensagens do
+# dia, 43 receberam texto fixo — o modelo falou em 7% dos turnos. A base de
+# conhecimento ligada em 03/set só podia ser usada nos outros 3.
+#
+# O caso que motivou isto: "Tem durante a.semana?" no passo do CPF foi
+# respondido com "CPF inválido. Confira os 11 dígitos e envie novamente." Além
+# de não responder, ACUSA o paciente de um erro que ele não cometeu.
+#
+# A regra é uma só, na entrada de ``_advance``, valendo para os 17 estados: se
+# o texto não é um valor plausível para o passo atual E parece pergunta, o
+# turno vai para o modelo com o fluxo intacto. O modelo já recebe
+# ``open_flow_summary`` no prompt, então sabe o que estava pendente e retoma.
+#
+# A ORDEM dos dois testes é o que torna isto seguro: um valor plausível nunca
+# chega ao detector de conversa. Um CPF não é interceptado nem que venha com
+# interrogação colada.
+
+# Formatos que os passos do funil pedem. Reconhecer aqui é o freio: se casar,
+# a mensagem é uma tentativa de responder, não uma pergunta.
+_VALOR_NUMERO_RE = re.compile(r"^\s*\d{1,2}\s*$")
+_VALOR_DOC_RE = re.compile(r"\d[\d.\-/\s]{9,}")
+_VALOR_DATA_RE = re.compile(r"\b\d{1,2}\s*[/.\-]\s*\d{1,2}\s*[/.\-]\s*\d{2,4}\b")
+_VALOR_EMAIL_RE = re.compile(r"\S+@\S+")
+_VALOR_SIM_NAO = frozenset(
+    {
+        "sim", "s", "nao", "n", "ok", "confirmo", "confirmado", "isso", "certo",
+        "pode", "positivo", "negativo", "cancelar", "reconciliar",
+        "m", "f", "masculino", "feminino",
+    }
+)
+
+# Só palavras que NÃO aparecem dentro de um nome próprio nem de um endereço.
+# "da", "e", "há" ficaram de fora de propósito: "Maria da Silva" é nome, e
+# interceptá-lo no passo do nome seria trocar um defeito por outro.
+_PERGUNTA_PALAVRA_RE = re.compile(
+    r"\b(?:qual|quais|quando|quanto|quantos|quantas|como|onde|porque|pq|quem"
+    r"|posso|poderia|pode\s+ser|consigo|consegue|aceita|aceitam|atende|atendem"
+    r"|funciona|custa|demora|voces|vcs|duvida|gostaria\s+de\s+saber"
+    r"|queria\s+saber|tem\s+(?:vaga|horario|outro|outra|durante|de\s+manha"
+    r"|a\s+tarde|a\s+noite|na\s+semana|no\s+sabado))\b"
+)
+
+# Passos em que texto livre é um valor legítimo — um nome não tem forma fixa.
+# Neles só a interrogação explícita interrompe; palavra solta não basta.
+_PASSOS_DE_TEXTO_LIVRE = frozenset(
+    {
+        FlowState.AWAITING_NEW_PATIENT_NAME.value,
+        FlowState.AWAITING_EDIT_VALUE.value,
+    }
+)
+
+
+# Aceitar o convite para agendar tem forma própria: "pode ser", "quero", um
+# dia da semana ou um período são RESPOSTAS, não perguntas. O ramo
+# ``AWAITING_APPOINTMENT_OFFER_REPLY`` avança o agendamento com elas, e a
+# guarda precisa enxergar a mesma coisa que ele — por isso a definição é uma
+# só. Duas cópias divergiriam, e divergir aqui custa agendamento: "tem de
+# manhã?" é aceite com preferência de turno, não dúvida a ser respondida.
+_ACEITE_DE_OFERTA_RE = re.compile(
+    r"\b(?:sim|claro|quero|gostaria|tenho\s+interesse|pode\s+ser"
+    r"|segunda|terca|quarta|quinta|sexta|sabado|domingo"
+    r"|manha|tarde|noite)\b"
+)
+
+# Formas que valem como valor APENAS em certos passos.
+_VALOR_POR_PASSO = {
+    FlowState.AWAITING_APPOINTMENT_OFFER_REPLY.value: _ACEITE_DE_OFERTA_RE,
+}
+
+
+def _parece_valor_de_passo(text: str, state: str = "") -> bool:
+    """O texto é uma tentativa de responder ao que foi pedido NESTE passo?"""
+
+    especifico = _VALOR_POR_PASSO.get(state)
+    if especifico is not None and especifico.search(_normalize(text)):
+        return True
+
+    bruto = str(text or "").strip()
+    if not bruto:
+        return False
+    if _VALOR_NUMERO_RE.match(bruto):
+        return True
+    if _VALOR_EMAIL_RE.search(bruto):
+        return True
+    if _VALOR_DATA_RE.search(bruto):
+        return True
+    if len(_digits(bruto)) >= 8:
+        return True
+    if _normalize(bruto) in _VALOR_SIM_NAO:
+        return True
+    return False
+
+
+def _parece_pergunta(text: str, state: str) -> bool:
+    """O texto é conversa dirigida à secretária, e não um valor?"""
+
+    bruto = str(text or "")
+    if "?" in bruto:
+        return True
+    if state in _PASSOS_DE_TEXTO_LIVRE:
+        return False
+    return bool(_PERGUNTA_PALAVRA_RE.search(_intent_text(bruto)))
+
+
+# Estados em que um humano já é o dono da conversa. A guarda NÃO vale aqui:
+# em ``HANDOFF`` a recepção já foi avisada e está a caminho, e deixar o modelo
+# reengajar cria atendimento duplicado dentro da clínica — custo real, do lado
+# de fora da tela. ``RECONCILIATION_REQUIRED`` é barreira de segurança e exige
+# uma palavra exata de propósito. A linha é essa: a guarda vale onde o funil
+# PERGUNTA algo ao paciente, não onde ele já entregou o caso.
+# ---------------------------------------------------------------------------
+# Desistir
+# ---------------------------------------------------------------------------
+# Medido em 04/set/2026 com o código já corrigido: no passo do CPF, NENHUMA
+# das dez palavras óbvias solta o fluxo — "cancelar", "cancela", "desistir",
+# "parar", "sair", "recomecar", "menu", "voltar", "nao quero mais", "0" — todas
+# recebem "CPF inválido. Confira os 11 dígitos e envie novamente." Quem começa
+# a marcar e muda de ideia fica preso até o TTL de 24 h, sem saída nenhuma.
+#
+# É pior que o defeito da pergunta: ali o paciente ficava sem resposta; aqui
+# ele fica sem saída, e ainda acusado de errar um número que não digitou.
+_DESISTENCIA_RE = re.compile(
+    r"\b(?:desisto|desisti|desistir|desistencia"
+    r"|deixa\s+(?:pra\s+la|quieto|assim|de\s+lado|para\s+depois)"
+    r"|esquece|esquecer|esquece\s+isso"
+    r"|nao\s+quero\s+(?:mais|agendar|marcar|continuar)"
+    r"|nao\s+precisa\s+mais|melhor\s+depois|fica\s+pra\s+depois"
+    r"|quero\s+parar|para\s+de\s+perguntar|parar|pare|encerrar|encerra"
+    r"|sair|sai\s+dai"
+    # "cancelar" só chega aqui nos passos em que ele NÃO tem outro significado
+    # — ver ``_PASSOS_SEM_DESISTENCIA`` logo abaixo.
+    r"|cancelar|cancela|cancelamento"
+    r")\b"
+)
+
+# Onde desistir NÃO vale — e cada um por um motivo diferente:
+#
+#   AWAITING_APPOINTMENT_ACTION  "cancelar" é a OPÇÃO 3 do menu (desmarcar uma
+#                                consulta existente). Tratá-la como desistência
+#                                roubaria um pedido real de desmarcação.
+#   AWAITING_CANCEL_AUTHORIZATION  "cancelar"/"sim" está confirmando justamente
+#                                  uma desmarcação; encerrar ali a engoliria.
+#   COMPLETED                    o agendamento existe. "cancelar" aqui é pedido
+#                                de desmarcar, não de abandonar formulário.
+#   HANDOFF / RECONCILIATION_REQUIRED  um humano já é o dono da conversa; vale
+#                                      a mesma linha da guarda de pergunta.
+#
+# Fora desses, o paciente está no MEIO de um formulário e "cancelar" não tem
+# outro sentido possível.
+_PASSOS_SEM_DESISTENCIA = frozenset(
+    {
+        FlowState.AWAITING_APPOINTMENT_ACTION.value,
+        FlowState.AWAITING_CANCEL_AUTHORIZATION.value,
+        FlowState.COMPLETED.value,
+        FlowState.HANDOFF.value,
+        FlowState.RECONCILIATION_REQUIRED.value,
+    }
+)
+
+
+def desistencia_encerra_o_passo(text: str, state: str) -> bool:
+    """O paciente pediu para encerrar — em qualquer passo de formulário."""
+
+    if state in _PASSOS_SEM_DESISTENCIA:
+        return False
+    intent = _intent_text(text)
+    if state in _PASSOS_DE_TEXTO_LIVRE:
+        # Onde a resposta certa é texto livre, CONTER a palavra não basta:
+        # "Maria Cancela Souza" é nome de gente — *Cancela* é sobrenome
+        # brasileiro — e encerrar o agendamento dela por causa do sobrenome
+        # seria trocar um defeito por outro pior. Aqui a mensagem inteira
+        # precisa SER o pedido de desistir.
+        return bool(_DESISTENCIA_RE.fullmatch(intent))
+    return bool(_DESISTENCIA_RE.search(intent))
+
+
+# O único passo do ``_advance`` que tem ramo próprio para abertura — conferido
+# por varredura de ``_is_opener`` no arquivo: só ``AWAITING_APPOINTMENT_ACTION``
+# testa ``_is_opener`` lá dentro. Nos demais, "Oi" cai na validação de formato e
+# vira acusação de erro. Se algum dia outro passo ganhar ramo de abertura, é
+# aqui que ele entra.
+_PASSOS_COM_RAMO_DE_ABERTURA = frozenset(
+    {FlowState.AWAITING_APPOINTMENT_ACTION.value}
+)
+
+
+_PASSOS_DE_HUMANO = frozenset(
+    {
+        FlowState.HANDOFF.value,
+        FlowState.RECONCILIATION_REQUIRED.value,
+    }
+)
+
+
+def pergunta_interrompe_o_passo(text: str, state: str) -> bool:
+    """A regra completa, na ordem que a torna segura.
+
+    Exposta com nome público porque é ela que o teste exercita: a garantia de
+    que nenhum valor plausível é interceptado vale mais escrita do que dita.
+    """
+
+    if state in _PASSOS_DE_HUMANO:
+        return False
+    # "Alguém ai?" tem interrogação e não é dúvida: é cutucão de quem ainda
+    # não leu nada. O funil já responde a isso sem reimprimir o menu inteiro,
+    # e esse ramo carrega o incidente de 12/ago/2026 (duas listas completas em
+    # sete segundos, a secretária lendo como amnésica). Interrogação sozinha
+    # não basta para tirar o turno de quem já sabe tratar o caso.
+    #
+    # Mas SÓ onde o funil sabe tratar abertura, e isso é o menu. Nos passos de
+    # coleta de dado não existe ramo de abertura nenhum: qualquer coisa que
+    # não case o formato vira acusação de erro. Medido em produção em 04/set
+    # 16:51 e 16:52 BRT — o Victor escreveu "Ola" e depois "Oi" num fluxo
+    # parado no CPF desde a véspera, e leu duas vezes "CPF inválido. Confira
+    # os 11 dígitos e envie novamente." Cumprimentar e ser acusado de errar um
+    # número que ninguém digitou é pior do que a pergunta sem resposta.
+    if _parece_valor_de_passo(text, state):
+        return False
+    if _is_opener(text):
+        # Onde o funil tem ramo de abertura (o menu), ele fica com o turno.
+        # Onde não tem, uma saudação é alguém REABRINDO a conversa, e o modelo
+        # — que recebe o resumo do agendamento — cumprimenta e retoma o passo.
+        return state not in _PASSOS_COM_RAMO_DE_ABERTURA
+    return _parece_pergunta(text, state)
+
+
 class LeadStage(str, Enum):
     """CRM funnel stages, ordered from first contact to outcome.
 
@@ -162,6 +400,7 @@ class LeadStage(str, Enum):
 # lead's current stage rather than inventing a transition.
 _FLOW_STAGE_MAP: dict[str, LeadStage] = {
     FlowState.AWAITING_APPOINTMENT_ACTION.value: LeadStage.QUALIFICANDO,
+    FlowState.AWAITING_APPOINTMENT_OFFER_REPLY.value: LeadStage.QUALIFICANDO,
     FlowState.AWAITING_SERVICE.value: LeadStage.ESCOLHENDO_SERVICO,
     FlowState.AWAITING_SLOT.value: LeadStage.ESCOLHENDO_HORARIO,
     FlowState.AWAITING_RESCHEDULE_SLOT.value: LeadStage.ESCOLHENDO_HORARIO,
@@ -314,7 +553,9 @@ CREATE TABLE IF NOT EXISTS outbox_events (
     claim_token TEXT,
     lease_expires_at TEXT,
     attempts INTEGER NOT NULL DEFAULT 0,
-    next_attempt_at TEXT
+    next_attempt_at TEXT,
+    follow_up_state TEXT,
+    follow_up_data_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS returns_ledger (
@@ -476,12 +717,101 @@ _SERVICES: dict[int, dict[str, Any]] = {
     3: {"procedure_id": 3, "price": 300, "label": "Teleconsulta"},
 }
 
-_PRICE_LIST_TEXT = (
-    "Os valores são:\n"
-    "Consulta presencial — R$ 600\n"
-    "Consulta presencial + 1 consulta sequencial — R$ 800\n"
-    "Teleconsulta — R$ 300"
-)
+# A única consulta paga adiantado. Presencial se paga na clínica, e é por isso
+# que reserva, comprovante e watcher de pagamento só existem para esta —
+# ``create_reservation`` fala em "teleconsultation" justamente por isso.
+TELE_PROCEDURE_ID = 3
+
+
+def service_price_centavos(procedure_id: int) -> int:
+    """Preço do procedimento em centavos inteiros, ou 0 se não houver.
+
+    Existe para o cobrador online: dinheiro atravessa a fronteira com o PSP
+    em centavos inteiros, nunca em reais com vírgula. Devolver 0 para
+    procedimento desconhecido é deliberado — quem cobra trata 0 como "não sei
+    o preço" e não cobra, em vez de inventar um valor.
+    """
+
+    for service in _SERVICES.values():
+        if service["procedure_id"] == procedure_id:
+            return int(Decimal(str(service["price"])) * 100)
+    return 0
+
+
+def _format_reais(price: Any) -> str:
+    """``600`` → ``"600"``; ``600.5`` → ``"600,50"``. Como o paciente lê."""
+
+    amount = Decimal(str(price))
+    if amount == amount.to_integral_value():
+        return str(int(amount))
+    return f"{amount:.2f}".replace(".", ",")
+
+
+def _build_price_list_text() -> str:
+    """A lista de preços, derivada da tabela de serviços.
+
+    Era um texto literal com os mesmos três números escritos de novo. Dois
+    lugares para mudar um preço é um lugar a mais: mexer na tabela e esquecer
+    o texto faz a secretária **dizer** um valor e **cobrar** outro — e o
+    modelo de pagamento online cobra pela tabela.
+    """
+
+    linhas = "\n".join(
+        f"{service['label']} — R$ {_format_reais(service['price'])}"
+        for service in _SERVICES.values()
+    )
+    return f"Os valores são:\n{linhas}"
+
+
+_PRICE_LIST_TEXT = _build_price_list_text()
+
+# Qualquer "R$ 300", "R$ 1.200,50" solto no texto de instruções do config.
+_CONFIG_PRICE_RE = re.compile(r"R\$\s*([\d.]+(?:,\d{2})?)")
+
+
+def _render_payment_instructions(template: str) -> str:
+    """Instrução de pagamento com o preço vindo da tabela, não do texto.
+
+    O valor da teleconsulta estava escrito em **três** lugares: ``_SERVICES``,
+    a lista de preços e o ``instructions`` do config. Três cópias do mesmo
+    número é uma promessa de divergência — e divergir aqui significa a
+    secretária dizer um valor e o cobrador online cobrar outro.
+
+    Duas saídas, nesta ordem:
+
+    1. Se o texto traz ``{valor}``, ele é preenchido pela tabela. É a forma
+       preferida: o config para de carregar o número.
+    2. Se traz um ``R$`` escrito à mão, ele é **respeitado** e a divergência
+       é logada alto. Sobrescrever silenciosamente o texto que o Victor
+       escreveu seria pior que a divergência: ele veria uma mensagem que não
+       redigiu, e sem aviso nenhum.
+    """
+
+    if not template:
+        return template
+    preco = _format_reais(_SERVICES[3]["price"])
+    if "{valor}" in template:
+        return template.replace("{valor}", preco)
+
+    # Comparado como número, não como texto. A primeira versão normalizava
+    # com ``rstrip("0")`` e transformava "300" em "3" — um detector de
+    # divergência que inventava divergência.
+    declarados = []
+    for bruto in _CONFIG_PRICE_RE.findall(template):
+        try:
+            declarados.append(Decimal(bruto.replace(".", "").replace(",", ".")))
+        except InvalidOperation:
+            continue
+    esperado = Decimal(str(_SERVICES[3]["price"]))
+    if declarados and esperado not in declarados:
+        logger.warning(
+            "instrução de pagamento fala em R$ %s mas a teleconsulta custa "
+            "R$ %s na tabela de serviços — a secretária vai dizer um valor e "
+            "cobrar outro. Use {valor} no config para não repetir o número.",
+            " / R$ ".join(_format_reais(valor) for valor in declarados),
+            preco,
+        )
+    return template
 
 _PRICE_QUESTION_RE = re.compile(
     r"\b(?:quanto\s+(?:custa|(?:e|é)|fica|sai)|qual\s+(?:e|é)\s+o\s+valor|"
@@ -555,6 +885,135 @@ _APPOINTMENT_PATTERNS = tuple(
     )
 )
 
+# --- verbo de agendamento solto + âncora clínica ---------------------------
+#
+# 02/set/2026, 17:19 BRT, teste do próprio Victor pelo WhatsApp dele:
+#
+#   "Ola. Estou oensando em agendar c9\nOm dr vitu"
+#
+# ("pensando" e "com" digitados errado.)  Nenhum padrão acima casa: todos
+# exigem que ``agendar`` venha DEPOIS de um verbo de vontade (quero, queria,
+# gostaria, preciso) ou ANTES de um substantivo (consulta, horário, retorno).
+# A frase escrita certa — "estou pensando em agendar com o Dr. Victor" —
+# também não casava.  ``classify_route`` devolveu ``OUT_OF_SCOPE``, ``handle``
+# devolveu ``None``, e a conversa inteira caiu no pipeline do modelo: três
+# turnos, nenhuma data oferecida, e duas promessas vazias ("vou verificar a
+# agenda", "sua solicitação foi encaminhada") sem nada por trás — ninguém foi
+# avisado e a agenda nunca foi lida.
+#
+# O detector do outro lado do gateway já discordava:
+# ``gateway.run._whatsapp_has_scheduling_intent`` viu ``agendar`` como
+# substring e escreveu ``scheduling=True`` no log da mesma mensagem.  Dois
+# detectores, duas respostas — e quem manda no fluxo é este aqui.  Por isso
+# esta regra é, de propósito, a mais frouxa do arquivo: verbo de agendamento
+# em qualquer posição + uma âncora clínica em qualquer posição.
+#
+# Quem a segura é ``_MEETING_MARKERS_RE``.  O risco conhecido de afrouxar o
+# casador é fornecedor pedindo agenda — em 14/ago/2026 um parceiro cobrando
+# resposta chegou à recepção como pedido de agendamento.  Vocabulário de
+# reunião/comercial devolve ``OUT_OF_SCOPE``, não ``EXCLUDED``: o contato
+# segue no pipeline do modelo (exatamente o que já acontece hoje) em vez de
+# ter o estado posto em quarentena, porque quem hoje fala de proposta pode
+# ser paciente na conversa seguinte.
+_BOOKING_VERB_RE = re.compile(
+    r"\b(?:agendar|agendamento|marcar|marcacao|remarcar|reagendar|desmarcar)\b"
+)
+_CLINICAL_ANCHOR_RE = re.compile(
+    r"\b(?:dr|dra|doutor|doutora|victor|vitor|medico|medica|consulta|consultas"
+    r"|consultorio|atendimento|teleconsulta|retorno)\b"
+)
+_MEETING_MARKERS_RE = re.compile(
+    r"\b(?:reuniao|reunioes|meeting|call|calls|apresentacao|demonstracao|demo"
+    r"|proposta|parceria|orcamento|contrato|comercial|convite|palestra"
+    r"|entrevista|visita|alinhamento|bate\s*papo)\b"
+)
+
+# --- dizer com todas as letras vale tanto quanto apertar o número -----------
+#
+# 03/set/2026, 17:27:47 BRT, teste do Victor. O menu estava na tela e ele
+# escreveu **"Eu quero agendar"** — a frase mais explícita possível, e
+# literalmente a opção 1 da lista. Resposta: **o mesmo menu, palavra por
+# palavra**, e o estado parado em AWAITING_APPOINTMENT_ACTION.
+#
+# O agravante em relação aos outros casos do dia: esta frase CASA com
+# ``_APPOINTMENT_PATTERNS`` — foi ela que abriu o funil às 13:09. O sistema
+# reconhece a intenção e ainda assim manda apertar 1. Pedir com todas as
+# letras e receber a pergunta de volta é a definição prática de "burra".
+#
+# A ordem aqui importa e é do mais específico para o mais genérico:
+# "quero desmarcar" tem que virar 3, não 1 — mapear qualquer intenção de
+# agendamento para a opção 1 marcaria consulta para quem quer cancelar.
+_MENU_TEXT_CHOICES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("3", re.compile(r"\b(?:desmarcar|cancelar)\b")),
+    ("2", re.compile(
+        r"\b(?:remarcar|reagendar|transferir|mudar|adiar|antecipar)\b"
+        r"|\b(?:consultar|ver|conferir|confirmar|verificar|saber)\b[^.?!\n]{0,20}"
+        r"\b(?:consulta|agendamento|hor[aá]rio)\b"
+    )),
+    ("5", re.compile(
+        r"\b(?:atualizar|alterar|corrigir|mudar|trocar)\b[^.?!\n]{0,20}"
+        r"\b(?:cadastro|telefone|celular|e-?mail)\b"
+    )),
+    ("4", re.compile(r"\bsequencial\b|\bretorno\b")),
+    ("1", re.compile(
+        r"\b(?:agendar|agendamento|marcar|marca[çc][aã]o)\b"
+        r"|\b(?:consulta|teleconsulta|avalia[çc][aã]o)\b"
+    )),
+)
+
+
+def _menu_choice_from_text(value: Any) -> str | None:
+    """A opção do menu que a frase está pedindo, ou ``None``.
+
+    Só é consultada quando a mensagem NÃO é um número — dígito continua sendo
+    o caminho de sempre, sem passar por regex nenhuma.
+    """
+
+    texto = _intent_text(value)
+    if not texto:
+        return None
+    for opcao, padrao in _MENU_TEXT_CHOICES:
+        if padrao.search(texto):
+            return opcao
+    return _menu_choice_within_one_typo(texto)
+
+
+# Uma letra errada não pode custar um agendamento.
+#
+# 03/set/2026, 22:11:22 BRT: o Victor escreveu **"Agendae"**. Não casou com
+# nada, caiu na reimpressão do menu, e a guarda anti-repetição — que estava
+# certa, o menu já estava na tela — silenciou. Ele não recebeu **nada**.
+#
+# É o mesmo aprendizado do primeiro conserto do dia ("Estou oensando em agendar
+# c9 Om dr vitu"): paciente digita em celular, com pressa. A distância de um
+# erro já é usada no vocabulário de saudação (``_within_one_edit``); aqui ela
+# vale para os verbos do menu.
+#
+# A ordem repete a de ``_MENU_TEXT_CHOICES`` — cancelar antes de agendar —
+# porque um erro de digitação em "desmarcar" não pode virar consulta marcada.
+# Palavras curtas ficam de fora: a menos de 5 letras, "um erro de distância"
+# encosta em qualquer coisa.
+_MENU_TYPO_VERBS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("3", ("desmarcar", "cancelar")),
+    ("2", ("remarcar", "reagendar")),
+    ("5", ("cadastro", "telefone")),
+    ("4", ("sequencial", "retorno")),
+    ("1", ("agendar", "agendamento", "marcar", "consulta", "teleconsulta")),
+)
+
+
+def _menu_choice_within_one_typo(texto: str) -> str | None:
+    palavras = [p for p in texto.split() if len(p) >= 5]
+    if not palavras:
+        return None
+    for opcao, alvos in _MENU_TYPO_VERBS:
+        for palavra in palavras:
+            if any(_within_one_edit(palavra, alvo) for alvo in alvos):
+                return opcao
+    return None
+
+
+_INTENT_STRETCH_RE = re.compile(r"(.)\1{2,}")
 _INTENT_DEGLUE_DIGIT_LETTER_RE = re.compile(r"(?<=\d)(?=[^\W\d_])")
 _INTENT_DEGLUE_LETTER_DIGIT_RE = re.compile(r"(?<=[^\W\d_])(?=\d)")
 _INTENT_PUNCTUATION_RE = re.compile(r"[^\w\s-]+")
@@ -575,6 +1034,12 @@ def _intent_text(value: Any) -> str:
     """
 
     text = _normalize(value)
+    # Letra esticada é ênfase, não palavra nova: "agendarrrrr" é "agendar".
+    # Nenhuma palavra do português tem três letras iguais seguidas, então
+    # colapsar 3+ para uma é seguro — "carro" e "passar" ficam intactos.
+    # Medido em 03/set/2026 22:13 BRT: "Oii queri agendarrrrr" não casava com
+    # nada e ia parar na reimpressão do menu.
+    text = _INTENT_STRETCH_RE.sub(r"\1", text)
     text = _INTENT_DEGLUE_DIGIT_LETTER_RE.sub(" ", text)
     text = _INTENT_DEGLUE_LETTER_DIGIT_RE.sub(" ", text)
     text = _INTENT_PUNCTUATION_RE.sub(" ", text)
@@ -1051,6 +1516,14 @@ class AppointmentStore:
                 "next_attempt_at",
                 "ALTER TABLE outbox_events ADD COLUMN next_attempt_at TEXT",
             ),
+            (
+                "follow_up_state",
+                "ALTER TABLE outbox_events ADD COLUMN follow_up_state TEXT",
+            ),
+            (
+                "follow_up_data_json",
+                "ALTER TABLE outbox_events ADD COLUMN follow_up_data_json TEXT",
+            ),
         ):
             if column not in existing:
                 connection.execute(ddl)
@@ -1132,6 +1605,108 @@ class AppointmentStore:
         if row is None:
             return None
         return str(row[0]), str(row[1])
+
+    def enqueue_appointment_offer(
+        self,
+        *,
+        outbox_id: str,
+        idempotency_key: str,
+        chat_key: str,
+        body: str,
+        now: datetime,
+        data: Mapping[str, Any] | None = None,
+    ) -> bool:
+        """Queue a secretary-originated booking offer with its next state.
+
+        The state is activated only after the outbox delivery is acknowledged.
+        A patient must never be expected to answer a message that the service
+        failed to deliver. Keeping this contract beside the outbox also means
+        a reply such as "gostaria sim, terça pela manhã" belongs to the
+        deterministic funnel even when it starts a fresh LLM session.
+        """
+
+        serialized = json.dumps(
+            dict(data or {}), ensure_ascii=False, separators=(",", ":")
+        )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT 1 FROM outbox_events WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            connection.execute(
+                """
+                INSERT INTO outbox_events
+                    (id, idempotency_key, chat_key, body, state, created_at, sent_at,
+                     follow_up_state, follow_up_data_json)
+                VALUES (?, ?, ?, ?, 'PENDING', ?, NULL, ?, ?)
+                ON CONFLICT(idempotency_key) DO UPDATE SET
+                    follow_up_state = excluded.follow_up_state,
+                    follow_up_data_json = excluded.follow_up_data_json
+                """,
+                (
+                    outbox_id,
+                    idempotency_key,
+                    chat_key,
+                    body,
+                    now.isoformat(),
+                    FlowState.AWAITING_APPOINTMENT_OFFER_REPLY.value,
+                    serialized,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT state, follow_up_state, follow_up_data_json
+                  FROM outbox_events WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+            if row is not None and str(row[0]) == "SENT":
+                self._activate_outbox_follow_up(
+                    connection,
+                    chat_key=chat_key,
+                    state=str(row[1] or ""),
+                    data_json=str(row[2] or "{}"),
+                    now=now,
+                )
+        return existing is None
+
+    @staticmethod
+    def _activate_outbox_follow_up(
+        connection: sqlite3.Connection,
+        *,
+        chat_key: str,
+        state: str,
+        data_json: str,
+        now: datetime,
+    ) -> None:
+        """Make an acknowledged outbox message the durable next turn, if any."""
+
+        if state != FlowState.AWAITING_APPOINTMENT_OFFER_REPLY.value:
+            return
+        try:
+            data = json.loads(data_json)
+        except (TypeError, ValueError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        connection.execute(
+            """
+            INSERT INTO flow_states (chat_key, state, data_json, updated_at, expires_at)
+            VALUES (?, ?, ?, ?, NULL)
+            ON CONFLICT(chat_key) DO UPDATE SET
+                state = excluded.state,
+                data_json = excluded.data_json,
+                updated_at = excluded.updated_at,
+                expires_at = NULL
+            """,
+            (
+                chat_key,
+                state,
+                json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+                now.isoformat(),
+            ),
+        )
 
     def mark_silenced(self, message_id: str) -> None:
         """Marca uma entrada tratada como "respondida com silêncio".
@@ -1239,7 +1814,23 @@ class AppointmentStore:
                 " stage_entered_at = CASE WHEN stage = ? THEN stage_entered_at ELSE ? END,"
                 " intent_kind = COALESCE(?, intent_kind),"
                 " service_label = COALESCE(?, service_label),"
-                " greeted_at = CASE WHEN ? THEN COALESCE(greeted_at, ?) ELSE greeted_at END,"
+                # ``greeted_at`` é a ÚLTIMA saudação, não a primeira.
+                #
+                # Era ``COALESCE(greeted_at, ?)``: só gravava quando a coluna
+                # estava vazia, então a primeiríssima saudação da vida do
+                # contato congelava para sempre. Como ``lead_was_greeted``
+                # pergunta "faz menos de 6 h que eu me apresentei?", a resposta
+                # virava NÃO em definitivo — e a secretária voltava a dizer
+                # "Sou a assistente do Dr. Victor Almeida" em **toda** impressão
+                # de menu, para sempre, para todo contato com mais de 6 h de
+                # vida.
+                #
+                # Medido em 03/set/2026 21:47 BRT, no chat do Victor:
+                # ``greeted_at`` = **12/ago**, três semanas parado, e as três
+                # respostas seguidas daquele minuto abriram todas com a
+                # apresentação. Quem quer "a primeira vez" tem ``first_seen_at``
+                # na mesma tabela.
+                " greeted_at = CASE WHEN ? THEN ? ELSE greeted_at END,"
                 " lost_reason = COALESCE(?, lost_reason)"
                 " WHERE chat_key = ?",
                 (
@@ -1289,7 +1880,16 @@ class AppointmentStore:
         stamp = now.isoformat()
         with self._connect() as connection:
             connection.execute(
-                "UPDATE leads SET greeted_at = COALESCE(greeted_at, ?), updated_at = ?"
+                # Sem COALESCE: este método existe para dizer "apresentei-me
+                # AGORA". Com ele, o carimbo só era escrito quando a coluna
+                # estava vazia — o mesmo defeito que ``record_lead`` tinha, em
+                # segundo lugar, e é este o caminho que ``_menu_for`` chama.
+                #
+                # 03/set/2026: consertei o de ``record_lead`` às 21:52, este
+                # continuou quebrado, e o ``greeted_at`` do Victor ficou em
+                # 12/ago por mais dois deploys. Duas escritas, um bug, e eu só
+                # olhei uma por vez. Procure as duas antes de declarar pronto.
+                "UPDATE leads SET greeted_at = ?, updated_at = ?"
                 " WHERE chat_key = ?",
                 (stamp, stamp, chat_key),
             )
@@ -2506,6 +3106,16 @@ class AppointmentStore:
         """Acknowledge only the exact claim generation that performed the send."""
 
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            follow_up = connection.execute(
+                """
+                SELECT chat_key, follow_up_state, follow_up_data_json
+                  FROM outbox_events
+                 WHERE id = ? AND state = 'CLAIMED' AND owner = ?
+                   AND claim_token = ?
+                """,
+                (str(outbox_id), str(owner), str(claim_token)),
+            ).fetchone()
             cursor = connection.execute(
                 """
                 UPDATE outbox_events
@@ -2521,6 +3131,14 @@ class AppointmentStore:
                     str(claim_token),
                 ),
             )
+            if cursor.rowcount == 1 and follow_up is not None:
+                self._activate_outbox_follow_up(
+                    connection,
+                    chat_key=str(follow_up[0]),
+                    state=str(follow_up[1] or ""),
+                    data_json=str(follow_up[2] or "{}"),
+                    now=now,
+                )
         return cursor.rowcount == 1
 
     def release_outbox_failure(
@@ -2836,7 +3454,20 @@ def classify_route(incoming: Any) -> Route:
         return Route.EXCLUDED
     # Institutional exclusion is matched on the raw normalization first, so
     # ungluing below can never smuggle a partner contact into the funnel.
-    if any(pattern.search(_intent_text(text)) for pattern in _APPOINTMENT_PATTERNS):
+    intent = _intent_text(text)
+    if any(pattern.search(intent) for pattern in _APPOINTMENT_PATTERNS):
+        return Route.APPOINTMENT
+    # A frase que não cabe em nenhum molde acima: verbo de agendamento solto,
+    # em qualquer posição, com uma âncora clínica no mesmo texto. Ver o bloco
+    # de comentário de ``_BOOKING_VERB_RE`` — é o teste do Victor de
+    # 02/set/2026, e é a forma como as pessoas escrevem quando não estão
+    # respondendo a um menu. O vocabulário de reunião/comercial é o freio:
+    # sem ele isto mandaria fornecedor para o funil do paciente.
+    if (
+        _BOOKING_VERB_RE.search(intent)
+        and _CLINICAL_ANCHOR_RE.search(intent)
+        and not _MEETING_MARKERS_RE.search(intent)
+    ):
         return Route.APPOINTMENT
     # Intent first, opener second: "bom dia, quero agendar" is an appointment,
     # not a greeting. Only a message that states nothing reaches this line.
@@ -3022,19 +3653,20 @@ def _slot_date_and_time(slot: Mapping[str, Any]) -> tuple[date | None, time | No
     )
 
 
-def filter_eligible_slots(
-    slots: Any, procedure_id: int, *, limit: int = 3, modality: str | None = None
+def policy_eligible_slots(
+    slots: Any, procedure_id: int, *, modality: str | None = None
 ) -> list[dict[str, Any]]:
-    """Return real policy-eligible slots, capped at three.
+    """EVERY real slot this clinic's policy allows, ordered by date and time.
 
-    In-person procedures 1 and 9 remain restricted to Wed/Thu 14:00–18:00
-    BRT. Teleconsultation procedure 3 accepts the real schedule returned by
-    Feegow and gives Saturday-morning slots priority without fabricating any.
+    A política de elegibilidade e a política de *vitrine* eram a mesma função
+    até 03/set/2026, e isso escondia horário de verdade do paciente. Aqui mora
+    só a primeira: o que a clínica aceita agendar. Quantos mostrar, em que
+    ordem e com que viés é decisão de quem chama —
+    :func:`filter_eligible_slots` mantém a vitrine do menu, byte a byte como
+    era, e a camada conversacional pede a lista inteira para poder responder
+    "não tem durante a semana?" com a agenda na mão em vez de um beco.
 
-    ``modality`` ("presencial"/"tele") lets a caller apply the same policy
-    to a procedure id outside {1,3,9} — the configurable free-return
-    procedure shares one Feegow id across both modalities, so the id alone
-    cannot select a policy branch the way it does for 1/3/9.
+    Nada aqui inventa vaga: toda linha veio da Feegow e sobreviveu ao filtro.
     """
 
     procedure_id = int(procedure_id)
@@ -3079,7 +3711,37 @@ def filter_eligible_slots(
                 "display_date": slot_date.strftime("%d/%m/%Y"),
             }
         )
-    if modality == "tele":
+    eligible.sort(key=lambda slot: (slot["date"], slot["time"], slot["id"]))
+    return eligible
+
+
+def filter_eligible_slots(
+    slots: Any, procedure_id: int, *, limit: int = 3, modality: str | None = None
+) -> list[dict[str, Any]]:
+    """Return real policy-eligible slots, capped at three.
+
+    In-person procedures 1 and 9 remain restricted to Wed/Thu 14:00–18:00
+    BRT. Teleconsultation procedure 3 accepts the real schedule returned by
+    Feegow and gives Saturday-morning slots priority without fabricating any.
+
+    ``modality`` ("presencial"/"tele") lets a caller apply the same policy
+    to a procedure id outside {1,3,9} — the configurable free-return
+    procedure shares one Feegow id across both modalities, so the id alone
+    cannot select a policy branch the way it does for 1/3/9.
+
+    ⚠️ O que esta vitrine custa, medido em 03/set/2026: teleconsulta ordena
+    sábado de manhã primeiro E devolve no máximo 3, então as três vagas
+    oferecidas ao Victor foram 09:00, 09:30 e 10:00 do MESMO sábado. Vaga de
+    dia de semana existia e era invisível — e a pergunta dele, "tem algum dia
+    que atenda durante a semana?", não tinha como ser respondida por aqui.
+    Quem precisa da agenda inteira chama :func:`policy_eligible_slots`.
+    """
+
+    eligible = policy_eligible_slots(slots, procedure_id, modality=modality)
+    resolved_modality = modality
+    if resolved_modality is None:
+        resolved_modality = "tele" if int(procedure_id) == 3 else "presencial"
+    if resolved_modality == "tele":
         eligible.sort(
             key=lambda slot: (
                 not (
@@ -3091,9 +3753,60 @@ def filter_eligible_slots(
                 slot["id"],
             )
         )
-    else:
-        eligible.sort(key=lambda slot: (slot["date"], slot["time"], slot["id"]))
-    return eligible[: max(0, min(int(limit), 3))]
+    teto = max(0, min(int(limit), 3))
+    return _spread_over_days(eligible, teto)
+
+
+def _spread_over_days(eligible: list[dict[str, Any]], teto: int) -> list[dict[str, Any]]:
+    """Até ``teto`` vagas cobrindo dias DIFERENTES antes de repetir um dia.
+
+    Medido em 03/set/2026, com a agenda real na mão. A teleconsulta tinha
+    **8 vagas: 5 no sábado 12/09 e 3 em quintas** (03/09 17:00, 10/09 16:30,
+    10/09 17:00). A ordenação põe sábado de manhã na frente, o corte era
+    ``eligible[:3]`` — e o paciente via 09:00, 09:30 e 10:00 do MESMO sábado.
+    As três vagas de dia de semana eram invisíveis por construção.
+
+    Foi o que o Victor viu às 13:15 BRT. Às 13:18 ele perguntou "Tem durante a
+    semana?" — pergunta cuja resposta era **sim, três** — e o funil, além de
+    não saber responder, apagou o agendamento.
+
+    A preferência da clínica é preservada: a primeira vaga continua sendo a
+    primeira da lista ordenada (sábado de manhã, para tele). O que muda é que
+    um único dia não consome mais a vitrine inteira. Se só houver um dia com
+    vaga, o comportamento é idêntico ao de antes — completa com o mesmo dia.
+    """
+
+    if teto <= 0:
+        return []
+    escolhidas: list[dict[str, Any]] = []
+    dias_usados: set[str] = set()
+    for vaga in eligible:
+        if len(escolhidas) >= teto:
+            break
+        dia = str(vaga.get("date") or "")
+        if dia in dias_usados:
+            continue
+        escolhidas.append(vaga)
+        dias_usados.add(dia)
+    if len(escolhidas) < teto:
+        # Poucos dias distintos: completa na ordem da preferência, sem repetir
+        # a mesma vaga.
+        vistos = {id(v) for v in escolhidas}
+        for vaga in eligible:
+            if len(escolhidas) >= teto:
+                break
+            if id(vaga) in vistos:
+                continue
+            escolhidas.append(vaga)
+    # A ORDEM não é mexida aqui de propósito. A preferência da clínica
+    # (sábado de manhã primeiro, para teleconsulta) é regra de negócio, e
+    # trocá-la por ordem cronológica seria decisão do Victor, não deste
+    # conserto — que existe só para a vaga de dia de semana deixar de ser
+    # invisível. Fica registrada a ressalva: com preferência, a lista pode
+    # sair com as datas fora de ordem ("1 - 12/09, 2 - 03/09"), e o paciente
+    # escolhe por número. Se isso confundir alguém em produção, é uma linha
+    # de `sort` — mas é decisão dele.
+    return escolhidas
 
 
 def _normalized_phone(value: Any) -> str:
@@ -3491,6 +4204,21 @@ class WhatsAppAppointmentsHandler:
         self._greeting_ttl_seconds = max(
             60, int(settings.get("greeting_ttl_hours", 6)) * 3600
         )
+        # Pergunta no meio de um passo vai para o modelo em vez de virar
+        # "formato inválido". Chave em vez de constante porque a virada de
+        # 03/set foi decidida assim pelo Victor: a volta atrás precisa ser um
+        # VALOR, não um deploy. Padrão ligado — é o comportamento pedido.
+        # Para desligar, basta a linha `pergunta_vai_ao_modelo: false` na
+        # configuração da secretária.
+        self._pergunta_vai_ao_modelo = bool(
+            settings.get("pergunta_vai_ao_modelo", True)
+        )
+        # Chave própria, e não a mesma acima: são comportamentos diferentes, e
+        # desligar "responder pergunta" não pode, sem querer, voltar a prender
+        # quem quer desistir. Para desligar: desistencia_encerra_fluxo: false
+        self._desistencia_encerra_fluxo = bool(
+            settings.get("desistencia_encerra_fluxo", True)
+        )
         # The cold open uses this much shorter window instead: long enough to
         # collapse one burst of messages into a single introduction, short
         # enough that a contact coming back later is greeted like the new
@@ -3531,7 +4259,9 @@ class WhatsAppAppointmentsHandler:
         if not isinstance(payment, Mapping):
             payment = {}
         self._payment_beneficiary = str(payment.get("beneficiary") or "").strip()
-        self._payment_instructions = str(payment.get("instructions") or "").strip()
+        self._payment_instructions = _render_payment_instructions(
+            str(payment.get("instructions") or "").strip()
+        )
         self._payment_ready = (
             payment.get("enabled") is True
             and bool(self._payment_beneficiary)
@@ -3845,6 +4575,24 @@ class WhatsAppAppointmentsHandler:
             already_greeted = False
         if already_greeted:
             return _RETURNING_MENU
+        # Carimba no ato de se apresentar, não no ramo que por acaso passou
+        # ``greeted=True`` ao ``_track_lead``. Antes, só a abertura fria
+        # carimbava — e um chat que JÁ tinha fluxo aberto imprimia a
+        # apresentação sem nunca registrar que a fez.
+        #
+        # Medido em 03/set/2026 21:54 BRT: consertar o ``COALESCE`` do
+        # ``record_lead`` não bastou. O ``greeted_at`` do Victor continuou em
+        # **12/ago** depois do deploy, porque o caminho que ele exercitava
+        # (fluxo aberto + menu reimpresso) nunca chega no ramo da abertura
+        # fria. Duas correções na mesma cadeia, e só as duas juntas fecham:
+        # uma faz o carimbo ser atualizável, esta faz o carimbo acontecer.
+        try:
+            store.mark_lead_greeted(chat_key, now=self._now())
+        except Exception:
+            # Best-effort igual ao resto do funil: no pior caso a secretária
+            # se apresenta de novo, que é o comportamento de hoje. Nunca
+            # custar a resposta ao paciente por causa do carimbo.
+            logger.warning("greeting stamp could not be written", exc_info=True)
         return f"{self._opening_line(source)}\n\n{_MENU_OPTIONS}"
 
     def _opening_line(self, source: Any = None) -> str:
@@ -3905,6 +4653,46 @@ class WhatsAppAppointmentsHandler:
             logger.warning("greeting lookup failed", exc_info=True)
             return False
 
+    def disclosure_already_made(self, source: Any) -> bool:
+        """Whether this chat has ALREADY been told it is an automated service.
+
+        Não é a mesma pergunta que ``already_greeted``, e a diferença é o
+        defeito de 03/set/2026. ``lead_was_greeted`` lê ``leads.greeted_at``,
+        que ``mark_lead_greeted`` grava com ``COALESCE`` — ou seja, UMA vez na
+        vida do contato e nunca mais. Com TTL de 6 h, um contato apresentado
+        em 12/ago responde "não apresentado" hoje, mesmo tendo acabado de
+        receber o menu de abertura com a identidade dentro.
+
+        A pergunta certa é sobre a CONVERSA, não sobre o contato: existe um
+        fluxo vivo? Todo fluxo nasce em ``handle`` pelo ``_menu_for``, e o
+        ``_menu_for`` ou traz a apresentação inteira (abertura fria) ou a
+        omite justamente porque ela foi feita há pouco neste mesmo chat. Nos
+        dois casos, a disclosure já aconteceu nesta conversa. Quando o fluxo
+        expira, a próxima abertura é fria de novo e se reapresenta — que é o
+        comportamento correto.
+
+        Medido no teste do Victor, 03/set 07:27→07:38 BRT: cinco turnos, um
+        único fluxo (``AWAITING_SLOT``), e "Aqui é a assistente do Dr. Victor
+        Almeida." colado em quatro deles.
+
+        Read-only e best-effort: nunca cria o banco, e qualquer falha responde
+        ``False`` — que no máximo repete a apresentação, nunca a suprime.
+        """
+
+        if not self._enabled or not self._db_path.exists():
+            return False
+        try:
+            chat_key = str(getattr(source, "chat_id", "") or "")
+            if not chat_key:
+                return False
+            flow = AppointmentStore(self._db_path).load_flow(chat_key)
+            if flow is None or self._flow_is_expired(flow):
+                return False
+            return True
+        except Exception:
+            logger.warning("disclosure lookup failed", exc_info=True)
+            return False
+
     def patient_dossier(self, source: Any) -> dict[str, str]:
         """What this chat has already told us about the patient.
 
@@ -3957,6 +4745,66 @@ class WhatsAppAppointmentsHandler:
             if chosen:
                 dossier["requested"] = chosen
         return dossier
+
+    def open_flow_summary(self, source: Any) -> dict[str, Any]:
+        """O agendamento em andamento, em forma que o modelo possa ler.
+
+        Irmão de :meth:`patient_dossier`, com outro destinatário: aquele monta
+        o aviso da recepção, este monta o CONTEXTO do modelo.
+
+        Existe por causa de 03/set/2026. Quando o paciente escreve uma frase no
+        meio da escolha de vaga, o funil agora devolve o turno ao modelo em vez
+        de apagar o fluxo (ver o ramo ``AWAITING_SLOT`` em ``_advance``). Só que
+        devolver o turno sem devolver o CONTEXTO troca um defeito por outro: o
+        modelo responderia "vou verificar a agenda" sobre vagas que já estão
+        lidas e guardadas a um palmo dele. Foi exatamente essa frase — dita
+        sobre dados que o sistema já tinha — que o Victor leu em 02/set.
+
+        Read-only e best-effort: dicionário vazio significa "não há fluxo", e o
+        chamador simplesmente não injeta nada.
+        """
+
+        if not self._enabled or not self._db_path.exists():
+            return {}
+        chat_key = str(getattr(source, "chat_id", "") or "")
+        if not chat_key:
+            return {}
+        try:
+            flow = AppointmentStore(self._db_path).load_flow(chat_key)
+        except Exception:
+            logger.warning("open flow summary lookup failed", exc_info=True)
+            return {}
+        if flow is None:
+            return {}
+        data = flow.data if isinstance(flow.data, Mapping) else {}
+        resumo: dict[str, Any] = {
+            "state": flow.state,
+            "step": _HANDOFF_STEP_LABELS.get(flow.state, flow.state),
+        }
+        rotulo = str(data.get("service_label") or "").strip()
+        if rotulo:
+            resumo["service_label"] = rotulo
+        preco = data.get("price")
+        if preco not in (None, ""):
+            resumo["price"] = preco
+        vagas = data.get("slots")
+        if isinstance(vagas, list) and vagas:
+            resumo["slots"] = [
+                {
+                    "posicao": posicao,
+                    "data": str(vaga.get("display_date") or vaga.get("date") or ""),
+                    "hora": str(vaga.get("time") or ""),
+                }
+                for posicao, vaga in enumerate(vagas, 1)
+                if isinstance(vaga, Mapping)
+            ]
+        escolhida = data.get("selected_slot")
+        if isinstance(escolhida, Mapping):
+            resumo["selected_slot"] = {
+                "data": str(escolhida.get("display_date") or ""),
+                "hora": str(escolhida.get("time") or ""),
+            }
+        return resumo
 
     def _sign_off(self, message: str) -> str:
         """Append the closing wish to a message that ends the conversation.
@@ -5006,10 +5854,59 @@ class WhatsAppAppointmentsHandler:
         message_id: str,
         chat_key: str,
         text: str,
-    ) -> str:
+    ) -> str | None:
         state = flow.state
         data = dict(flow.data)
         normalized = _normalize(text)
+
+        # Desistir tem de ser possível em qualquer passo. Vem ANTES da guarda
+        # de pergunta porque é o sinal mais forte e mais específico dos dois:
+        # quem escreve "desisto" não quer conversar, quer sair.
+        if self._desistencia_encerra_fluxo and desistencia_encerra_o_passo(
+            text, state
+        ):
+            logger.info(
+                "appointment flow: desistência no passo %s — fluxo encerrado a "
+                "pedido do paciente",
+                state,
+            )
+            resposta = store.record_response(
+                message_id,
+                chat_key,
+                "Sem problema. Quando quiser agendar, é só me chamar por aqui.",
+                FlowState.COMPLETED.value,
+                {},
+                now=self._now(),
+            )
+            # PERDIDO, não AGENDADO. ``COMPLETED`` mapeia para ``AGENDADO`` no
+            # funil de CRM, e contar uma desistência como consulta marcada
+            # estragaria justamente o número que o Victor usa para julgar o
+            # funil. ``RESERVA_CANCELADA`` é o único estado que leva a
+            # ``PERDIDO``, e é ele que carrega o ``lost_reason``; nada é
+            # cancelado na Feegow por isto — ``_track_lead`` é observacional.
+            self._track_lead(
+                store,
+                chat_key,
+                FlowState.RESERVA_CANCELADA,
+                {},
+                note="desistiu: pediu para encerrar",
+            )
+            store.purge_flow(chat_key)
+            return resposta
+
+        # Uma pergunta não é um valor mal digitado. Antes de qualquer ramo
+        # validar formato, o turno vai para o modelo — com o fluxo INTACTO,
+        # que é a diferença entre atender e desistir. Ver
+        # ``pergunta_interrompe_o_passo``.
+        if self._pergunta_vai_ao_modelo and pergunta_interrompe_o_passo(
+            text, state
+        ):
+            logger.info(
+                "appointment flow: pergunta no passo %s — turno devolvido ao "
+                "modelo, fluxo preservado",
+                state,
+            )
+            return None
 
         if state == FlowState.RECONCILIATION_REQUIRED.value:
             if normalized != "reconciliar":
@@ -5085,6 +5982,46 @@ class WhatsAppAppointmentsHandler:
                 FlowState.COMPLETED,
                 data,
             )
+        if state == FlowState.AWAITING_APPOINTMENT_OFFER_REPLY.value:
+            # This state exists only after the secretary successfully sent a
+            # concrete invitation to book. Here, unlike a cold inbound,
+            # "sim" and a weekday are unambiguous answers to that invitation.
+            if re.search(
+                r"\b(?:nao|não|agora\s+nao|agora\s+não)\b", normalized
+            ):
+                response = store.record_response(
+                    message_id,
+                    chat_key,
+                    "Sem problema. Quando quiser agendar, é só me chamar por aqui.",
+                    FlowState.COMPLETED.value,
+                    {},
+                    now=self._now(),
+                )
+                store.purge_flow(chat_key)
+                return response
+            # Mesma definição que a guarda de pergunta consulta, para que as
+            # duas nunca discordem sobre o que é um aceite.
+            accepted = bool(_ACEITE_DE_OFERTA_RE.search(normalized))
+            if not accepted:
+                return self._respond(
+                    store,
+                    message_id,
+                    chat_key,
+                    "Para seguir com o agendamento, confirme se deseja marcar a consulta.",
+                    FlowState.AWAITING_APPOINTMENT_OFFER_REPLY,
+                    data,
+                )
+            data["requested_preference"] = str(text).strip()[:240]
+            return self._respond(
+                store,
+                message_id,
+                chat_key,
+                "Perfeito. Anotei sua preferência de período. "
+                "Agora escolha o tipo de consulta:\n\n"
+                f"{_SERVICE_MENU}",
+                FlowState.AWAITING_SERVICE,
+                data,
+            )
         if state == FlowState.AWAITING_APPOINTMENT_ACTION.value:
             if _PRICE_QUESTION_RE.search(normalized):
                 return self._respond(
@@ -5135,6 +6072,29 @@ class WhatsAppAppointmentsHandler:
                 )
                 store.purge_flow(chat_key)
                 return response
+            # O atalho falado só vale para quem JÁ foi apresentado.
+            #
+            # Avançar não pode custar a apresentação: quem chega frio e diz
+            # "quero agendar" pularia o menu e, junto com ele, o "Sou a
+            # assistente do Dr. Victor Almeida" — a única vez que a secretária
+            # diz quem é. Em chat frio o menu com a apresentação continua
+            # vindo primeiro, exatamente como antes; o paciente aperta 1 e
+            # segue. O ganho fica onde estava o defeito medido: a conversa já
+            # aberta, com o menu na tela (Victor, 03/set 17:27:47 BRT).
+            try:
+                ja_apresentada = store.lead_was_greeted(
+                    chat_key, now=self._now(), within_seconds=self._greeting_ttl_seconds
+                )
+            except Exception:
+                logger.warning("greeting lookup failed", exc_info=True)
+                ja_apresentada = False
+            escolha_falada = (
+                _menu_choice_from_text(text)
+                if ja_apresentada and not normalized.isdigit()
+                else None
+            )
+            if escolha_falada is not None:
+                normalized = escolha_falada
             if normalized != "1":
                 action = {"2": "MANAGE", "3": "CANCEL", "4": "RETURN", "5": "EDIT"}.get(
                     normalized
@@ -5220,14 +6180,67 @@ class WhatsAppAppointmentsHandler:
                 if index < 0:
                     raise IndexError
             except (ValueError, TypeError, IndexError, KeyError):
-                return self._respond(
-                    store,
-                    message_id,
-                    chat_key,
-                    "Escolha uma vaga pelo número informado.",
-                    FlowState.AWAITING_SLOT,
-                    data,
+                # Uma frase só respondia a dois erros diferentes, e nenhum
+                # tinha saída: o estado era regravado a cada tentativa, então
+                # ``updated_at`` andava junto e o TTL de 24 h nunca chegava.
+                # Quem respondesse com palavras ficava preso para sempre, e
+                # cada nova tentativa renovava a prisão. Medido em 03/set,
+                # 09:54 e 10:05 BRT: duas saudações, duas respostas idênticas
+                # de 39 caracteres, ``api_calls=0`` nas duas.
+                offered = data.get("slots")
+                if normalized.isdigit() and isinstance(offered, list) and offered:
+                    # Número é gente escolhendo. Reimprimir a lista ajuda;
+                    # repetir a mesma frase seca é o que faz a secretária
+                    # parecer um telefone quebrado.
+                    lines = [
+                        "Escolha uma das vagas disponíveis (horário de Brasília):",
+                        "",
+                    ]
+                    lines.extend(
+                        f"**{position}** - {slot['display_date']} às {slot['time']}"
+                        for position, slot in enumerate(offered, 1)
+                    )
+                    return self._respond(
+                        store,
+                        message_id,
+                        chat_key,
+                        "\n".join(lines),
+                        FlowState.AWAITING_SLOT,
+                        data,
+                    )
+                # Palavra não é escolha de vaga — é PERGUNTA, e perguntar é a
+                # coisa mais normal que um paciente faz. Devolve o turno ao
+                # modelo (``None`` é o contrato para isso) e **mantém o fluxo
+                # de pé**: as vagas já lidas da Feegow continuam guardadas, e
+                # um "2" na mensagem seguinte cai aqui de novo e agenda.
+                #
+                # O que havia antes — gravar ``_OTHER_SUBJECT_REPLY`` e chamar
+                # ``purge_flow`` — foi medido em produção no teste do Victor de
+                # 03/set/2026 e é destrutivo em três frentes:
+                #
+                #   13:14:16  "Pode ser teleconsulta?"   → fluxo apagado, 3 vagas perdidas
+                #   13:18:21  "Tem durante a semana?"    → idem (e as 3 vagas
+                #                                          ofertadas eram todas
+                #                                          no MESMO sábado, então
+                #                                          a pergunta estava certa)
+                #
+                # 1. apagava vaga que a Feegow já tinha devolvido;
+                # 2. jogava o lead para ATENDIMENTO_HUMANO;
+                # 3. dizia "eu encaminho ao Dr. Victor" — e NADA era enfileirado
+                #    em ``outbox_events``. Promessa vazia, agora vinda do lado
+                #    determinístico, que é a metade que existe para ser confiável.
+                #
+                # Não repor a frase aqui é parte do conserto: quem responde
+                # passa a ser o modelo, que pode de fato responder — com o
+                # contexto do fluxo (ver ``_whatsapp_flow_context`` em
+                # gateway/run.py) e com a agenda na mão pelo toolset
+                # ``secretaria``. "Teleconsulta" e "durante a semana" são
+                # perguntas com resposta; o funil é que não tinha como dá-la.
+                logger.info(
+                    "appointment flow: texto livre na escolha de vaga — turno "
+                    "devolvido ao modelo, fluxo preservado"
                 )
+                return None
             if (
                 int(data["procedure_id"]) == 3
                 and self._tele_payment_terms(selected) is None
@@ -6108,6 +7121,43 @@ class WhatsAppAppointmentsHandler:
                 raise RuntimeError("injected Feegow client has no slot reader")
             result = method(start.strftime("%d-%m-%Y"), end.strftime("%d-%m-%Y"))
         return filter_eligible_slots(result, int(procedure_id), limit=3, modality=modality)
+
+    def available_slots_all(
+        self, procedure_id: int, *, modality: str | None = None
+    ) -> list[dict[str, Any]]:
+        """A agenda inteira que a política aceita, sem teto e sem viés.
+
+        Mesma leitura da Feegow que :meth:`available_slots` — mesma janela,
+        mesmo profissional, mesma unidade —, e a MESMA política de
+        elegibilidade. A diferença é só o que se devolve: aqui vai tudo,
+        ordenado por data e hora.
+
+        Existe para a camada conversacional. ``available_slots`` é a vitrine
+        do menu (3 vagas, teleconsulta com sábado de manhã na frente) e
+        continua idêntica; quem precisa responder "tem algum dia durante a
+        semana?" precisa enxergar a semana. Nenhuma vaga é inventada: toda
+        linha veio da Feegow e passou pelo mesmo filtro.
+        """
+
+        client = self._require_client()
+        start = self._now().date()
+        end = start + timedelta(days=self._search_days)
+        method = getattr(client, "list_available_slots", None)
+        if callable(method):
+            result = method(
+                procedure_id=int(procedure_id),
+                professional_id=self._professional_id,
+                specialty_id=self._specialty_id,
+                local_id=self._local_id,
+                start_date=start.strftime("%d-%m-%Y"),
+                end_date=end.strftime("%d-%m-%Y"),
+            )
+        else:
+            method = getattr(client, "search_appointments", None)
+            if not callable(method):
+                raise RuntimeError("injected Feegow client has no slot reader")
+            result = method(start.strftime("%d-%m-%Y"), end.strftime("%d-%m-%Y"))
+        return policy_eligible_slots(result, int(procedure_id), modality=modality)
 
     def find_patient(self, cpf: str) -> list[dict[str, Any]]:
         """Find exact CPF candidates through an explicit injected-client method."""
