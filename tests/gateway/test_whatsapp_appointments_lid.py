@@ -131,8 +131,29 @@ def test_lid_chat_key_resolves_to_the_mapped_phone():
     assert _chat_phone(LID_CHAT_KEY) == PHONE
 
 
-def test_phone_jid_needs_no_mapping_and_is_unchanged():
-    assert _chat_phone("5571988877766@s.whatsapp.net") == "71988877766"
+def test_phone_jid_needs_no_mapping():
+    """Um JID de telefone se resolve sozinho, sem consultar mapeamento nenhum."""
+    assert _chat_phone("5511988877766@s.whatsapp.net") == "11988877766"
+
+
+def test_phone_jid_is_canonicalised_to_the_shape_its_ddd_uses():
+    """Trocado em 07/set/2026: o telefone do chat sai na forma do DDD dele.
+
+    Antes, esta função devolvia os dígitos como vieram. Isso bastava enquanto
+    ninguém comparava o resultado com nada; mas o portão de identidade compara
+    com o cadastro da Feegow, que escreve o mesmo número na outra grafia, e
+    duas grafias nunca são iguais. Canonizar aqui é o que faz os dois lados
+    falarem a mesma língua — ver ``_normalized_phone``.
+
+    Em produção não muda nada: 100% das conversas chegam por LID e o mapeamento
+    do bridge já entrega a forma certa. Muda para um JID escrito à mão.
+    """
+    # DDD 71 não usa o nono dígito no WhatsApp: escrito com ele, sai sem.
+    assert _chat_phone("5571988877766@s.whatsapp.net") == "7188877766"
+    # DDD 11 usa: escrito sem, sai com.
+    assert _chat_phone("551188877766@s.whatsapp.net") == "11988877766"
+    # Fixo não é celular em DDD nenhum, e não ganha nem perde dígito.
+    assert _chat_phone("557132110000@s.whatsapp.net") == "7132110000"
 
 
 def test_unmapped_lid_keeps_failing_closed():
@@ -475,3 +496,347 @@ def test_find_patient_by_cpf_propagates_instead_of_answering_empty():
     assert client.search_patients(cpf=CPF) == []
     with pytest.raises(FeegowAPIError):
         client.find_patient_by_cpf(CPF)
+
+
+# ------------------------------------------------- o cadastro como ele é hoje
+#
+# Georges Rocha, 05/set/2026 09:42 BRT. O conserto de 14/ago resolveu a
+# resolução do LID: o telefone dele saiu certo (``7188503616``). Ele morreu na
+# linha seguinte, no MESMO passo, e por outra razão — a comparação com o
+# cadastro.
+#
+# O que a Feegow devolve de verdade para o paciente 1015 (medido em 07/set):
+#
+#     "telefone":  "71988503616"      <- COM o nono dígito
+#     "celulares": ["71988503616"]
+#     "telefones": ["7188503616"]     <- a forma exata do WhatsApp
+#
+# Dois defeitos somados, cada um fatal sozinho:
+#
+# 1. ``_patient_phones`` só lia as chaves no SINGULAR. As plurais são as que a
+#    API de 02/set/2026 usa — e era nelas que estava o número certo.
+# 2. ``_normalized_phone`` só tirava o ``55``. WhatsApp endereça DDD >= 31 SEM
+#    o nono dígito e o cadastro guarda COM: comparar as duas formas cruas nunca
+#    bate, para nenhum paciente de Salvador.
+#
+# Os testes de 14/ago não pegaram porque montam o cadastro com
+# ``known_patient(celular=PHONE)`` — a chave singular, já na forma do WhatsApp.
+# O mundo real não entrega nenhuma das duas coisas.
+
+FEEGOW_PHONE_NINE = "71988503616"
+FEEGOW_PHONE_EIGHT = "7188503616"
+LID_BAHIA = "211995408220269"
+LID_BAHIA_CHAT_KEY = f"{LID_BAHIA}@lid"
+PHONE_BAHIA_WITH_COUNTRY = "55" + FEEGOW_PHONE_EIGHT
+
+
+def _feegow_shaped_patient(**overrides):
+    """O envelope de paciente do padrão de 02/set/2026, como ele chega."""
+    patient = known_patient()
+    patient.pop("celular", None)
+    patient.update(
+        {
+            "telefone": FEEGOW_PHONE_NINE,
+            "celulares": [FEEGOW_PHONE_NINE, None],
+            "telefones": [FEEGOW_PHONE_EIGHT, None],
+        }
+    )
+    patient.update(overrides)
+    return patient
+
+
+def _drive_bahia(handler, prefix):
+    return _drive_to_phone_confirmation(
+        handler, prefix, chat_key=LID_BAHIA_CHAT_KEY
+    )
+
+
+def test_ninth_digit_alone_must_not_send_a_bahian_patient_to_reception(tmp_path):
+    """O caso do Georges: cadastro COM o nono dígito, WhatsApp SEM."""
+    _write_lid_mapping(phone=PHONE_BAHIA_WITH_COUNTRY, lid=LID_BAHIA)
+    feegow = FakeFeegow(
+        slots=[dict(SLOT)],
+        patients=[known_patient(celular=FEEGOW_PHONE_NINE)],
+        procedures=[dict(PROC1)],
+    )
+    handler = _build(feegow, tmp_path)
+
+    reply = _drive_bahia(handler, "nono-digito")
+
+    assert DEAD_END not in reply
+    assert "CONFIRMAR" in reply
+
+
+def test_plural_feegow_phone_keys_are_read(tmp_path):
+    """O número certo estava em ``telefones`` e ninguém lia essa chave."""
+    _write_lid_mapping(phone=PHONE_BAHIA_WITH_COUNTRY, lid=LID_BAHIA)
+    feegow = FakeFeegow(
+        slots=[dict(SLOT)],
+        patients=[_feegow_shaped_patient()],
+        procedures=[dict(PROC1)],
+    )
+    handler = _build(feegow, tmp_path)
+
+    reply = _drive_bahia(handler, "plural")
+
+    assert DEAD_END not in reply
+    assert "CONFIRMAR" in reply
+
+
+def test_a_second_number_in_the_plural_list_still_identifies_the_patient(tmp_path):
+    """Cadastro com dois números: o do WhatsApp é o segundo da lista."""
+    _write_lid_mapping(phone=PHONE_BAHIA_WITH_COUNTRY, lid=LID_BAHIA)
+    feegow = FakeFeegow(
+        slots=[dict(SLOT)],
+        patients=[
+            _feegow_shaped_patient(
+                telefone="7133334444",
+                celulares=["7133334444", FEEGOW_PHONE_NINE],
+                telefones=[],
+            )
+        ],
+        procedures=[dict(PROC1)],
+    )
+    handler = _build(feegow, tmp_path)
+
+    reply = _drive_bahia(handler, "segundo-numero")
+
+    assert DEAD_END not in reply
+    assert "CONFIRMAR" in reply
+
+
+def test_a_different_persons_phone_still_fails_closed(tmp_path):
+    """A guarda não pode virar peneira: outro número continua parando aqui.
+
+    É o ponto do portão — o CPF pode ter sido digitado por outra pessoa. Sem
+    este teste, o conserto acima seria indistinguível de desligar a guarda.
+    """
+    _write_lid_mapping(phone=PHONE_BAHIA_WITH_COUNTRY, lid=LID_BAHIA)
+    feegow = FakeFeegow(
+        slots=[dict(SLOT)],
+        patients=[
+            _feegow_shaped_patient(
+                telefone="71977776666",
+                celulares=["71977776666", None],
+                telefones=["7177776666", None],
+            )
+        ],
+        procedures=[dict(PROC1)],
+    )
+    handler = _build(feegow, tmp_path)
+
+    reply = _drive_bahia(handler, "outra-pessoa")
+
+    assert DEAD_END in reply
+
+
+def test_landline_in_the_registration_is_never_rewritten_as_a_mobile(tmp_path):
+    """Fixo tem 8 dígitos em todo DDD e não ganha nono dígito nenhum."""
+    _write_lid_mapping(phone=PHONE_BAHIA_WITH_COUNTRY, lid=LID_BAHIA)
+    feegow = FakeFeegow(
+        slots=[dict(SLOT)],
+        patients=[
+            _feegow_shaped_patient(
+                telefone="7132110000",
+                celulares=["7132110000", None],
+                telefones=["7132110000", None],
+            )
+        ],
+        procedures=[dict(PROC1)],
+    )
+    handler = _build(feegow, tmp_path)
+
+    reply = _drive_bahia(handler, "fixo")
+
+    assert DEAD_END in reply
+
+
+# ------------------------------------------------- da vaga ao comprovante
+#
+# ``operations``, ``reservations`` e ``payment_proofs`` estão em ZERO na base de
+# produção desde 12/ago/2026: ninguém nunca passou do portão de telefone, então
+# o resto do caminho da venda nunca rodou contra dado real. Estes testes fazem
+# o percurso inteiro com o envelope que a Feegow devolve hoje — para o próximo
+# defeito aparecer aqui, e não num paciente.
+
+TELE_SLOT = {
+    "id": "slot-tele",
+    "procedimento_id": 3,
+    "data": "2026-08-05",
+    "horario": "14:00",
+}
+PROC_TELE = {"procedimento_id": 3, "nome": "Teleconsulta", "valor": 300}
+
+
+def _feegow_real_envelope(**overrides):
+    """Como o ``patient/search`` de 02/set/2026 responde, campo a campo.
+
+    Já normalizado por ``_normalize_patient_rows`` — que é o que o handler
+    recebe —, mas mantendo as chaves originais que a API manda junto: ``id``,
+    ``nascimento`` em DD-MM-AAAA, e as listas de telefone.
+    """
+    patient = {
+        "id": 1015,
+        "paciente_id": 1015,
+        "nome": "Paciente Exemplo",
+        "cpf": CPF,
+        "documentos": {"cpf": CPF},
+        "nascimento": "01-02-1990",
+        "telefone": FEEGOW_PHONE_NINE,
+        "celulares": [FEEGOW_PHONE_NINE, None],
+        "telefones": [FEEGOW_PHONE_EIGHT, None],
+        "email": "paciente@example.invalid",
+        "sexo": "F",
+    }
+    patient.update(overrides)
+    return patient
+
+
+def _tele_handler(tmp_path, feegow, clock):
+    return WhatsAppAppointmentsHandler(
+        payment_config(),
+        db_path=tmp_path / "appointments.sqlite3",
+        proofs_dir=tmp_path / "proofs",
+        feegow_client=feegow,
+        clock=clock,
+    )
+
+
+def _drive_tele_to_summary(handler, prefix):
+    """Menu → agendar → teleconsulta → vaga → CPF → nascimento → SIM."""
+    for index, text in enumerate(
+        ("Quero agendar uma consulta", "1", "3", "1", CPF_FORMATTED, BIRTH_DATE),
+        start=1,
+    ):
+        handler.handle(
+            event(text, message_id=f"{prefix}-{index}", chat_id=LID_BAHIA_CHAT_KEY)
+        )
+    return handler.handle(
+        event("SIM", message_id=f"{prefix}-7", chat_id=LID_BAHIA_CHAT_KEY)
+    )
+
+
+def _rows(tmp_path, query):
+    with sqlite3.connect(tmp_path / "appointments.sqlite3") as connection:
+        return connection.execute(query).fetchall()
+
+
+def test_real_envelope_reaches_the_pix_charge_and_creates_the_reservation(tmp_path):
+    """O caminho que nunca rodou: vaga → identidade → PIX → reserva viva."""
+    _write_lid_mapping(phone=PHONE_BAHIA_WITH_COUNTRY, lid=LID_BAHIA)
+    feegow = FakeFeegow(
+        slots=[dict(TELE_SLOT)],
+        patients=[_feegow_real_envelope()],
+        procedures=[dict(PROC_TELE)],
+    )
+    handler = _tele_handler(tmp_path, feegow, MutableClock(NOW))
+
+    summary = _drive_tele_to_summary(handler, "venda")
+    assert DEAD_END not in summary
+    assert "CONFIRMAR" in summary
+
+    charge = handler.handle(
+        event("CONFIRMAR", message_id="venda-8", chat_id=LID_BAHIA_CHAT_KEY)
+    )
+
+    assert DEAD_END not in charge
+    assert "comprovante" in charge.lower()
+    assert feegow.created_appointments, "a Feegow nunca foi chamada para criar"
+    assert len(_rows(tmp_path, "SELECT state FROM reservations")) == 1
+    operations = _rows(tmp_path, "SELECT kind, state FROM operations")
+    assert operations and all(state == "SUCCEEDED" for _, state in operations)
+
+
+def test_real_envelope_accepts_the_payment_proof_and_holds_the_slot(tmp_path):
+    """Comprovante recebido: a reserva para de expirar e nada é cancelado."""
+    _write_lid_mapping(phone=PHONE_BAHIA_WITH_COUNTRY, lid=LID_BAHIA)
+    feegow = FakeFeegow(
+        slots=[dict(TELE_SLOT)],
+        patients=[_feegow_real_envelope()],
+        procedures=[dict(PROC_TELE)],
+    )
+    handler = _tele_handler(tmp_path, feegow, MutableClock(NOW))
+    _drive_tele_to_summary(handler, "prova")
+    handler.handle(
+        event("CONFIRMAR", message_id="prova-8", chat_id=LID_BAHIA_CHAT_KEY)
+    )
+
+    source = tmp_path / "comprovante.jpg"
+    source.write_bytes(b"pix-bytes")
+    reply = handler.handle(
+        event(
+            "Segue o comprovante",
+            message_id="prova-9",
+            chat_id=LID_BAHIA_CHAT_KEY,
+            media_urls=[str(source)],
+        )
+    )
+
+    assert "recebido" in reply.lower()
+    assert _rows(tmp_path, "SELECT state FROM reservations")[0][0] == (
+        "COMPROVANTE_RECEBIDO"
+    )
+    assert _rows(tmp_path, "SELECT COUNT(*) FROM payment_proofs")[0][0] == 1
+    assert feegow.cancelled_appointments == []
+
+
+def _with_ninth_digit(digits):
+    """A grafia do cadastro: DDD 71 com o nono dígito de volta."""
+    bare = "".join(character for character in str(digits) if character.isdigit())
+    if len(bare) == 10 and bare[2] in "6789":
+        return f"{bare[:2]}9{bare[2:]}"
+    return bare
+
+
+def test_new_patient_readback_survives_feegows_own_phone_spelling(tmp_path):
+    """Paciente novo: a Feegow grava o telefone na grafia dela e devolve assim.
+
+    O cadastro é criado com a forma do WhatsApp (sem o nono dígito) e volta com
+    ele. Se o readback comparar as duas grafias cruas, o agendamento morre
+    DEPOIS de já ter criado o paciente — o pior lugar possível para falhar.
+    """
+    _write_lid_mapping(phone=PHONE_BAHIA_WITH_COUNTRY, lid=LID_BAHIA)
+
+    class _FeegowThatRewritesThePhone(FakeFeegow):
+        def create_patient(self, **payload):
+            result = super().create_patient(**payload)
+            stored = dict(self.patients[0])
+            stored.pop("telefone", None)
+            stored["telefones"] = [_with_ninth_digit(payload["telefone"]), None]
+            self.patients = [stored]
+            return result
+
+    feegow = _FeegowThatRewritesThePhone(
+        slots=[dict(TELE_SLOT)], patients=[], procedures=[dict(PROC_TELE)]
+    )
+    handler = _tele_handler(tmp_path, feegow, MutableClock(NOW))
+
+    for index, text in enumerate(
+        ("Quero agendar uma consulta", "1", "3", "1", CPF_FORMATTED, BIRTH_DATE),
+        start=1,
+    ):
+        handler.handle(
+            event(text, message_id=f"novo-{index}", chat_id=LID_BAHIA_CHAT_KEY)
+        )
+    handler.handle(event("SIM", message_id="novo-7", chat_id=LID_BAHIA_CHAT_KEY))
+    handler.handle(
+        event("Paciente Exemplo", message_id="novo-8", chat_id=LID_BAHIA_CHAT_KEY)
+    )
+    handler.handle(event("F", message_id="novo-9", chat_id=LID_BAHIA_CHAT_KEY))
+    summary = handler.handle(
+        event(
+            "paciente@example.invalid",
+            message_id="novo-10",
+            chat_id=LID_BAHIA_CHAT_KEY,
+        )
+    )
+    assert "CONFIRMAR" in summary, summary
+
+    charge = handler.handle(
+        event("CONFIRMAR", message_id="novo-11", chat_id=LID_BAHIA_CHAT_KEY)
+    )
+
+    assert DEAD_END not in charge
+    assert "comprovante" in charge.lower()
+    assert feegow.created_patients
+    assert feegow.created_appointments

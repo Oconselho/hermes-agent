@@ -288,8 +288,16 @@ def test_changing_the_payload_creates_a_new_grant_and_discards_the_old_one(tmp_p
 
     rows = _authorizations(tmp_path / "appointments.sqlite3")
     assert len(rows) == 2
-    assert rows[1][3] != first_hash
-    assert rows[1][2] == "slot-thu-15"
+    # Os dois grants nascem no mesmo instante (relógio congelado), então
+    # ``ORDER BY created_at, id`` desempata pelo id — que é um hash, e cuja
+    # ordem alfabética não diz qual veio primeiro. Identifique cada grant pelo
+    # que ele é: o vivo é o não consumido.
+    live = [row for row in rows if row[4] is None]
+    superseded = [row for row in rows if row[4] is not None]
+    assert len(live) == 1 and len(superseded) == 1
+    assert live[0][3] != first_hash
+    assert live[0][2] == "slot-thu-15"
+    assert superseded[0][3] == first_hash
     assert _mutation_calls(feegow) == []
 
 

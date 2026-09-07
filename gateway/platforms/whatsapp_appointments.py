@@ -3810,10 +3810,50 @@ def _spread_over_days(eligible: list[dict[str, Any]], teto: int) -> list[dict[st
 
 
 def _normalized_phone(value: Any) -> str:
+    """Bare local digits, in the one shape WhatsApp addresses this person by.
+
+    Every phone this flow compares comes from one of two worlds that write the
+    same number differently. WhatsApp addresses a Bahian mobile as
+    ``7188503616``; the Feegow record for the same patient says
+    ``71988503616``, because the national plan gave mobiles a ninth digit in
+    2016 and the clinic types numbers the way people write them. Comparing the
+    raw forms is comparing two spellings of one number, and it never matches
+    for any DDD from 31 up — which is the entire Salvador base.
+
+    That cost a booking on 05/set/2026: the patient had picked a slot and given
+    CPF and birth date, and the phone gate rejected him one line before the
+    write, exactly like the LID bug of 13/ago did before it. Canonising here
+    fixes both sides at once — the chat key and the registration read the same
+    helper — and the readback checks that verify what Feegow stored come along
+    for free, since Feegow answers in its own spelling too.
+
+    ``brazilian_whatsapp_number`` only ever moves a ninth digit it is certain
+    about: landlines, VoIP ranges and non-Brazilian numbers come back untouched.
+    """
+
     phone = _digits(value)
+    if not phone:
+        return phone
+    # Only something that can *be* a Brazilian national number gets the country
+    # code bolted on. An opaque LID is 14-15 digits and must come back exactly
+    # as it arrived, so an unresolvable identity keeps failing the length check
+    # downstream instead of being dressed up as a phone number.
     if phone.startswith("55") and len(phone) in {12, 13}:
-        phone = phone[2:]
-    return phone
+        national = phone
+    elif len(phone) in {10, 11}:
+        national = f"55{phone}"
+    else:
+        return phone
+    try:
+        from gateway.whatsapp_identity import brazilian_whatsapp_number
+
+        canonical = brazilian_whatsapp_number(national)
+    except Exception:
+        logger.warning("phone canonicalization failed; comparing as written", exc_info=True)
+        canonical = national
+    if canonical.startswith("55") and len(canonical) in {12, 13}:
+        canonical = canonical[2:]
+    return canonical or phone
 
 
 def _reception_send_target(value: Any) -> str:
@@ -4045,9 +4085,28 @@ _HANDOFF_STEP_LABELS = {
 }
 
 
+# Every key a patient record may carry a phone under. The plural ones are not
+# a defensive extra: they are what the 02/set/2026 API actually answers with —
+# ``_normalize_patient_rows`` documents the same envelope. Reading only the
+# singular ones meant the gate never saw ``telefones``, and on 05/set/2026 that
+# is precisely where the patient's WhatsApp number was sitting while the flow
+# handed him to reception.
+_PATIENT_PHONE_KEYS = (
+    "telefone",
+    "telefones",
+    "celular",
+    "celulares",
+    "telefone_celular",
+    "phone",
+    "phones",
+    "mobile",
+    "mobiles",
+)
+
+
 def _patient_phones(patient: Mapping[str, Any]) -> set[str]:
     values: list[Any] = []
-    for key in ("telefone", "celular", "phone", "mobile", "telefone_celular"):
+    for key in _PATIENT_PHONE_KEYS:
         value = patient.get(key)
         if isinstance(value, (list, tuple, set)):
             values.extend(value)
