@@ -27,6 +27,7 @@ except ModuleNotFoundError:
 import asyncio
 import concurrent.futures
 import dataclasses
+from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
 import inspect
 import json
@@ -2118,9 +2119,107 @@ def _whatsapp_with_interest_question(response: Any) -> str:
     return f"{text}{separator}{_WHATSAPP_INTEREST_QUESTION}"
 
 
+# ---------------------------------------------------------------------------
+# Dinheiro: conferir, não censurar
+# ---------------------------------------------------------------------------
+#
+# As quatro formas que a guarda de preço sempre inspecionou, agora com o
+# NÚMERO capturado. Nenhuma foi afrouxada de propósito: o que a guarda olhava
+# antes ela continua olhando, e a única diferença é o que faz com o achado.
+_WHATSAPP_MONEY_RE = re.compile(
+    r"(?is)"
+    r"\bR\$\s*(?P<cifrao>\d[\d.,]*)"
+    r"|(?P<reais>\d[\d.,]*)\s*r(?:eais|eal)\b"
+    r"|\b(?P<decimal>\d{1,6}[.,]\d{2})\b"
+    r"|(?:\b(?:custa|pre[cç]o|valor|pagamento|parcela)\b"
+    r".{0,40}?\b(?P<perto>\d[\d.,]*)\b)"
+)
+
+
+def _whatsapp_money_amount(raw: Any) -> Optional[Decimal]:
+    """``"600,00,"`` → ``Decimal("600")``. ``None`` quando não dá para ler.
+
+    O separador decimal é o ÚLTIMO ponto ou vírgula, e só quando sobram
+    exatamente dois dígitos depois dele — é assim que "1.200,00" e "1,200.00"
+    valem o mesmo, e é assim que "600.00" (o modelo escrevendo à americana)
+    não vira seiscentos mil. Qualquer outra coisa devolve ``None``, que o
+    chamador trata como valor desconhecido e portanto bloqueia.
+    """
+
+    texto = str(raw or "").strip().strip(".,")
+    if not texto or not texto[0].isdigit():
+        return None
+    corte = max(texto.rfind("."), texto.rfind(","))
+    if corte >= 0 and len(texto) - corte - 1 == 2:
+        inteiro = texto[:corte].replace(".", "").replace(",", "")
+        centavos = texto[corte + 1:]
+    else:
+        inteiro = texto.replace(".", "").replace(",", "")
+        centavos = "00"
+    if not inteiro.isdigit() or not centavos.isdigit():
+        return None
+    try:
+        return Decimal(f"{inteiro}.{centavos}").normalize()
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _whatsapp_price_table_reais() -> Optional[frozenset]:
+    """Os valores que a clínica realmente cobra, da tabela que cobra.
+
+    ``_SERVICES`` é a mesma fonte da tool ``servicos_e_precos``, do texto de
+    preço do funil e do cobrador online — uma tabela só, para que conferir
+    aqui não possa divergir do que é dito e do que é cobrado.
+
+    ``None`` quando não dá para ler a tabela, e aí o chamador bloqueia: sem
+    referência, todo número é desconhecido.
+    """
+
+    try:
+        from gateway.platforms.whatsapp_appointments import _SERVICES
+
+        return frozenset(
+            Decimal(str(servico["price"])).normalize()
+            for servico in _SERVICES.values()
+        )
+    except Exception:
+        logger.warning(
+            "price table unreadable; every money figure will be blocked",
+            exc_info=True,
+        )
+        return None
+
+
+def _whatsapp_quotes_unlisted_money(text: Any) -> bool:
+    """A resposta cita algum dinheiro que NÃO está na tabela de preços?
+
+    ``False`` para texto sem dinheiro nenhum e para texto em que todo valor
+    citado é um preço real da clínica — o caso que a tool ``servicos_e_precos``
+    produz e que a guarda antiga destruía. ``True`` para qualquer outra coisa,
+    inclusive número ilegível e tabela ilegível.
+    """
+
+    achados = [
+        proximo
+        for match in _WHATSAPP_MONEY_RE.finditer(str(text or ""))
+        for proximo in (match.group(match.lastgroup or 0),)
+        if proximo
+    ]
+    if not achados:
+        return False
+    tabela = _whatsapp_price_table_reais()
+    if not tabela:
+        return True
+    for bruto in achados:
+        valor = _whatsapp_money_amount(bruto)
+        if valor is None or valor not in tabela:
+            return True
+    return False
+
+
 def _sanitize_gateway_final_response(
     platform: Any, text: str, *, trusted_source: bool = False,
-    quoted_inbound: bool = False,
+    quoted_inbound: bool = False, audit: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Sanitize final gateway replies before sending them to chat surfaces.
 
@@ -2156,6 +2255,15 @@ def _sanitize_gateway_final_response(
     leaks, XML, internal reasoning, provider errors — still applies: they cost
     nothing here and keep this a single hardening path.
 
+    ``audit`` é preenchido com ``{"guard": <nome>}`` quando uma das guardas
+    TROCA o texto do modelo por uma frase de contenção. Existe porque a troca
+    é silenciosa por fora e invisível por dentro: em 10/set/2026 a guarda de
+    preço trocou a resposta certa por "Obrigado. O Dr. Victor verificará sua
+    mensagem pessoalmente." e ninguém — nem o contato, nem a recepção, nem o
+    Victor — soube. Quem chama usa isso para avisar um humano; ver
+    ``note_guard_block``. Sem ``audit`` nada muda, e por isso nenhuma chamada
+    antiga precisou ser tocada.
+
     Every human-facing chat surface (Telegram, WhatsApp, Discord, Slack,
     Signal, Matrix, plugin platforms, etc.) should receive concise, safe
     provider failure categories with secrets redacted instead of raw HTTP
@@ -2170,6 +2278,10 @@ def _sanitize_gateway_final_response(
     # gateway composed itself, and text that merely quotes the contact, claim
     # nothing — see the docstring.
     _model_authored = not trusted_source and not quoted_inbound
+
+    def _registra_guarda(nome: str) -> None:
+        if audit is not None:
+            audit["guard"] = nome
     if platform_value == "whatsapp":
         cleaned = _redact_gateway_user_facing_secrets(str(text))
         # ── [SILENCIOSO]: model chose to stay silent (conversation already resolved)
@@ -2328,9 +2440,21 @@ def _sanitize_gateway_final_response(
             r"|(\b(Respondi no WhatsApp|Anotei (seu|o) (recado|pedido)|Avisei o Dr|A pessoa (pede|solicitou|perguntou|mencionou)|O contato (pediu|solicitou)|Também convidou o senhor|provavelmente Ozempic|possivelmente um local)\b)"
         )
         # ── Block fake appointment/scheduling claims ──
+        #
+        # ``resumo do agendamento`` e ``responda CONFIRMAR`` entraram em
+        # 10/set/2026. Eles são a fala do funil — o resumo que ele monta e a
+        # autorização que só ele pode pedir — e o modelo escrevendo qualquer
+        # um dos dois está afirmando um agendamento em forma de substantivo,
+        # sem usar nenhum dos particípios acima.
+        #
+        # Até aqui quem barrava essas duas formas era, por acidente, a guarda
+        # de PREÇO: o resumo cita um valor, e a guarda antiga barrava todo
+        # valor. Quando ela passou a conferir o valor em vez de censurá-lo, o
+        # acidente acabou — e é melhor assim: cada guarda passa a barrar o que
+        # ela diz que barra, em vez de depender da vizinha.
         _fake_appt_re = re.compile(
             r"(?is)"
-            r"\b(agendad[oa]|confirmad[oa]|marcad[oa]|reservad[oa]|agendamento\s+confirmado|est[aá]\s+marcad[oa]|est[aá]\s+agendad[oa]|consulta\s+(confirmada|marcada|agendada))\b"
+            r"\b(agendad[oa]|confirmad[oa]|marcad[oa]|reservad[oa]|agendamento\s+confirmado|est[aá]\s+marcad[oa]|est[aá]\s+agendad[oa]|consulta\s+(confirmada|marcada|agendada)|resumo\s+d[oe]\s+agendamento|responda\s+confirmar)\b"
             r"(?=.{0,80}("
             r"\d{1,2}\s*(h|horas|hrs)\b"
             r"|\b\d{1,2}:\d{2}\b"
@@ -2340,17 +2464,28 @@ def _sanitize_gateway_final_response(
             r"))"
         )
         if _model_authored and _fake_appt_re.search(cleaned):
+            _registra_guarda("agendamento_inventado")
             return "Obrigado. O Dr. Victor verificará sua mensagem pessoalmente."
 
-        # ── Block any currency/price disclosure ──
-        _price_disclosure_re = re.compile(
-            r"(?is)"
-            r"\bR\$\s*\d[\d.,]*"
-            r"|\d[\d.,]*\s*r(eais|eal)\b"
-            r"|\b\d{1,6}[.,]\d{2}\b"
-            r"|(?:\b(custa|pre[cç]o|valor|pagamento|parcela)\b.{0,40}?\b(\d[\d.,]*)\b)"
-        )
-        if _model_authored and _price_disclosure_re.search(cleaned):
+        # ── Money the model did not read from the price table ──
+        # Esta guarda nasceu em jun/2026, quando a secretária era só modelo e
+        # não tinha de onde tirar um preço: qualquer número em reais só podia
+        # ser invenção, e bloquear tudo era a resposta certa.
+        #
+        # Deixou de ser em 03/set/2026, quando a tool ``servicos_e_precos``
+        # deu ao modelo a MESMA tabela que o funil usa para cobrar. Desde
+        # então "bloquear todo número" pune justamente a resposta certa: em
+        # 10/set 17:22 BRT o lead 71 9925-0705 perguntou "quanto custa", o
+        # modelo consultou a tool e escreveu os três valores corretos, e o
+        # contato recebeu 60 caracteres sem preço nenhum.
+        #
+        # Então a pergunta deixa de ser *tem dinheiro no texto?* e passa a ser
+        # *este dinheiro é o da tabela?*. O que a guarda existe para impedir
+        # — o modelo inventar um valor — continua impedido, agora por
+        # conferência e não por censura. Fail-closed continua sendo a regra:
+        # tabela que não carrega, ou número que não está nela, bloqueia.
+        if _model_authored and _whatsapp_quotes_unlisted_money(cleaned):
+            _registra_guarda("dinheiro_fora_da_tabela")
             return "Obrigado. O Dr. Victor verificará sua mensagem pessoalmente."
 
         # ── Block clinical conduct from a scheduling secretary ──
@@ -2413,6 +2548,7 @@ def _sanitize_gateway_final_response(
             return _WHATSAPP_CLINICAL_REFUSAL
 
         if internal_reasoning_re.search(cleaned):
+            _registra_guarda("raciocinio_interno")
             return "Obrigado. O Dr. Victor verificará sua mensagem pessoalmente."
         cleaned = re.sub(r"```.*?```", "", cleaned, flags=re.S)
         cleaned = _whatsapp_normalize_emphasis(cleaned)
@@ -14257,12 +14393,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 response = _normalize_empty_agent_response(
                     agent_result, response, history_len=len(history),
                 )
+                _guarda_audit: Dict[str, Any] = {}
                 response = _sanitize_gateway_final_response(
                     source.platform,
                     response,
                     # Only the deterministic appointment handler earns this;
                     # anything the model produced goes through every guard.
                     trusted_source=_appointment_response is not None,
+                    audit=_guarda_audit,
                 )
                 if response is None:
                     # Model returned [SILENCIOSO] — conversation already resolved,
@@ -14274,6 +14412,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return None
 
                 if source.platform and source.platform.value == "whatsapp" and response:
+                    # Uma guarda trocou a fala do modelo por uma frase de
+                    # contenção. Isso é um beco sem saída se parar aqui: o
+                    # contato leva "O Dr. Victor verificará sua mensagem
+                    # pessoalmente" — uma promessa — e até 10/set/2026
+                    # ninguém era avisado de nada. O lead 71 9925-0705 ficou
+                    # parado em ESCOLHENDO_SERVICO com `outbox_events` vazia.
+                    #
+                    # Mesmo destino da recusa clínica (a linha do próprio
+                    # Victor) porque é a ele que a frase promete, e porque
+                    # quem tem de ver uma guarda disparando é quem pode
+                    # decidir se a guarda está certa.
+                    if _guarda_audit.get("guard"):
+                        logger.warning(
+                            "[WhatsApp] guarda %s trocou a resposta do modelo "
+                            "para %s; avisando a linha do Dr. Victor",
+                            _guarda_audit["guard"], getattr(source, "chat_id", "?"),
+                        )
+                        try:
+                            _guard_handler = self._get_appointment_handler()
+                            if _guard_handler is not None:
+                                await asyncio.to_thread(
+                                    _guard_handler.note_guard_block,
+                                    event,
+                                    str(_guarda_audit["guard"]),
+                                )
+                        except Exception:
+                            logger.warning(
+                                "[WhatsApp] guard block notice failed",
+                                exc_info=True,
+                            )
+
                     # O funil já se apresentou? Ele é o único que sabe: as
                     # respostas dele não entram no `history` do modelo, então
                     # sem esta pergunta a identidade é recolada a cada turno.

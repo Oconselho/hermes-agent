@@ -334,6 +334,40 @@ _PASSOS_COM_RAMO_DE_ABERTURA = frozenset(
 )
 
 
+# Definida aqui, e não junto da tabela de preços, porque quem primeiro
+# precisa dela é a guarda de pergunta logo abaixo: ela decide se o turno fica
+# com o funil ou vai para o modelo, e essa decisão vem antes de qualquer ramo
+# do ``_advance``.
+_PRICE_QUESTION_RE = re.compile(
+    r"\b(?:quanto\s+(?:custa|(?:e|é)|fica|sai)|qual\s+(?:e|é)\s+o\s+valor|"
+    r"quais\s+(?:sao|são)\s+os\s+valores|valor\s+da\s+consulta|"
+    r"pre[cç]os?)\b"
+)
+
+# Passos cujo ramo no ``_advance`` responde à pergunta de preço sozinho, com
+# ``_PRICE_LIST_TEXT`` — texto do próprio funil, da mesma tabela que cobra.
+#
+# Existe por causa de 10/set/2026 17:22 BRT. O menu de serviço TERMINA com
+# *Para saber os valores, pergunte "quanto custa"* — e quando o lead (71
+# 9925-0705) perguntou exatamente isso, a guarda de pergunta tirou o turno do
+# funil antes que o ramo de preço rodasse. O modelo respondeu certo, com a
+# tabela lida pela tool ``servicos_e_precos`` (273 caracteres, os três valores
+# corretos), e a guarda de prevenção de preço do ``run.py`` trocou tudo por
+# "Obrigado. O Dr. Victor verificará sua mensagem pessoalmente." — 60 caracteres
+# que não dizem preço nenhum e não avisam ninguém.
+#
+# A lição não é sobre preço: o funil convidou a pergunta, sabia a resposta e
+# entregou o turno mesmo assim. Onde o passo TEM ramo para a pergunta, o passo
+# fica com ela — a mesma regra que ``_PASSOS_COM_RAMO_DE_ABERTURA`` já aplica
+# para "Oi".
+_PASSOS_COM_RAMO_DE_PRECO = frozenset(
+    {
+        FlowState.AWAITING_SERVICE.value,
+        FlowState.AWAITING_APPOINTMENT_ACTION.value,
+    }
+)
+
+
 _PASSOS_DE_HUMANO = frozenset(
     {
         FlowState.HANDOFF.value,
@@ -371,6 +405,13 @@ def pergunta_interrompe_o_passo(text: str, state: str) -> bool:
         # Onde não tem, uma saudação é alguém REABRINDO a conversa, e o modelo
         # — que recebe o resumo do agendamento — cumprimenta e retoma o passo.
         return state not in _PASSOS_COM_RAMO_DE_ABERTURA
+    # Pergunta de preço em passo que tem ramo de preço é do funil. Ver
+    # ``_PASSOS_COM_RAMO_DE_PRECO``: a resposta dele vem da tabela que cobra,
+    # atravessa o sanitizador como ``trusted_source`` e não pode ser censurada.
+    if state in _PASSOS_COM_RAMO_DE_PRECO and _PRICE_QUESTION_RE.search(
+        _intent_text(text)
+    ):
+        return False
     return _parece_pergunta(text, state)
 
 
@@ -703,6 +744,13 @@ _SERVICE_MENU = (
     "Para saber os valores, pergunte \"quanto custa\"."
 )
 
+_GUARD_BLOCK_LABELS = {
+    "dinheiro_fora_da_tabela": "citou um valor que não está na tabela de preços",
+    "agendamento_inventado": "afirmou um agendamento que o sistema não fez",
+    "raciocinio_interno": "deixou raciocínio interno vazar para a resposta",
+}
+
+
 _SERVICES: dict[int, dict[str, Any]] = {
     1: {"procedure_id": 1, "price": 600, "label": "Consulta presencial"},
     2: {
@@ -812,12 +860,6 @@ def _render_payment_instructions(template: str) -> str:
             preco,
         )
     return template
-
-_PRICE_QUESTION_RE = re.compile(
-    r"\b(?:quanto\s+(?:custa|(?:e|é)|fica|sai)|qual\s+(?:e|é)\s+o\s+valor|"
-    r"quais\s+(?:sao|são)\s+os\s+valores|valor\s+da\s+consulta|"
-    r"pre[cç]os?)\b"
-)
 
 _INSTITUTIONAL_MARKERS = (
     "clinica parceira",
@@ -2784,6 +2826,61 @@ class AppointmentStore:
             )
         return {"id": outbox_id, "chat_key": notice_chat_id, "body": body}
 
+    def enqueue_guard_block(
+        self,
+        chat_key: str,
+        notice_chat_id: str,
+        *,
+        now: datetime,
+        details: Mapping[str, str] | None = None,
+        guard: str = "",
+    ) -> dict[str, str] | None:
+        """Faz valer a promessa que a frase de contenção faz sozinha.
+
+        Quando uma guarda de saída troca a fala do modelo, o contato recebe
+        "Obrigado. O Dr. Victor verificará sua mensagem pessoalmente." — e é
+        só isso que ele recebe. Sem esta fila, ninguém verifica coisa nenhuma.
+
+        Balde de uma hora, como o aviso clínico: uma rajada vira um aviso só,
+        e quem escreve de novo três horas depois levanta assunto novo.
+
+        O texto do contato não é carregado: o que interessa ao Victor é que a
+        secretária foi impedida de responder e por quê — o teor está na
+        conversa, que é onde ele vai abrir.
+        """
+
+        bucket = now.strftime("%Y-%m-%dT%H")
+        idempotency_key = _opaque_id("guard-block", chat_key, guard, bucket)
+        outbox_id = _opaque_id("outbox", idempotency_key)
+        motivo = _GUARD_BLOCK_LABELS.get(
+            guard, "foi contida por uma guarda de saída"
+        )
+        lines = [
+            "🛑 *Resposta contida* — a secretária foi impedida de responder no "
+            "WhatsApp.",
+            "",
+            f"Motivo: a resposta {motivo}.",
+            "",
+        ]
+        lines.extend(f"{label}: {value}" for label, value in (details or {}).items())
+        lines.append("")
+        lines.append(
+            "O contato recebeu apenas \"O Dr. Victor verificará sua mensagem "
+            "pessoalmente\" e está esperando. Abrir a conversa para responder — "
+            "e conferir se a guarda estava certa."
+        )
+        body = "\n".join(lines)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO outbox_events
+                    (id, idempotency_key, chat_key, body, state, created_at, sent_at)
+                VALUES (?, ?, ?, ?, 'PENDING', ?, NULL)
+                """,
+                (outbox_id, idempotency_key, notice_chat_id, body, now.isoformat()),
+            )
+        return {"id": outbox_id, "chat_key": notice_chat_id, "body": body}
+
     def enqueue_reception_question(
         self,
         chat_key: str,
@@ -4600,6 +4697,70 @@ class WhatsAppAppointmentsHandler:
         except Exception:
             logger.warning(
                 "doctor promise notice could not be queued", exc_info=True
+            )
+
+    def note_guard_block(self, incoming: Any, guard: str) -> None:
+        """Avisa que uma guarda de saída trocou a fala da secretária.
+
+        As três guardas do ``_sanitize_gateway_final_response`` que substituem
+        texto — agendamento inventado, dinheiro fora da tabela, raciocínio
+        interno — devolvem ao contato "Obrigado. O Dr. Victor verificará sua
+        mensagem pessoalmente.". Isso é uma promessa, e até 10/set/2026 era
+        promessa sem código atrás: o lead 71 9925-0705 perguntou o preço às
+        17:22 BRT, recebeu essa frase e ficou parado em ``ESCOLHENDO_SERVICO``
+        com ``outbox_events`` vazia. A quarta promessa vazia deste sistema.
+
+        Vai para a linha do próprio Victor, e não para a recepção, por dois
+        motivos que apontam no mesmo sentido: é a ele que a frase promete, e
+        uma guarda disparando é informação sobre a MÁQUINA — quem precisa ver
+        é quem decide se a guarda está certa, não quem atende paciente.
+
+        Sem trava de organização, pelo mesmo motivo de ``note_doctor_escalation``:
+        um fornecedor que ouviu a promessa é credor dela igual a um paciente.
+
+        Best-effort: o contato já tem a resposta dele: o que se perde numa
+        falha é só o Victor ficar sabendo — que é o ponto inteiro da chamada,
+        e por isso o log é ruidoso.
+        """
+
+        if not self._enabled:
+            return
+        if not self._clinical_notice_chat_id:
+            logger.warning(
+                "guard block not queued: clinical_notice_chat_id is unset, so "
+                "the containment sentence has no destination"
+            )
+            return
+        if not self._db_path.exists():
+            return
+        try:
+            source = getattr(incoming, "source", None)
+            chat_key = str(getattr(source, "chat_id", "") or "")
+            if not chat_key or self._is_reception_chat(chat_key):
+                return
+            if self._is_clinical_notice_chat(chat_key):
+                return
+            details: dict[str, str] = {}
+            local_digits = _chat_phone(chat_key)
+            phone = _format_phone(local_digits)
+            name = _contact_first_name(source)
+            if phone:
+                details["Contato"] = f"{name} — {phone}" if name else phone
+            details["Recebido"] = self._now().strftime("%d/%m %H:%M")
+            asked = _question_summary(getattr(incoming, "text", ""))
+            if asked:
+                details["Perguntou"] = asked
+            details.update(_reception_contact_lines(local_digits, ""))
+            AppointmentStore(self._db_path).enqueue_guard_block(
+                chat_key,
+                self._clinical_notice_chat_id,
+                now=self._now(),
+                details=details,
+                guard=str(guard or "desconhecida"),
+            )
+        except Exception:
+            logger.warning(
+                "guard block notice could not be queued", exc_info=True
             )
 
     def _menu_for(

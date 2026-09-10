@@ -75,7 +75,11 @@ PERGUNTAS_EM_PASSOS = [
     ("quando o doutor atende", FlowState.AWAITING_CPF),
     ("Qual o valor da consulta?", FlowState.AWAITING_SLOT),
     ("tem horario de manha", FlowState.AWAITING_SLOT),
-    ("quanto custa", FlowState.AWAITING_SERVICE),
+    # "quanto custa" NÃO está aqui, e a ausência é deliberada: em
+    # AWAITING_SERVICE e AWAITING_APPOINTMENT_ACTION o próprio ``_advance``
+    # responde preço, da tabela que cobra. Ver ``_PASSOS_COM_RAMO_DE_PRECO`` e
+    # ``test_whatsapp_preco_do_lead.py`` — 10/set/2026.
+    ("quanto custa", FlowState.AWAITING_SLOT),
     ("voces atendem plano de saude", FlowState.AWAITING_APPOINTMENT_ACTION),
     ("onde fica o consultorio", FlowState.AWAITING_BIRTH_DATE),
     ("como funciona a teleconsulta", FlowState.AWAITING_PHONE_CONFIRMATION),

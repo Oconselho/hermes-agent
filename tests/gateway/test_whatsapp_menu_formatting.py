@@ -231,10 +231,43 @@ class TestTrustedDeterministicFlowClosesTheChain:
         assert out is not None
         assert out.strip() != self._BLOCKED
 
-    @pytest.mark.parametrize("step", sorted(_STEPS))
+    @pytest.mark.parametrize(
+        "step", ["confirmed", "summary in-person", "summary teleconsult"]
+    )
     def test_same_text_from_the_model_is_still_blocked(self, step):
-        """The guards must not weaken for anything a model wrote."""
+        """O que só o funil pode afirmar continua barrado para o modelo.
+
+        Marcar, confirmar, resumir um agendamento e pedir a autorização são
+        fala do funil. Nada disso afrouxou.
+        """
         out = _sanitize_gateway_final_response("whatsapp", self._STEPS[step])
+        assert out.strip() == self._BLOCKED
+
+    def test_o_modelo_pode_dizer_o_preco_da_tabela(self):
+        """Mudança deliberada de 10/set/2026, e a razão dela.
+
+        Em 03/set a tool ``servicos_e_precos`` deu ao modelo a MESMA tabela
+        que o funil usa para cobrar. A partir dali "todo número em reais é
+        invenção" deixou de ser verdade, e a guarda passou a destruir a
+        resposta certa: em 10/set 17:22 BRT um lead perguntou "quanto custa",
+        o modelo respondeu os três valores corretos e o contato recebeu
+        ``_BLOCKED``.
+
+        A guarda continua existindo — ver o teste seguinte. O que mudou é a
+        pergunta que ela faz: não *tem dinheiro?*, e sim *é o dinheiro da
+        tabela?*.
+        """
+        out = _sanitize_gateway_final_response("whatsapp", self._STEPS["price list"])
+
+        assert out.strip() != self._BLOCKED
+        assert "R$ 600" in out
+
+    def test_preco_fora_da_tabela_continua_barrado(self):
+        """O que a guarda foi escrita para impedir segue impedido."""
+        out = _sanitize_gateway_final_response(
+            "whatsapp", "Os valores são:\nConsulta presencial — R$ 450"
+        )
+
         assert out.strip() == self._BLOCKED
 
     def test_default_is_untrusted(self):
