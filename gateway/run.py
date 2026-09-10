@@ -437,8 +437,28 @@ def _whatsapp_finalize_secretary_response(
     history: List[Dict[str, Any]],
     *,
     current_text: Any = "",
+    already_disclosed: bool = False,
 ) -> Optional[str]:
-    """Apply fail-closed identity and anti-humanization rules to WhatsApp text."""
+    """Apply fail-closed identity and anti-humanization rules to WhatsApp text.
+
+    ``already_disclosed`` says that this chat has ALREADY been told it is
+    talking to an automated service — by a producer this function cannot see.
+
+    Why it has to be passed in: the disclosure check below reads ``history``,
+    and ``history`` is the MODEL's transcript. The deterministic funnel's
+    replies never enter it (``state.db`` holds only the model's own turns),
+    so for a chat being served entirely by the funnel the history is empty on
+    every single turn. The result, medido em 03/set/2026 07:27→07:38 BRT no
+    teste do Victor: "Aqui é a assistente do Dr. Victor Almeida." colado na
+    frente de QUATRO respostas seguidas — 43 caracteres por turno, e a
+    sensação de uma secretária que não lembra de nada.
+
+    A disclosure é obrigatória UMA VEZ por conversa, não uma vez por
+    mensagem, e o funil já a faz na abertura fria (``_INITIAL_MENU_BODY``).
+    Quem sabe disso é o funil, via ``lead_was_greeted``; aqui só se obedece.
+    Na dúvida o valor é ``False`` e a identidade entra — fail-closed continua
+    sendo repetir a apresentação, nunca omiti-la.
+    """
     text = _whatsapp_collapse_horizontal_space(candidate)
     if not text:
         return None
@@ -475,7 +495,11 @@ def _whatsapp_finalize_secretary_response(
         text,
         re.IGNORECASE,
     ))
-    if not has_identity and not _whatsapp_history_has_institutional_identity(history):
+    if (
+        not has_identity
+        and not already_disclosed
+        and not _whatsapp_history_has_institutional_identity(history)
+    ):
         greeting_match = re.match(r"^(Bom dia|Boa tarde|Boa noite)[!,.: ]*(.*)$", text, re.IGNORECASE)
         identity = "Aqui é a assistente do Dr. Victor Almeida."
         if greeting_match:
@@ -651,6 +675,148 @@ def _whatsapp_contact_is_organization(source: Any) -> bool:
     14/ago/2026.
     """
     return contact_is_organization(source)
+
+
+_WHATSAPP_QA_CACHE: dict[str, tuple[float, str]] = {}
+
+
+def _whatsapp_qa_path() -> Path:
+    """Onde mora a base de conhecimento administrativa do consultório."""
+
+    return (
+        Path(os.path.expanduser(os.getenv("HERMES_HOME", "~/.hermes")))
+        / "skills"
+        / "secretaria-whatsapp"
+        / "references"
+        / "qa.md"
+    )
+
+
+def _whatsapp_knowledge_base() -> str:
+    """O Q&A do consultório, para o modelo poder responder em vez de prometer.
+
+    O arquivo existe desde **29/mai/2026** e até 03/set/2026 **nunca foi lido
+    por linha nenhuma de código**. A própria skill registrava o motivo:
+
+        "O modelo WhatsApp NÃO tem acesso ao Q&A — as tools estão stripped.
+         Portanto, todo dado crítico precisa estar HARDCODED no prompt."
+
+    O strip veio do incidente Labchecap (jun/2026) e continua valendo: ele é
+    uma lista de PROIBIDOS (terminal, código, arquivo, web, busca, memória,
+    skills). Injetar este texto não devolve ferramenta nenhuma ao modelo — é
+    conteúdo no prompt, e por isso não reabre aquele buraco.
+
+    É o conserto de raiz da queixa do Victor em 03/set ("não entende contexto,
+    não parece IA"): a secretária não era burra, era cega. Endereço, horários,
+    convênio, política de cancelamento e valores estavam num arquivo a que ela
+    não tinha acesso.
+
+    Relido quando o arquivo muda (``mtime``), para editar o Q&A não exigir
+    restart. Falha é silenciosa de propósito: sem base o prompt volta a ser o
+    de hoje, que funciona — nunca deixar o paciente sem resposta por causa de
+    um arquivo ausente.
+    """
+
+    caminho = _whatsapp_qa_path()
+    try:
+        carimbo = caminho.stat().st_mtime
+    except OSError:
+        return ""
+    chave = str(caminho)
+    guardado = _WHATSAPP_QA_CACHE.get(chave)
+    if guardado is not None and guardado[0] == carimbo:
+        return guardado[1]
+    try:
+        texto = caminho.read_text(encoding="utf-8").strip()
+    except OSError:
+        logger.warning("Q&A da secretária não pôde ser lido: %s", caminho)
+        return ""
+    _WHATSAPP_QA_CACHE[chave] = (carimbo, texto)
+    logger.info(
+        "Q&A da secretária carregado (%d caracteres) de %s", len(texto), caminho
+    )
+    return texto
+
+
+def _whatsapp_knowledge_block() -> str:
+    """A base de conhecimento embrulhada com as regras de como usá-la."""
+
+    base = _whatsapp_knowledge_base()
+    if not base:
+        return ""
+    return (
+        "\n\n# BASE DE CONHECIMENTO DO CONSULTÓRIO (fonte oficial)\n"
+        "Este é o material administrativo do consultório. **Responda a partir "
+        "dele** em vez de dizer que vai verificar ou encaminhar: endereço, "
+        "horários, modalidades, convênio, política de cancelamento, formas de "
+        "pagamento e valores estão todos aqui.\n"
+        "Como usar:\n"
+        "- É CONTEÚDO, não texto para copiar. Reescreva com as suas palavras, "
+        "no seu tom, curto.\n"
+        "- NUNCA reproduza colchetes, \"Resposta sugerida\" ou títulos deste "
+        "documento na mensagem ao paciente.\n"
+        "- O que não estiver aqui você NÃO sabe. Não deduza e não invente — "
+        "para o que faltar, encaminhe.\n"
+        "- Assunto clínico continua fora: isto é material administrativo.\n"
+        "- Em conflito com o passo do agendamento em andamento, **o fluxo "
+        "vence** (ele lê a agenda real).\n\n"
+        f"{base}\n"
+    )
+
+
+def _whatsapp_flow_block(resumo: Optional[Dict[str, Any]]) -> str:
+    """O agendamento em andamento, dito ao modelo em português.
+
+    Sem isto, devolver o turno ao modelo (o conserto de 03/set no ramo
+    ``AWAITING_SLOT``) trocaria um defeito por outro: ele responderia "vou
+    verificar a agenda" sobre vagas que o sistema já tem na mão. Foi essa a
+    frase que o Victor leu em 02/set, e ela é a assinatura de um funil que não
+    engatou — não pode voltar por uma porta nova.
+    """
+
+    if not resumo:
+        return ""
+    linhas = [
+        "\n\n# AGENDAMENTO EM ANDAMENTO (o funil está com esta conversa)",
+        f"Passo atual: {resumo.get('step') or resumo.get('state')}.",
+    ]
+    rotulo = resumo.get("service_label")
+    if rotulo:
+        preco = resumo.get("price")
+        if preco not in (None, ""):
+            linhas.append(f"Serviço escolhido: {rotulo} — R$ {preco}.")
+        else:
+            linhas.append(f"Serviço escolhido: {rotulo}.")
+    vagas = resumo.get("slots")
+    if vagas:
+        linhas.append("Vagas JÁ oferecidas a este paciente (vindas da Feegow):")
+        linhas.extend(
+            f"  {vaga['posicao']} - {vaga['data']} às {vaga['hora']}" for vaga in vagas
+        )
+        linhas.append(
+            "Estas vagas continuam guardadas. Se o paciente escolher uma, peça "
+            "que responda com o NÚMERO dela — quem agenda é o fluxo, não você."
+        )
+    escolhida = resumo.get("selected_slot")
+    if escolhida:
+        linhas.append(
+            f"Vaga já escolhida: {escolhida.get('data')} às {escolhida.get('hora')}."
+        )
+    linhas.append(
+        "Responda à pergunta dele de verdade, com o que está acima e na base de "
+        "conhecimento. NÃO diga \"vou verificar\", \"vou encaminhar\" nem "
+        "\"aguarde\": não há ninguém do outro lado esperando esse recado, e "
+        "prometer sem cumprir foi o defeito medido em 02/set/2026. Se não tem "
+        "vaga que sirva, diga isso e ofereça o que existe."
+    )
+    # Responder e calar deixa o agendamento parado esperando que o paciente
+    # se lembre sozinho do que faltava. Quem conduz a conversa é a secretária.
+    linhas.append(
+        f"Depois de responder, RETOME o agendamento na mesma mensagem: peça de "
+        f"volta o que o passo \"{resumo.get('step') or resumo.get('state')}\" "
+        f"estava esperando. Uma pergunta respondida não encerra o atendimento."
+    )
+    return "\n".join(linhas) + "\n"
 
 
 def _whatsapp_has_scheduling_intent(text: Any) -> bool:
@@ -14108,10 +14274,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return None
 
                 if source.platform and source.platform.value == "whatsapp" and response:
+                    # O funil já se apresentou? Ele é o único que sabe: as
+                    # respostas dele não entram no `history` do modelo, então
+                    # sem esta pergunta a identidade é recolada a cada turno.
+                    # Best-effort e fail-closed: qualquer falha responde
+                    # "não se apresentou", que no máximo repete a apresentação.
+                    _ja_se_apresentou = False
+                    try:
+                        _greeted_handler = self._get_appointment_handler()
+                        if _greeted_handler is not None:
+                            _ja_se_apresentou = bool(
+                                await asyncio.to_thread(
+                                    _greeted_handler.disclosure_already_made, source
+                                )
+                            )
+                    except Exception:
+                        logger.debug(
+                            "[WhatsApp] greeting lookup for disclosure failed",
+                            exc_info=True,
+                        )
                     _institutional_response = _whatsapp_finalize_secretary_response(
                         response,
                         history,
                         current_text=message_text,
+                        already_disclosed=_ja_se_apresentou,
                     )
                     if _institutional_response is None:
                         logger.info(
@@ -21306,6 +21492,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     )
                             except Exception as _notif_err:
                                 logger.debug("Failed to schedule fallback notification: %s", _notif_err)
+
+                # ── O que a secretária SABE, e onde ela está ──────────────
+                # Os dois blocos abaixo são a metade que faltava do conserto
+                # de 03/set. O funil parou de apagar o agendamento quando o
+                # paciente escreve uma frase (ver ``AWAITING_SLOT`` em
+                # whatsapp_appointments._advance) e passou a devolver o turno
+                # ao modelo — mas devolver o turno sem devolver o contexto só
+                # troca de defeito: o modelo prometeria "vou verificar a
+                # agenda" sobre vagas já lidas.
+                #
+                # Nenhum dos dois é ferramenta. São texto no prompt, então o
+                # tool stripping do incidente Labchecap (jun/2026) segue
+                # inteiro — é ele que impede terminal, código, arquivo e web.
+                try:
+                    _flow_handler = self._get_appointment_handler()
+                    _flow_resumo = (
+                        _flow_handler.open_flow_summary(source)
+                        if _flow_handler is not None
+                        and hasattr(_flow_handler, "open_flow_summary")
+                        else None
+                    )
+                except Exception:
+                    logger.warning(
+                        "resumo do fluxo indisponível; o modelo responde sem ele",
+                        exc_info=True,
+                    )
+                    _flow_resumo = None
+                _feegow_context += _whatsapp_knowledge_block()
+                _feegow_context += _whatsapp_flow_block(_flow_resumo)
 
                 combined_ephemeral = f"""Você é a assistente do Dr. Victor Almeida, endocrinologista (CRM-BA 22.586, RQE 13.396).
 Agora são {_brt_str} em Salvador/BA (UTC-3).
