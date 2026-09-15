@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -86,6 +87,40 @@ class FeegowValidationError(FeegowAPIError):
 
 class FeegowConflictError(FeegowAPIError):
     """Conflito explícito (HTTP 409), que exige reconciliação por leitura."""
+
+
+# Esta API responde "não encontrei" com **409**, não com 200 vazio nem com 404.
+# Medido contra produção em 15/set/2026, no `patient/search`:
+#
+#   CPF que existe          -> 200, um registro com paciente_id/nome/matricula
+#   CPF que NÃO existe      -> 409, {"success": false,
+#                                    "content": "Paciente não encontrado"}
+#
+# O custo de ler isso como "base ilegível" foi total: `find_patient_by_cpf` lê
+# em modo estrito justamente porque lista vazia significa "cadastrar paciente
+# novo" — e como vazio NUNCA chegava, **todo paciente ainda não cadastrado
+# morria no passo da data de nascimento e ia para a recepção**. A tabela
+# `operations` do funil tinha ZERO linhas desde que existe: nenhum agendamento
+# jamais foi gravado na Feegow por este caminho. João Pedro Neiva (71
+# 98362-0139), 15/set/2026 12:03 BRT, é o caso que mostrou isto.
+#
+# O reconhecimento é estreito de propósito: só 409 que se declara
+# `success: false` E diz "não encontrado". Qualquer outro 409 continua
+# subindo como conflito de verdade — duplicidade de agendamento, por exemplo,
+# onde falhar fechado é a resposta certa.
+_FEEGOW_NAO_ENCONTRADO_RE = re.compile(r"n[ãa]o\s+encontrad", re.IGNORECASE)
+
+
+def _conflito_e_busca_vazia(exc: FeegowConflictError) -> bool:
+    """Se este 409 é, na verdade, uma busca que não achou nada."""
+
+    corpo = getattr(exc, "response_body", None)
+    if not isinstance(corpo, dict) or corpo.get("success") is not False:
+        return False
+    conteudo = corpo.get("content") or corpo.get("message") or ""
+    if not isinstance(conteudo, str):
+        return False
+    return bool(_FEEGOW_NAO_ENCONTRADO_RE.search(conteudo))
 
 
 class FeegowWriteDisabledError(FeegowAPIError):
@@ -542,9 +577,21 @@ class FeegowClient:
         logger.info("Feegow: searching patients with %s", list(params.keys()))
 
         def read() -> List[Dict[str, Any]]:
-            return self._normalize_patient_rows(
-                self._request("GET", "patient/search", params=params)
-            )
+            try:
+                bruto = self._request("GET", "patient/search", params=params)
+            except FeegowConflictError as exc:
+                if not _conflito_e_busca_vazia(exc):
+                    raise
+                # Medido contra a API de produção em 15/set/2026: CPF que não
+                # existe responde **409** com {"success": false, "content":
+                # "Paciente não encontrado"}. CPF que existe responde 200.
+                # "Não encontrado" é RESULTADO, não erro de leitura.
+                logger.info(
+                    "Feegow: patient/search respondeu 409 'não encontrado' — "
+                    "tratando como busca vazia"
+                )
+                return []
+            return self._normalize_patient_rows(bruto)
 
         if strict:
             return read()
