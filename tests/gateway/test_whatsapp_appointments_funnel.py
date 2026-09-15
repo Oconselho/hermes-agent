@@ -548,6 +548,112 @@ def test_option_six_leaves_the_funnel_instead_of_looping_the_menu(tmp_path):
     assert handler.handle(event("é sobre uma parceria", message_id="m-3")) is None
 
 
+def test_option_six_holds_against_an_opener_on_the_very_next_message(tmp_path):
+    """Sair pelo 6 tem de SEGURAR — e o que o quebrava era uma abertura.
+
+    Georges Rocha, 12/set/2026: apertou 6 às 13:02 BRT, ouviu "me conte", e a
+    mensagem seguinte — uma dúvida clínica — levou o menu inteiro de volta.
+    Repetiu às 13:08 e recebeu o menu de novo. ``api_calls=0`` nos quatro
+    turnos, porque o funil respondeu todos; e como as três rotas de
+    escalonamento do ``run.py`` leem o texto ENTREGUE, que nunca foi do
+    modelo, ninguém foi avisado da dúvida.
+
+    A causa não era o 6 responder errado. Era ``purge_flow`` deixar o chat SEM
+    linha nenhuma — e ``flow is None`` é exatamente a condição de abertura
+    fria. Sair do funil apagando a marca de que se saiu é voltar para ele na
+    mensagem seguinte.
+    """
+
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    clock = MutableClock(datetime(2026, 9, 12, 12, 59, tzinfo=BRT))
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True}, db_path=db_path, clock=clock
+    )
+
+    handler.handle(event("boa tarde", message_id="g-1"))
+    handler.handle(event("6", message_id="g-2"))
+
+    # "preciso de uma informação" é Route.OPENER — a mesma classe de mensagem
+    # que trouxe o Georges de volta. Antes deste conserto isto devolvia o menu.
+    clock.value += timedelta(minutes=1)
+    depois = handler.handle(event("preciso de uma informação", message_id="g-3"))
+    assert depois is None, f"o funil recapturou quem tinha saído: {depois!r}"
+
+    # E segue segurando: não é um passe livre de uma mensagem só.
+    clock.value += timedelta(minutes=5)
+    assert handler.handle(event("pode me ajudar?", message_id="g-4")) is None
+
+
+def test_option_six_no_longer_makes_the_secretary_reintroduce_itself(tmp_path):
+    """Efeito colateral do conserto acima, e vale pinar: a apresentação some.
+
+    ``disclosure_already_made`` responde "já me apresentei?" perguntando se
+    existe fluxo vivo. Como o ramo do 6 chamava ``purge_flow`` ANTES de a
+    resposta ser finalizada, a pergunta caía num chat sem fluxo e o ``run.py``
+    colava "Aqui é a assistente do Dr. Victor Almeida." na frente — 43
+    caracteres, medidos duas vezes em 12/set/2026 (a resposta do funil tem 80
+    e o Georges recebeu 123). Com a marca gravada em vez do fluxo apagado, a
+    apresentação não volta.
+    """
+
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    clock = MutableClock(datetime(2026, 9, 12, 12, 59, tzinfo=BRT))
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True}, db_path=db_path, clock=clock
+    )
+
+    abertura = handler.handle(event("boa tarde", message_id="d-1"))
+    assert "Sou a assistente do Dr. Victor Almeida" in abertura
+
+    saida = handler.handle(event("6", message_id="d-2"))
+    assert saida is not None
+
+    source = getattr(event("6", message_id="d-3"), "source", None)
+    assert handler.disclosure_already_made(source) is True, (
+        "sem fluxo vivo o run.py recola os 43 caracteres da apresentação"
+    )
+
+
+def test_an_explicit_booking_request_reopens_the_funnel_after_option_six(tmp_path):
+    """A marca segura abertura, não pedido. Quem diz "quero agendar" volta."""
+
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    clock = MutableClock(datetime(2026, 9, 12, 12, 59, tzinfo=BRT))
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True}, db_path=db_path, clock=clock
+    )
+
+    handler.handle(event("boa tarde", message_id="v-1"))
+    handler.handle(event("6", message_id="v-2"))
+
+    clock.value += timedelta(minutes=2)
+    volta = handler.handle(event("quero agendar uma consulta", message_id="v-3"))
+    assert volta is not None, "pedido explícito de agendamento tem de reabrir o funil"
+    assert "**1**" in volta
+
+
+def test_the_out_of_funnel_mark_expires_like_any_other_flow(tmp_path):
+    """Passado o TTL, quem escreve é alguém novo chegando — e o menu é certo.
+
+    A marca não pode virar exílio permanente: sem prazo, um contato que pediu
+    "outro assunto" em agosto nunca mais conseguiria marcar consulta pelo
+    caminho determinístico.
+    """
+
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    clock = MutableClock(datetime(2026, 9, 12, 12, 59, tzinfo=BRT))
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True}, db_path=db_path, clock=clock
+    )
+
+    handler.handle(event("boa tarde", message_id="t-1"))
+    handler.handle(event("6", message_id="t-2"))
+
+    clock.value += timedelta(hours=25)
+    reaberto = handler.handle(event("boa tarde", message_id="t-3"))
+    assert reaberto is not None and "**1**" in reaberto
+
+
 def test_institutional_exclusion_still_beats_a_glued_intent():
     """Ungluing must never smuggle a partner contact into the funnel."""
 
@@ -577,8 +683,13 @@ def test_menu_introduces_once_and_then_stops_repeating_itself(tmp_path):
     handler.handle(event("obrigado", message_id="m-2"))
     second = handler.handle(event("quero agendar", message_id="m-3"))
     assert "Sou a assistente do Dr. Victor Almeida" not in second
-    assert "Como posso ajudar?" in second
-    assert "**1** - Agendar uma consulta" in second
+    # O que este teste protege — não se reapresentar — continua valendo.
+    # O que mudou em 03/set/2026: um pedido ESCRITO ("quero agendar") deixou de
+    # reimprimir o menu e passa a avançar, como se o paciente tivesse apertado
+    # 1. Medido às 17:27:47 BRT: ele disse exatamente isso e recebeu o mesmo
+    # menu de volta. Só vale depois da apresentação, por isso aqui funciona.
+    assert "Escolha o serviço" in second
+    assert "**1** - Consulta presencial" in second
 
 
 def test_model_greeting_suppresses_the_menu_introduction(tmp_path):
@@ -597,8 +708,12 @@ def test_model_greeting_suppresses_the_menu_introduction(tmp_path):
 
     clock.value += timedelta(minutes=1)
     menu = handler.handle(event("quero agendar", message_id="g-1"))
+    # A garantia que dá nome ao teste: o modelo já cumprimentou, então o funil
+    # NÃO se reapresenta.
     assert "Sou a assistente do Dr. Victor Almeida" not in menu
-    assert "**1** - Agendar uma consulta" in menu
+    # E, desde 03/set/2026, o pedido escrito avança em vez de reimprimir a
+    # lista — o contato já foi cumprimentado, então o atalho falado vale.
+    assert "Escolha o serviço" in menu
 
 
 def test_model_greeting_is_ignored_for_excluded_contacts(tmp_path):

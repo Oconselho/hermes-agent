@@ -141,6 +141,10 @@ class FlowState(str, Enum):
     COMPLETED = "COMPLETED"
     HANDOFF = "HANDOFF"
     RECONCILIATION_REQUIRED = "RECONCILIATION_REQUIRED"
+    # O paciente disse, com todas as letras, que o assunto é outro (opção 6).
+    # Não é passo de funil: é a marca de que o funil NÃO é dono deste chat até
+    # o prazo vencer. Ver ``_advance`` (ramo do "6") e ``handle``.
+    FORA_DO_FUNIL = "FORA_DO_FUNIL"
 
 
 
@@ -5195,6 +5199,26 @@ class WhatsAppAppointmentsHandler:
             store.purge_flow(chat_key)
             flow = None
 
+        if flow is not None and flow.state == FlowState.FORA_DO_FUNIL.value:
+            # O paciente já disse que o assunto é outro. Enquanto a marca
+            # valer, o funil não é dono deste chat: o turno vai para o modelo,
+            # que é quem sabe conversar — e é o único caminho pelo qual as
+            # rotas de escalonamento do ``run.py`` chegam a avisar alguém.
+            #
+            # A exceção é UMA só, e é explícita: ``Route.APPOINTMENT``. Quem
+            # escreve "quero agendar" está pedindo o funil de volta e tem de
+            # ser atendido na hora.
+            #
+            # ``Route.OPENER`` deliberadamente NÃO reabre. Uma abertura
+            # ("preciso de uma informação", "pode me ajudar?") é como começa a
+            # frase de quem acabou de dizer que o assunto é outro — deixá-la
+            # reabrir devolveria o menu na mensagem seguinte ao 6 e recriaria o
+            # laço inteiro. Cumprimento não é pedido de agendamento.
+            if route is not Route.APPOINTMENT:
+                return None
+            store.purge_flow(chat_key)
+            flow = None
+
         if route not in _FUNNEL_ROUTES and flow is None:
             return None
 
@@ -6268,15 +6292,29 @@ class WhatsAppAppointmentsHandler:
                     data,
                 )
             if normalized == "6":
-                # Leave the funnel instead of looping the menu. The response
-                # is recorded (so the delivery stays deduplicated) and the
-                # flow row is then dropped, which is what lets the next
-                # message be classified by the model pipeline as usual.
+                # Sair do funil precisa DEIXAR MARCA. Apagar o fluxo era a
+                # intenção certa com o mecanismo errado: sem linha em
+                # ``flow_states``, a mensagem seguinte encontra ``flow is
+                # None`` — que é exatamente a condição de ABERTURA FRIA — e o
+                # paciente leva o menu inteiro de novo.
+                #
+                # Medido com o Georges Rocha em 12/set/2026: ele apertou 6 às
+                # 13:02 BRT, ouviu "me conte", contou a dúvida clínica às
+                # 13:03 e recebeu o menu. Repetiu tudo às 13:08 e recebeu o
+                # menu de novo. ``api_calls=0`` nos quatro turnos: o modelo
+                # nunca foi chamado, e por isso nenhuma das três rotas de
+                # escalonamento do ``run.py`` — que leem o texto ENTREGUE —
+                # teve o que casar. Ninguém foi avisado da dúvida clínica.
+                #
+                # ``FORA_DO_FUNIL`` fica gravado e o ``handle`` devolve os
+                # turnos seguintes ao modelo. Expira pelo mesmo TTL dos outros
+                # fluxos (24 h), de propósito: passado esse prazo o contato é
+                # alguém novo chegando, e o menu volta a ser a resposta certa.
                 response = store.record_response(
                     message_id,
                     chat_key,
                     _OTHER_SUBJECT_REPLY,
-                    FlowState.COMPLETED.value,
+                    FlowState.FORA_DO_FUNIL.value,
                     {},
                     now=self._now(),
                 )
@@ -6290,7 +6328,7 @@ class WhatsAppAppointmentsHandler:
                     {},
                     note="saiu do funil: outro assunto",
                 )
-                store.purge_flow(chat_key)
+                # NÃO apagar o fluxo: a marca gravada acima é o conserto.
                 return response
             # O atalho falado só vale para quem JÁ foi apresentado.
             #
