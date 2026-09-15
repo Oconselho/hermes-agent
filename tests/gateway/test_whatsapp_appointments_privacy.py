@@ -115,7 +115,10 @@ def test_successful_patient_and_appointment_creation_leaks_nothing(tmp_path, cap
         summary = _new_patient_create(handler, "ok")
         result = handler.handle(event("CONFIRMAR", message_id="ok-11"))
 
-    assert "criado" in result
+    # 15/set/2026: agendamento presencial concluído confirma com data e
+    # hora ("Consulta agendada para …"). Só a teleconsulta, que segura
+    # vaga contra pagamento, ainda fala em "criado".
+    assert "agendada" in result
     assert feegow.created_patients and feegow.created_appointments
     assert_no_pii(caplog.text)
     assert_no_pii(summary)

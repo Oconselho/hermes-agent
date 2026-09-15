@@ -66,7 +66,9 @@ SLOT = {"id": "slot-1", "procedimento_id": 1, "data": "2026-08-05", "horario": "
 # The dead-end reply itself. "recepção" alone is useless as a marker: the
 # legitimate booking summary also mentions reception ("a recepção fará a
 # confirmação final").
-DEAD_END = "Não foi possível concluir este agendamento com segurança"
+# 15/set/2026: falha do fluxo deixou de mandar o paciente procurar a
+# recepção. Agora a recepção é que liga — o ônus do erro é nosso.
+DEAD_END = "A recepção já recebeu seus dados e vai entrar em contato"
 
 
 def _write_lid_mapping(phone=PHONE_WITH_COUNTRY, lid=LID):
@@ -288,7 +290,9 @@ def test_dead_end_notice_tells_reception_who_to_call_and_what_was_answered(tmp_p
     assert "Consulta presencial" in body
     assert "05/08/2026 às 14:00" in body
     assert "data de nascimento" in body
-    assert "Ligar para o paciente" in body
+    # Mesma data: o aviso deixou de chamar o paciente de "lead" e passou a
+# dizer o que a recepção faz com ele.
+    assert "A recepção liga para o paciente" in body
 
 
 def test_dead_end_notice_identifies_the_patient_it_is_about(tmp_path):

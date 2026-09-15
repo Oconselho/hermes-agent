@@ -615,7 +615,10 @@ def test_create_result_without_an_exact_id_requires_reconciliation(tmp_path):
     feegow.duplicates = [{"agendamento_id": 901}]
     done = handler.handle(event("RECONCILIAR", message_id="noid-12"))
 
-    assert "criado" in done
+    # 15/set/2026: agendamento presencial concluído confirma com data e
+    # hora ("Consulta agendada para …"). Só a teleconsulta, que segura
+    # vaga contra pagamento, ainda fala em "criado".
+    assert "agendada" in done
     assert len(feegow.created_appointments) == 1
 
 

@@ -74,7 +74,7 @@ class TestInPersonBookingNotifiesReception:
     def test_notice_is_queued_for_reception(self, tmp_path):
         handler, db_path = _handler(tmp_path, reception_chat_id=RECEPTION)
         response = _book_in_person(handler)
-        assert "criado" in response.lower()
+        assert "agendada" in response.lower()
 
         rows = _outbox(db_path)
         assert len(rows) == 1
@@ -123,14 +123,16 @@ class TestInPersonBookingNotifiesReception:
         handler, db_path = _handler(tmp_path, reception_chat_id="")
         response = _book_in_person(handler)
 
-        assert "criado" in response.lower()
+        assert "agendada" in response.lower()
         assert _outbox(db_path) == []
 
     def test_patient_still_gets_the_confirmation(self, tmp_path):
         """The notice is a side effect; it must not alter the patient reply."""
         handler, _ = _handler(tmp_path, reception_chat_id=RECEPTION)
         response = _book_in_person(handler)
-        assert "A confirmação final será feita pela recepção." in response
+        # 15/set/2026: a recepção virou alternativa, não etapa. O agendamento
+        # já está concluído quando esta frase sai.
+        assert "a recepção atende pelo WhatsApp" in response
 
     def test_a_failing_notice_does_not_lose_the_booking(self, tmp_path, monkeypatch):
         handler, db_path = _handler(tmp_path, reception_chat_id=RECEPTION)
@@ -143,7 +145,7 @@ class TestInPersonBookingNotifiesReception:
         )
         response = _book_in_person(handler)
         # The appointment was created remotely; the patient must be told.
-        assert "criado" in response.lower()
+        assert "agendada" in response.lower()
 
 
 class TestNoticeIsIdempotent:

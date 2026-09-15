@@ -235,7 +235,10 @@ def test_existing_patient_completes_proc1_with_preflight_status1_and_readback(tm
 
     result = handler.handle(event("CONFIRMAR", message_id="p1-8"))
 
-    assert "criado" in result.lower()
+    # 15/set/2026: agendamento presencial concluído confirma com data e
+    # hora ("Consulta agendada para …"). Só a teleconsulta, que segura
+    # vaga contra pagamento, ainda fala em "criado".
+    assert "agendada" in result.lower()
     assert "status" not in result.lower()
     assert len(feegow.created_patients) == 0
     assert len(feegow.created_appointments) == 1
@@ -1144,7 +1147,10 @@ def test_new_patient_requires_independent_exact_readback_before_appointment(tmp_
     assert "novo cadastro de paciente" in summary.lower()
     response = handler.handle(event("CONFIRMAR", message_id="new-11"))
 
-    assert "criado" in response
+    # 15/set/2026: agendamento presencial concluído confirma com data e
+    # hora ("Consulta agendada para …"). Só a teleconsulta, que segura
+    # vaga contra pagamento, ainda fala em "criado".
+    assert "agendada" in response
     assert len(feegow.created_patients) == 1
     assert len(feegow.created_appointments) == 1
     assert sum(name == "find_patient_by_cpf" for name, _ in feegow.calls) >= 2
@@ -1219,7 +1225,10 @@ def test_public_flow_exposes_reconciliation_after_ambiguous_authorized_operation
 
     second = handler.handle(event("RECONCILIAR", message_id="public-reconcile-12"))
 
-    assert "criado" in second
+    # 15/set/2026: agendamento presencial concluído confirma com data e
+    # hora ("Consulta agendada para …"). Só a teleconsulta, que segura
+    # vaga contra pagamento, ainda fala em "criado".
+    assert "agendada" in second
     assert len(calls) == 2
     with sqlite3.connect(db_path) as connection:
         consumed_at = connection.execute(
@@ -1493,7 +1502,10 @@ def test_free_return_full_flow_consumes_controlled_ledger_at_zero_price(tmp_path
     assert "R$ 0" in summary
     response = handler.handle(event("CONFIRMAR", message_id="return-8"))
 
-    assert "criado" in response
+    # 15/set/2026: agendamento presencial concluído confirma com data e
+    # hora ("Consulta agendada para …"). Só a teleconsulta, que segura
+    # vaga contra pagamento, ainda fala em "criado".
+    assert "agendada" in response
     assert feegow.created_appointments[0]["procedimento_id"] == 2
     assert feegow.created_appointments[0]["valor"] == 0
     with sqlite3.connect(db_path) as connection:

@@ -86,9 +86,11 @@ class TestHandoffNotifiesReception:
         assert len(rows) == 1
         chat_key, body = rows[0]
         assert chat_key == RECEPTION_DELIVERED
-        assert "agendamento automático" in body.lower()
+        assert "agendamento não concluído" in body.lower()
         # The point of the notice: a human is asked to pick up the phone.
-        assert "ligar para o paciente" in body.lower()
+        # 15/set/2026: o aviso deixou de mandar "ligar" e passou a dizer o
+        # que a recepção faz — e que o paciente já sabe que a ligação vem.
+        assert "a recepção liga para o paciente" in body.lower()
 
     def test_notice_identifies_who_reception_should_call(self, tmp_path):
         """Anonymous, this notice was unactionable — see the module docstring."""

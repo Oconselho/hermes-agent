@@ -70,9 +70,25 @@ SILENCE = _Silence()
 
 
 _BRT = ZoneInfo("America/Bahia")
+_RECEPTION_PHONE = "71 99669-1002"
+
+# Falha do fluxo não vira tarefa do paciente. Regra do Victor, 15/set/2026.
+#
+# O texto anterior — "Não foi possível concluir este agendamento com
+# segurança. Por favor, fale com a recepção pelo WhatsApp 71 99669-1002." —
+# fazia três coisas erradas de uma vez: confessava um problema que é nosso,
+# mandava o paciente resolver, e deixava no ar que o agendamento dependia
+# dele. João Pedro Neiva (71 98362-0139) leu isso em 15/set 12:03 BRT depois
+# de informar serviço, vaga, CPF e data de nascimento — com a recepção já
+# avisada no mesmo segundo, sem que ele soubesse.
+#
+# A promessa daqui é coberta: todo caminho que responde este texto passa por
+# ``_handoff``, que enfileira o aviso à recepção com os dados do paciente
+# antes de devolver a frase.
 _RECEPTION = (
-    "Não foi possível concluir este agendamento com segurança. "
-    "Por favor, fale com a recepção pelo WhatsApp 71 99669-1002."
+    "Não consegui concluir seu agendamento por aqui. "
+    f"A recepção já recebeu seus dados e vai entrar em contato pelo WhatsApp "
+    f"{_RECEPTION_PHONE} para finalizar. Você não precisa fazer nada."
 )
 
 
@@ -2762,15 +2778,21 @@ class AppointmentStore:
         day = now.date().isoformat()
         idempotency_key = _opaque_id("reception-handoff", chat_key, day)
         outbox_id = _opaque_id("outbox", idempotency_key)
-        lines = [
-            "Lead parado no agendamento automático pelo WhatsApp.",
-            "",
-        ]
-        lines.extend(f"{label}: {value}" for label, value in (details or {}).items())
-        if len(lines) > 2:
-            lines.append("")
+        # "Lead" saiu daqui em 15/set/2026, a pedido do Victor: quem chega pelo
+        # WhatsApp do consultório é paciente, e a recepção tem de ler o nome
+        # antes de qualquer outra coisa. O termo continua valendo no CRM
+        # (``LeadStage``), que é medida interna e ninguém da recepção lê.
+        campos = dict(details or {})
+        paciente = campos.pop("Paciente", None) or campos.pop("Nome", None)
+        lines = ["🗓️ *Agendamento não concluído* — atendimento pelo WhatsApp.", ""]
+        if paciente:
+            lines.append(f"Paciente: {paciente}")
+        lines.extend(f"{label}: {value}" for label, value in campos.items())
+        lines.append("")
         lines.append(
-            "Ligar para o paciente para concluir o agendamento e esclarecer dúvidas."
+            "A recepção liga para o paciente e conclui o agendamento. "
+            "Ele foi avisado de que a ligação vem daqui e de que não precisa "
+            "fazer nada."
         )
         body = "\n".join(lines)
         with self._connect() as connection:
@@ -4087,7 +4109,16 @@ def _identification_details(data: Mapping[str, Any]) -> dict[str, str]:
         )
         if chosen:
             details["Agendamento desejado"] = chosen
-    name = str(data.get("name") or data.get("contact_name") or "").strip()
+    # O nome do cadastro vem primeiro: é por ele que a recepção acha a pessoa
+    # na Feegow. ``name`` é o que o paciente digitou num cadastro novo e
+    # ``contact_name`` é o apelido do WhatsApp — os dois servem, nessa ordem,
+    # quando não existe cadastro ainda.
+    name = str(
+        data.get("patient_name")
+        or data.get("name")
+        or data.get("contact_name")
+        or ""
+    ).strip()
     if name:
         details["Nome"] = name
     birth = str(data.get("birth_date") or "").strip()
@@ -4096,6 +4127,13 @@ def _identification_details(data: Mapping[str, Any]) -> dict[str, str]:
     cpf = _digits(data.get("cpf"))
     if len(cpf) == 11:
         details["CPF"] = f"{cpf[:3]}.{cpf[3:6]}.{cpf[6:9]}-{cpf[9:]}"
+    # O prontuário é o identificador que a recepção digita no Feegow. Só
+    # existe para quem JÁ tem cadastro, e é lido do próprio registro — pedir
+    # ao paciente um número que a Feegow já tem é a pergunta que o Victor
+    # mandou parar de fazer (15/set/2026).
+    prontuario = str(data.get("patient_record") or "").strip()
+    if prontuario:
+        details["Prontuário"] = prontuario
     patient_id = str(data.get("patient_id") or "").strip()
     if patient_id:
         details["Matrícula Feegow"] = patient_id
@@ -6593,6 +6631,21 @@ class WhatsAppAppointmentsHandler:
                 data["patient_id"] = patient_identifier
                 data["patient_phones"] = sorted(_patient_phones(patient))
                 data["new_patient"] = False
+                # Guardado AQUI porque é o único momento em que o registro da
+                # Feegow está na mão: o aviso à recepção é montado bem depois,
+                # só a partir do fluxo. Sem isto a recepção recebia o primeiro
+                # nome do WhatsApp e nenhum prontuário — e acabava pedindo ao
+                # paciente o que a Feegow já sabia.
+                nome_cadastro = str(
+                    patient.get("nome") or patient.get("nome_social") or ""
+                ).strip()
+                if nome_cadastro:
+                    data["patient_name"] = nome_cadastro[:120]
+                prontuario = str(
+                    patient.get("matricula") or patient.get("prontuario") or ""
+                ).strip()
+                if prontuario:
+                    data["patient_record"] = prontuario[:40]
             else:
                 if data.get("appointment_action"):
                     return self._handoff(store, message_id, chat_key)
@@ -7519,10 +7572,19 @@ class WhatsAppAppointmentsHandler:
                         "reception booking notice could not be queued",
                         exc_info=True,
                     )
-            response = (
-                f"Agendamento {appointment_id} criado. "
-                "A confirmação final será feita pela recepção."
-            )
+            # Regra do Victor, 15/set/2026: agendamento concluído se confirma
+            # ao paciente com data e hora, o pagamento antecipado é OFERTA e o
+            # contato com a recepção é ALTERNATIVA — nenhum dos dois é etapa.
+            #
+            # O texto anterior ("A confirmação final será feita pela
+            # recepção") dizia o contrário das três coisas: escondia o horário,
+            # não mencionava pagamento e deixava o agendamento parecendo
+            # pendente de um humano que já tinha sido só avisado.
+            #
+            # Esta frase só sai DEPOIS de ``_execute_authorized`` devolver o id
+            # confirmado pela Feegow por releitura exata — intenção, escolha de
+            # vaga ou tentativa de gravação nunca chegam aqui.
+            response = self._confirmacao_de_agendamento(appointment_id, data)
         return self._respond(
             store,
             message_id,
@@ -7531,6 +7593,56 @@ class WhatsAppAppointmentsHandler:
             FlowState.COMPLETED,
             completed,
         )
+
+    def _confirmacao_de_agendamento(
+        self, appointment_id: int, data: Mapping[str, Any]
+    ) -> str:
+        """A confirmação de um agendamento que EXISTE na Feegow.
+
+        Três partes, nesta ordem (regra do Victor, 15/set/2026): data e hora
+        primeiro, pagamento antecipado como oferta, recepção como alternativa.
+
+        O valor vem de ``_SERVICES`` — a mesma tabela que cobra — e nunca do
+        ``instructions`` do config, que fala da teleconsulta e diria R$ 300
+        para uma presencial de R$ 600. Sem beneficiário configurado a oferta
+        some inteira em vez de sair pela metade: melhor não oferecer do que
+        oferecer sem dizer para quem pagar.
+        """
+
+        selected = data.get("selected_slot") or {}
+        quando = " ".join(
+            parte
+            for parte in (
+                str(selected.get("display_date") or "").strip(),
+                f"às {str(selected.get('time')).strip()}"
+                if selected.get("time")
+                else "",
+            )
+            if parte
+        )
+        linhas = [
+            f"Consulta agendada para {quando} (horário de Brasília)."
+            if quando
+            else "Consulta agendada.",
+            f"Número do agendamento: {appointment_id}.",
+        ]
+
+        try:
+            preco = _SERVICES[int(data["procedure_id"])]["price"]
+        except (KeyError, TypeError, ValueError):
+            preco = None
+        if preco is not None and self._payment_beneficiary:
+            linhas.append(
+                f"Se preferir, você pode adiantar o pagamento por PIX: "
+                f"R$ {_format_reais(preco)} para {self._payment_beneficiary}. "
+                "É opcional — seu horário já está reservado."
+            )
+
+        linhas.append(
+            "Se precisar de qualquer coisa, a recepção atende pelo WhatsApp "
+            f"{_RECEPTION_PHONE}."
+        )
+        return "\n".join(linhas)
 
     def _summarize(
         self,

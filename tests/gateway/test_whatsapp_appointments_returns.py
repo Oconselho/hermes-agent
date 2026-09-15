@@ -132,7 +132,10 @@ def test_attended_base_inside_the_window_grants_one_free_return(
     assert "R$ 0" in summary
     result = handler.handle(event("CONFIRMAR", message_id=f"ret-{modality}-8"))
 
-    assert "criado" in result
+    # 15/set/2026: agendamento presencial concluído confirma com data e
+    # hora ("Consulta agendada para …"). Só a teleconsulta, que segura
+    # vaga contra pagamento, ainda fala em "criado".
+    assert "agendada" in result
     assert len(feegow.created_appointments) == 1
     assert feegow.created_appointments[0]["valor"] == 0
     assert feegow.created_appointments[0]["procedimento_id"] == RETURN_PROC
