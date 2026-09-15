@@ -654,6 +654,58 @@ def test_the_out_of_funnel_mark_expires_like_any_other_flow(tmp_path):
     assert reaberto is not None and "**1**" in reaberto
 
 
+def test_a_shared_link_never_answers_for_the_patient(tmp_path):
+    """Quem perguntou preço foi o endereço da reportagem, não o paciente.
+
+    14/set/2026, 07:06 BRT: Georges Rocha mandou uma matéria da Folha e
+    recebeu a tabela de valores seguida do menu, 479 caracteres. O slug de uma
+    reportagem é escrito com hífen entre as palavras, e ``\\b`` trata hífen,
+    barra e ponto como fronteira — então cada palavra do endereço vira palavra
+    solta para qualquer padrão de intenção.
+    """
+
+    db_path = tmp_path / "state" / "appointments.sqlite3"
+    clock = MutableClock(datetime(2026, 9, 14, 7, 6, tzinfo=BRT))
+    handler = WhatsAppAppointmentsHandler(
+        {"enabled": True}, db_path=db_path, clock=clock
+    )
+
+    handler.handle(event("bom dia", message_id="l-1"))
+
+    clock.value += timedelta(minutes=1)
+    link = (
+        "https://www1.folha.uol.com.br/equilibrioesaude/2026/09/"
+        "anvisa-aprova-12-novas-canetas-emagrecedoras-veja-precos.shtml"
+    )
+    resposta = handler.handle(event(link, message_id="l-2")) or ""
+    assert "Os valores são" not in resposta, (
+        f"a tabela de preços saiu para um link: {resposta!r}"
+    )
+
+    # E o conserto não pode custar a pergunta de verdade — nem quando ela vem
+    # na mesma mensagem que o link.
+    clock.value += timedelta(minutes=1)
+    com_pergunta = handler.handle(
+        event(f"olha isso {link} quanto custa?", message_id="l-3")
+    ) or ""
+    assert "Os valores são" in com_pergunta
+
+    clock.value += timedelta(minutes=1)
+    sozinha = handler.handle(event("qual o preço?", message_id="l-4")) or ""
+    assert "Os valores são" in sozinha
+
+
+def test_a_link_does_not_open_the_funnel_by_itself():
+    """Mesma causa, um degrau antes: o slug não pode virar rota de paciente."""
+
+    link = (
+        "https://exemplo.com.br/saude/2026/09/"
+        "como-agendar-consulta-com-endocrinologista.html"
+    )
+    assert classify_route(event(link)) is Route.OUT_OF_SCOPE
+    assert classify_route(event(f"{link} quero agendar")) is Route.APPOINTMENT
+
+
 def test_institutional_exclusion_still_beats_a_glued_intent():
     """Ungluing must never smuggle a partner contact into the funnel."""
 

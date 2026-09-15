@@ -1065,6 +1065,21 @@ _INTENT_DEGLUE_LETTER_DIGIT_RE = re.compile(r"(?<=[^\W\d_])(?=\d)")
 _INTENT_PUNCTUATION_RE = re.compile(r"[^\w\s-]+")
 
 
+# Endereço colado numa mensagem é CONTEÚDO COMPARTILHADO, não frase do
+# paciente. O slug de uma reportagem é escrito por um jornal, com hífen entre
+# as palavras — e `\b` trata hífen, barra e ponto como fronteira, então toda
+# palavra do endereço vira palavra solta para qualquer padrão de intenção.
+#
+# Medido em 14/set/2026, 07:06 BRT: o Georges mandou uma reportagem da Folha
+# sobre a Anvisa e recebeu a TABELA DE PREÇOS seguida do menu, 479 caracteres.
+# Ele não perguntou preço nenhum; quem perguntou foi o endereço da matéria.
+#
+# Some com o endereço ANTES de procurar intenção, e só aí. O texto que o
+# paciente escreveu em volta continua inteiro: "olha isso, quanto custa?"
+# segue casando, porque o que sai é o link, não a pergunta.
+_URL_RE = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
+
+
 def _intent_text(value: Any) -> str:
     """Normalize a message for intent matching, ungluing runs and punctuation.
 
@@ -1079,7 +1094,7 @@ def _intent_text(value: Any) -> str:
     one.
     """
 
-    text = _normalize(value)
+    text = _normalize(_URL_RE.sub(" ", str(value or "")))
     # Letra esticada é ênfase, não palavra nova: "agendarrrrr" é "agendar".
     # Nenhuma palavra do português tem três letras iguais seguidas, então
     # colapsar 3+ para uma é seguro — "carro" e "passar" ficam intactos.
@@ -6102,6 +6117,11 @@ class WhatsAppAppointmentsHandler:
         state = flow.state
         data = dict(flow.data)
         normalized = _normalize(text)
+        # ``normalized`` ainda carrega endereço colado, e tem de carregar: os
+        # ramos que leem VALOR de passo (CPF, data, número de vaga) trabalham
+        # em cima dele. Quem procura INTENÇÃO usa este outro, sem endereço —
+        # a mesma regra que ``pergunta_interrompe_o_passo`` já segue.
+        intencao = _intent_text(text)
 
         # Desistir tem de ser possível em qualquer passo. Vem ANTES da guarda
         # de pergunta porque é o sinal mais forte e mais específico dos dois:
@@ -6267,7 +6287,7 @@ class WhatsAppAppointmentsHandler:
                 data,
             )
         if state == FlowState.AWAITING_APPOINTMENT_ACTION.value:
-            if _PRICE_QUESTION_RE.search(normalized):
+            if _PRICE_QUESTION_RE.search(intencao):
                 return self._respond(
                     store,
                     message_id,
@@ -6384,7 +6404,7 @@ class WhatsAppAppointmentsHandler:
             )
 
         if state == FlowState.AWAITING_SERVICE.value:
-            if _PRICE_QUESTION_RE.search(normalized):
+            if _PRICE_QUESTION_RE.search(intencao):
                 return self._respond(
                     store,
                     message_id,
