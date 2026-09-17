@@ -177,3 +177,124 @@ async def test_gemini_quebrado_falha_aberto():
     # E a próxima tentativa pode tentar de novo, em vez de herdar o silêncio.
     assert await runner.ler(ev, src) is None
     assert runner.leituras == 2
+
+
+# ── Uma gravação, um leitor (17/set/2026) ──────────────────────────────────
+#
+# Luciano (71 99142-4909) mandou foto e áudio em sequência. A foto abriu um
+# turno; o áudio chegou com esse turno ainda esperando o modelo, interrompeu, e
+# foi transcrito DUAS vezes: uma pelo STT do caminho de interrupção
+# (`_dequeue_pending_with_transcription`) e outra pelo leitor multimodal, que é
+# quem de fato entrega o texto ao modelo. O contato viu dois 🎙️ e o Gemini foi
+# pago duas vezes pelo mesmo .ogg.
+
+
+class _RunnerFila:
+    """O helper de interrupção, com só o que ele toca."""
+
+    def __init__(self, *, plataforma="whatsapp", multimodal_items=True):
+        self._plataforma = plataforma
+        self._multimodal_items = multimodal_items
+        self.transcricoes = 0
+        self.ecos = []
+
+    def _whatsapp_gemini_media_items(self, event):
+        if not self._multimodal_items:
+            return []
+        return [
+            {"path": p, "kind": "audio", "mime_type": "audio/ogg", "display_name": p}
+            for p in (getattr(event, "media_urls", None) or [])
+        ]
+
+    async def _enrich_message_with_transcription(self, text, audio_paths):
+        self.transcricoes += 1
+        return f'"{FALA}"', [FALA]
+
+    def _should_echo_stt_transcripts(self):
+        return True
+
+    def _adapter_for_source(self, source):
+        runner = self
+
+        class _Adapter:
+            async def send(self, chat_id, text, metadata=None):
+                runner.ecos.append(text)
+
+        return _Adapter()
+
+    _whatsapp_reader_handles_event = GatewayRunner._whatsapp_reader_handles_event
+    dequeue = GatewayRunner._dequeue_pending_with_transcription
+
+
+class _AdapterComPendente:
+    def __init__(self, event):
+        self._event = event
+
+    def get_pending_message(self, session_key):
+        return self._event
+
+
+def _source_fila(platform="whatsapp"):
+    return types.SimpleNamespace(
+        chat_id="279993749885060@lid",
+        user_name="Luciano Particular",
+        thread_id=None,
+        platform=types.SimpleNamespace(value=platform),
+    )
+
+
+def test_o_dono_do_anexo_e_o_leitor_multimodal_quando_ele_esta_ligado():
+    runner, ev, src = _RunnerFila(), _event(), _source_fila()
+    assert runner._whatsapp_reader_handles_event(ev, src) is True
+
+
+def test_fora_do_whatsapp_o_caminho_antigo_continua_valendo():
+    runner, ev = _RunnerFila(plataforma="telegram"), _event()
+    assert runner._whatsapp_reader_handles_event(ev, _source_fila("telegram")) is False
+
+
+def test_sem_anexo_que_o_leitor_reconheca_o_stt_continua_dono():
+    runner, ev, src = _RunnerFila(multimodal_items=False), _event(), _source_fila()
+    assert runner._whatsapp_reader_handles_event(ev, src) is False
+
+
+@pytest.mark.asyncio
+async def test_interrupcao_por_audio_nao_transcreve_nem_ecoa_de_novo():
+    """O conserto: quem lê é um só, e o eco sai uma vez só."""
+
+    runner = _RunnerFila()
+    ev = _event(text="[ptt received]")
+    src = _source_fila()
+
+    texto = await runner.dequeue(_AdapterComPendente(ev), "s-1", src)
+
+    assert runner.transcricoes == 0, "o áudio foi transcrito duas vezes"
+    assert runner.ecos == [], "o contato recebeu o 🎙️ duplicado"
+    assert texto == "[ptt received]", (
+        "o rótulo tem de seguir intacto para o leitor multimodal substituir"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sem_o_leitor_multimodal_a_interrupcao_ainda_transcreve(monkeypatch):
+    """O caminho antigo não pode morrer: sem leitor adiante, ninguém leria."""
+
+    import gateway.run as run
+    monkeypatch.setattr(run, "_load_gateway_config", lambda: {"multimodal": {"enabled": False}})
+
+    runner = _RunnerFila()
+    ev = _event(text="[ptt received]")
+    src = _source_fila()
+
+    texto = await runner.dequeue(_AdapterComPendente(ev), "s-1", src)
+
+    assert runner.transcricoes == 1
+    assert FALA in texto
+    # O eco agora passa por `_whatsapp_safe_transcript_echo`, como os outros
+    # três pontos de eco já passavam — era o único caminho que falava com
+    # paciente sem sanitizador nenhum (incidente de 09-10/ago/2026). Ele
+    # reescreve o 🎙️ na forma institucional; o que importa é que a fala
+    # chegou inteira e que algo foi enviado.
+    assert len(runner.ecos) == 1
+    assert FALA in runner.ecos[0]
+    assert "🎙️" not in runner.ecos[0]

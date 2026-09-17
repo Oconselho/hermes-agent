@@ -18491,6 +18491,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return prefix, successful_transcripts
         return user_text, successful_transcripts
 
+    def _whatsapp_reader_handles_event(self, event, source) -> bool:
+        """Se o leitor multimodal do WhatsApp vai ler os anexos deste evento.
+
+        Uma pergunta só, feita antes de qualquer leitura: quem é o dono deste
+        anexo? Se for o leitor multimodal, ninguém mais lê — nem para o modelo,
+        nem para o eco. É isto que impede a mesma gravação de ser transcrita
+        duas vezes e aparecer duas vezes na tela do contato.
+
+        Fail-closed ao contrário do usual, e de propósito: qualquer dúvida
+        (config ilegível, plataforma que não é WhatsApp, evento sem mídia que o
+        leitor reconheça) responde ``False`` e o caminho antigo roda. Errar para
+        ``True`` calaria a transcrição inteira; errar para ``False`` no máximo
+        repete o que já acontecia.
+        """
+
+        try:
+            if getattr(source.platform, "value", source.platform) != "whatsapp":
+                return False
+            cfg = _load_gateway_config().get("multimodal", {})
+            if not isinstance(cfg, dict) or not bool(cfg.get("enabled", False)):
+                return False
+            return bool(self._whatsapp_gemini_media_items(event))
+        except Exception:
+            logger.debug(
+                "WhatsApp multimodal ownership check failed; keeping the STT path",
+                exc_info=True,
+            )
+            return False
+
     async def _dequeue_pending_with_transcription(
         self,
         adapter,
@@ -18529,6 +18558,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if is_audio:
                 audio_paths.append(path)
 
+        # A premissa do docstring acima — "o pipeline de STT nunca roda para o
+        # evento enfileirado" — deixou de ser verdade no WhatsApp quando o
+        # leitor multimodal entrou. Este evento é passado logo adiante para
+        # ``_prepare_inbound_message_text``, que lê o MESMO arquivo pelo Gemini
+        # e ecoa de novo: duas transcrições no chat e duas chamadas pagas ao
+        # Gemini pelo mesmo áudio.
+        #
+        # Medido com o Luciano (71 99142-4909) em 17/set/2026: foto às 11:44:41
+        # BRT abriu um turno, o áudio chegou às 11:44:53 e interrompeu, o STT
+        # transcreveu aqui às 11:44:54→11:44:57 (321 caracteres) e a leitura
+        # multimodal do mesmo .ogg foi ao modelo às 11:44:59. O padrão se
+        # repete nas três últimas interrupções com áudio — 13/set 18:15,
+        # 15/set 11:08 e 17/set 11:44 BRT, sempre ~20 ms depois do
+        # ``interrupted_during_api_call``.
+        #
+        # Quem lê fica sendo um só, e é o de adiante: a transcrição daqui era
+        # descartada de qualquer forma, porque a leitura multimodal sobrescreve
+        # o texto que vai ao modelo. O que sobrava dela era só o eco duplicado.
+        if audio_paths and self._whatsapp_reader_handles_event(event, source):
+            logger.info(
+                "Voice interrupt: leitura do áudio deixada para o leitor "
+                "multimodal do WhatsApp (evita transcrição e eco duplicados)"
+            )
+            audio_paths = []
+
         if audio_paths:
             enriched_text, successful_transcripts = await self._enrich_message_with_transcription(
                 text, audio_paths,
@@ -18540,10 +18594,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 echo_meta = {"thread_id": source.thread_id} if source.thread_id else None
                 if echo_adapter:
                     for tx in successful_transcripts:
+                        # Mesma guarda dos outros três pontos de eco. Faltava
+                        # só aqui — e este é o caminho que fala com paciente
+                        # sem passar por nenhum sanitizador de saída
+                        # (incidente de 09-10/ago/2026).
+                        safe_echo = _whatsapp_safe_transcript_echo(
+                            source.platform, f'🎙️ "{tx}"'
+                        )
+                        if not safe_echo:
+                            logger.warning(
+                                "Suppressed unsafe voice-interrupt transcript echo for %s",
+                                source.chat_id or "unknown",
+                            )
+                            continue
                         try:
                             await echo_adapter.send(
                                 source.chat_id,
-                                f'🎙️ "{tx}"',
+                                safe_echo,
                                 metadata=echo_meta,
                             )
                         except Exception as echo_exc:
