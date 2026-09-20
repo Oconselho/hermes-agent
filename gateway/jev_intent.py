@@ -80,6 +80,38 @@ PERGUNTA = {
     },
 }
 
+# A segunda pergunta não é enfeite, e não custa outra requisição: vai na mesma.
+#
+# 19/set, medido contra os avisos que realmente saíram (`outbox_events`): em
+# 17/set 11:00 BRT uma plataforma parceira escreveu *"Dr Victor, por acaso você
+# conseguiria disponibilizar mais algumas horas ainda em setembro?"*. É pedido de
+# agenda, e o Jev responde 0,78 — acima do limiar. Só que quem pede não é
+# paciente: mandar isso à recepção reabre 14/ago/2026, quando um parceiro chegou
+# lá como pedido de agendamento. A trava do léxico para esse caso é uma lista de
+# nomes de empresa; a daqui é quem escreveu, julgado no texto.
+PERGUNTA_QUEM = {
+    "type": "choice",
+    "instructions": "Quem está enviando esta mensagem?",
+    "criteria": {
+        "paciente": "a própria pessoa que é (ou quer ser) paciente do Dr. Victor",
+        "familiar_ou_conhecido": (
+            "escreve em nome ou no lugar de outra pessoa (filho, cônjuge, "
+            "cuidador, amigo)"
+        ),
+        "profissional_de_saude": (
+            "médico, enfermeiro, secretária ou funcionário de outro serviço de saúde"
+        ),
+        "empresa_ou_parceiro": (
+            "empresa, plataforma, laboratório, convênio, operadora, cobrança, "
+            "indústria — inclusive quando pede horário na agenda dele"
+        ),
+        "outro": "não é possível determinar",
+    },
+}
+
+# Remetente que, mesmo pedindo agenda, não é lead da recepção.
+QUEM_FORA_DO_FUNIL = frozenset({"empresa_ou_parceiro"})
+
 
 class _Indisponivel(Exception):
     """O Jev não pode ser usado agora. Nunca escapa deste módulo."""
@@ -114,12 +146,16 @@ def no_residuo(texto: Any, lexico: bool) -> bool:
     return bool(lexico) or tem_anexo(texto)
 
 
-def _consulta(texto: str, timeout: float) -> float:
+def _consulta(texto: str, timeout: float) -> tuple[float, str]:
+    """Devolve ``(probabilidade_de_pedido, quem_envia)``. Uma requisição só."""
     lib = _jevlib()
     payload = {
         "state": {"mensagem": texto},
         "model": MODELO,
-        "questions": {"pedido_agendamento": PERGUNTA},
+        "questions": {
+            "pedido_agendamento": PERGUNTA,
+            "quem_envia": PERGUNTA_QUEM,
+        },
     }
     payload = lib.anonimiza(payload)
     rotulo = lib.checa_fronteira(payload)
@@ -150,10 +186,17 @@ def _consulta(texto: str, timeout: float) -> float:
         raise _Indisponivel("falha: %s" % type(exc).__name__) from exc
 
     try:
-        valor = (corpo["answers"]["pedido_agendamento"])["noul"]
-        return float(valor)
+        respostas = corpo["answers"]
+        valor = float(respostas["pedido_agendamento"]["noul"])
     except Exception as exc:  # noqa: BLE001
         raise _Indisponivel("resposta sem noul") from exc
+    # A segunda resposta é opcional por construção: se vier estranha, o pedido
+    # ainda vale e a trava de remetente simplesmente não se aplica.
+    try:
+        quem = str(respostas["quem_envia"]["choice"])
+    except Exception:  # noqa: BLE001
+        quem = ""
+    return valor, quem
 
 
 def scheduling_intent(texto: Any, *, lexico: bool, timeout: float | None = None):
@@ -182,7 +225,7 @@ def scheduling_intent(texto: Any, *, lexico: bool, timeout: float | None = None)
 
     inicio = time.monotonic()
     try:
-        p = _consulta(texto_s, timeout)
+        p, quem = _consulta(texto_s, timeout)
     except _Indisponivel as exc:
         diag["motivo"] = "fallback: %s" % exc
         diag["ms"] = int((time.monotonic() - inicio) * 1000)
@@ -195,9 +238,14 @@ def scheduling_intent(texto: Any, *, lexico: bool, timeout: float | None = None)
     diag.update(
         fonte="jev",
         p=round(p, 3),
+        quem=quem,
         ms=int((time.monotonic() - inicio) * 1000),
     )
     if p >= LIMIAR_SIM:
+        if quem in QUEM_FORA_DO_FUNIL:
+            # Pede agenda, mas não é lead de recepção. Medido em 17/set 11:00 BRT.
+            diag["motivo"] = "pedido de agenda, mas o remetente é %s" % quem
+            return False, diag
         diag["motivo"] = "acima do limiar"
         return True, diag
     if p >= LIMIAR_MURO:

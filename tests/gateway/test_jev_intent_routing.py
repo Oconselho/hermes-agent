@@ -79,7 +79,7 @@ def _liga_o_roteamento(monkeypatch):
     monkeypatch.setenv("HERMES_JEV_TIMEOUT", "4")
 
 
-def _responde(valor):
+def _responde(valor, quem="paciente"):
     """Duplo da consulta ao Jev, que registra se foi chamada."""
     chamadas = []
 
@@ -87,7 +87,7 @@ def _responde(valor):
         chamadas.append((texto, timeout))
         if isinstance(valor, Exception):
             raise valor
-        return valor
+        return valor, quem
 
     return _falso, chamadas
 
@@ -150,6 +150,51 @@ def test_limiar_e_maioria_folgada(monkeypatch):
         monkeypatch.setattr(jev_intent, "_consulta", falso)
         decisao, _diag = jev_intent.scheduling_intent(ANEXO_PEDIDO, lexico=False)
         assert decisao is esperado, valor
+
+
+PARCEIRO_PEDE_AGENDA = (
+    "Dr Victor, por acaso você conseguiria disponibilizar mais algumas horas "
+    "ainda em setembro? 🙏🏻"
+)
+
+
+def test_parceiro_que_pede_agenda_nao_vira_lead(monkeypatch):
+    """17/set 11:00 BRT, mensagem real de uma plataforma parceira.
+
+    O Jev responde 0,78 — é pedido de agenda mesmo. Mas quem pede não é
+    paciente, e mandar isso à recepção reabre 14/ago/2026. Este caso foi achado
+    no preflight, comparando a decisão nova contra os avisos que de fato saíram
+    em `outbox_events` — e o defeito era do commit anterior DESTE trabalho.
+    """
+    falso, chamadas = _responde(0.78, quem="empresa_ou_parceiro")
+    monkeypatch.setattr(jev_intent, "_consulta", falso)
+
+    decisao, diag = jev_intent.scheduling_intent(PARCEIRO_PEDE_AGENDA, lexico=True)
+
+    assert decisao is False
+    assert len(chamadas) == 1
+    assert diag["quem"] == "empresa_ou_parceiro"
+    assert "remetente" in diag["motivo"]
+
+
+def test_paciente_com_a_mesma_probabilidade_entra(monkeypatch):
+    """A trava é o remetente, não o número: mesmo 0,78, outro quem, outra rota."""
+    falso, _ = _responde(0.78, quem="paciente")
+    monkeypatch.setattr(jev_intent, "_consulta", falso)
+
+    decisao, _diag = jev_intent.scheduling_intent(ANEXO_PEDIDO, lexico=False)
+
+    assert decisao is True
+
+
+def test_quem_ausente_nao_bloqueia(monkeypatch):
+    """Resposta sem a segunda pergunta não pode derrubar a primeira."""
+    falso, _ = _responde(0.95, quem="")
+    monkeypatch.setattr(jev_intent, "_consulta", falso)
+
+    decisao, _diag = jev_intent.scheduling_intent(ANEXO_PEDIDO, lexico=False)
+
+    assert decisao is True
 
 
 @pytest.mark.parametrize(
