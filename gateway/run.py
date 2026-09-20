@@ -865,6 +865,41 @@ def _whatsapp_has_scheduling_intent(text: Any) -> bool:
     return False
 
 
+try:  # noqa: E402  — opcional por construção: sem ele, vale só o léxico
+    from gateway.jev_intent import (
+        scheduling_intent as _jev_scheduling_intent,
+        registra as _jev_registra,
+    )
+except Exception:  # noqa: BLE001
+    _jev_scheduling_intent = None
+    _jev_registra = None
+
+
+def _whatsapp_scheduling_intent_julgado(text: Any, *, conversa: str = "") -> bool:
+    """O veredito de agendamento, com o Jev no resíduo onde o léxico erra.
+
+    Medido em 19/set/2026 sobre 120 mensagens reais (cópia do banco, ``mode=ro``,
+    heurística extraída deste mesmo arquivo): ela dispara 8 vezes e o Jev sustenta
+    **1**; cinco dos sete falsos positivos são transcrição de anexo — o léxico lê o
+    laudo do Gemini como se fosse a fala da pessoa. E ela perde 2 pedidos de
+    verdade, um deles falado em áudio.
+
+    Quem decide o caso fácil continua sendo o léxico, de graça. Falha de rede,
+    chave ausente ou piso barrando caem de volta nele. Ver ``gateway/jev_intent.py``.
+    """
+    lexico = _whatsapp_has_scheduling_intent(text)
+    if _jev_scheduling_intent is None:
+        return bool(lexico)
+    try:
+        decisao, diag = _jev_scheduling_intent(text, lexico=lexico)
+    except Exception:  # noqa: BLE001  — este caminho nunca derruba conversa
+        logger.warning("jev_intent falhou; valendo o léxico", exc_info=True)
+        return bool(lexico)
+    if _jev_registra is not None and diag.get("fonte") == "jev":
+        _jev_registra(diag, chave_conversa=conversa)
+    return bool(decisao)
+
+
 _WHATSAPP_MONTHS_PT = {
     "janeiro": 1, "fevereiro": 2, "marco": 3, "abril": 4, "maio": 5,
     "junho": 6, "julho": 7, "agosto": 8, "setembro": 9, "outubro": 10,
@@ -2049,7 +2084,14 @@ def _whatsapp_lead_handoff_route(history: Any, current_text: Any) -> str:
     quatro vezes para aprender.
     """
     texts = _whatsapp_contact_thread_texts(history, current_text)
-    if any(_whatsapp_has_scheduling_intent(text) for text in texts):
+    # 19/set/2026: a recepção é paga por esta linha, e era aqui que um convite de
+    # evento em imagem virava "lead de agendamento" — o texto julgado não era o da
+    # pessoa, era o laudo do Gemini sobre o anexo dela. O léxico continua varrendo
+    # a thread (de graça); o Jev julga o trecho que ele apontou — ou, quando ele
+    # nada aponta e há anexo, a mensagem atual, que é justamente onde ele é cego.
+    _lex_hits = [text for text in texts if _whatsapp_has_scheduling_intent(text)]
+    _alvo = _lex_hits[0] if _lex_hits else (current_text or (texts[-1] if texts else ""))
+    if _whatsapp_scheduling_intent_julgado(_alvo):
         return "agendamento"
     if _whatsapp_demands_document(texts):
         return "documento"
@@ -21430,7 +21472,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "funnel greeting lookup failed; model may reintroduce",
                         exc_info=True,
                     )
-                _has_scheduling = _whatsapp_has_scheduling_intent(_recent_text)
+                _has_scheduling = _whatsapp_scheduling_intent_julgado(_recent_text)
                 _feegow_token_path = os.path.join(
                     os.path.expanduser("~/.hermes"), "feegow_token.txt"
                 )
