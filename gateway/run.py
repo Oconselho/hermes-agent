@@ -21686,7 +21686,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             footer="Paciente já cadastrado. Confirmar a vaga e responder pelo WhatsApp.",
                                         )
                                         safe_schedule_threadsafe(
-                                            _wp_adapter.send(_reception_jid, _notif_msg),
+                                            _wp_adapter.send(
+                                                _reception_jid,
+                                                _notif_msg,
+                                                metadata={"internal_notice": True},
+                                            ),
                                             _loop_for_step, logger=logger,
                                             log_message="Feegow notification error")
                                 except Exception:
@@ -21717,7 +21721,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             ),
                                         )
                                         safe_schedule_threadsafe(
-                                            _wp_adapter.send(_reception_jid, _notif_msg),
+                                            _wp_adapter.send(
+                                                _reception_jid,
+                                                _notif_msg,
+                                                metadata={"internal_notice": True},
+                                            ),
                                             _loop_for_step, logger=logger,
                                             log_message="Feegow new patient notification error")
                                 except Exception:
@@ -21763,7 +21771,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         ),
                                     )
                                     safe_schedule_threadsafe(
-                                        _wp_adapter.send(_reception_jid, _notif_msg),
+                                        _wp_adapter.send(
+                                                _reception_jid,
+                                                _notif_msg,
+                                                metadata={"internal_notice": True},
+                                            ),
                                         _loop_for_step,
                                         logger=logger,
                                         log_message="Feegow fallback notification scheduling error",

@@ -635,3 +635,55 @@ def test_mensagem_de_paciente_nao_vai_marcada_como_interna(tmp_path):
     asyncio.run(drain_appointment_outbox(handler, Adapter(), worker_id="w-paciente"))
 
     assert entregues and entregues[0][1] is None
+
+
+def test_todo_aviso_direto_a_recepcao_vai_marcado_como_interno():
+    """Os avisos que NÃO passam pelo outbox também atravessam a guarda de dono.
+
+    Três das rotas de escalonamento do ``run.py`` chamam ``adapter.send`` na
+    hora, sem fila. Sem a marca, responder à mão no chat da recepção faria a
+    guarda de saída engolir o aviso do paciente seguinte — o tipo de silêncio
+    que este sistema já pagou caro.
+
+    O teste lê a árvore do arquivo em vez de simular o gateway inteiro: o que
+    precisa ser garantido é sintático (a chamada leva ``metadata``), e uma
+    montagem de gateway não provaria mais do que isso.
+    """
+
+    import ast
+    from pathlib import Path
+
+    fonte = Path(__file__).resolve().parents[2] / "gateway" / "run.py"
+    arvore = ast.parse(fonte.read_text(encoding="utf-8"))
+
+    encontradas = 0
+    for no in ast.walk(arvore):
+        if not isinstance(no, ast.Call):
+            continue
+        alvo = no.func
+        if not isinstance(alvo, ast.Attribute) or alvo.attr != "send":
+            continue
+        if not no.args or not isinstance(no.args[0], ast.Name):
+            continue
+        if no.args[0].id != "_reception_jid":
+            continue
+        encontradas += 1
+        marcada = any(
+            palavra.arg == "metadata"
+            and isinstance(palavra.value, ast.Dict)
+            and any(
+                isinstance(chave, ast.Constant) and chave.value == "internal_notice"
+                for chave in palavra.value.keys
+            )
+            for palavra in no.keywords
+        )
+        assert marcada, (
+            f"linha {no.lineno} de gateway/run.py manda aviso à recepção sem "
+            "metadata={'internal_notice': True} — a guarda de saída do bridge "
+            "pode engolir esse aviso"
+        )
+
+    assert encontradas == 3, (
+        f"esperava 3 avisos diretos à recepção, encontrei {encontradas} — se o "
+        "número mudou, confira se a rota nova também está marcada"
+    )
