@@ -935,8 +935,15 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
                 async with self._http_session.post(
                     f"http://127.0.0.1:{self._bridge_port}/send",
+                    # 45 s, e não 30, desde 21/set/2026: o bridge passou a
+                    # segurar a mensagem por até 20 s para re-checar se o Victor
+                    # respondeu o chat à mão. Com o teto antigo, uma espera de
+                    # 12 s somada a um envio lento faria o cliente desistir de
+                    # um POST que o bridge ainda completa — e o outbox
+                    # reentregaria a mesma mensagem. A margem de envio puro
+                    # continua sendo os mesmos 30 s de antes.
                     json=payload,
-                    timeout=aiohttp.ClientTimeout(total=30)
+                    timeout=aiohttp.ClientTimeout(total=45)
                 ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
