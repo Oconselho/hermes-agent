@@ -43,6 +43,13 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
+try:  # pragma: no cover - a ausência do módulo é caminho de degradação
+    from gateway import jev_contato as _jev_contato
+except Exception:  # noqa: BLE001
+    # Sem o módulo — release anterior, import quebrado — o funil se comporta
+    # exatamente como antes de 21/set. Nada aqui pode depender dele existir.
+    _jev_contato = None
+
 
 class _Silence(str):
     """O funil atendeu a mensagem e responde nada, de propósito.
@@ -550,6 +557,12 @@ CREATE TABLE IF NOT EXISTS contacts (
     external_id TEXT,
     is_quarantined INTEGER NOT NULL DEFAULT 0,
     quarantined_at TEXT,
+    -- Que tipo de contato é este (21/set/2026). Rótulo, confiança e quando foi
+    -- julgado. Não é PII: é uma palavra de um conjunto fechado, e nenhuma
+    -- letra da conversa entra aqui. Ver ``gateway/jev_contato.py``.
+    contact_kind TEXT,
+    contact_kind_confidence REAL,
+    contact_kind_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -1617,6 +1630,18 @@ class AppointmentStore:
                 "quarantined_at",
                 "ALTER TABLE contacts ADD COLUMN quarantined_at TEXT",
             ),
+            (
+                "contact_kind",
+                "ALTER TABLE contacts ADD COLUMN contact_kind TEXT",
+            ),
+            (
+                "contact_kind_confidence",
+                "ALTER TABLE contacts ADD COLUMN contact_kind_confidence REAL",
+            ),
+            (
+                "contact_kind_at",
+                "ALTER TABLE contacts ADD COLUMN contact_kind_at TEXT",
+            ),
         ):
             if column not in contact_columns:
                 connection.execute(ddl)
@@ -2074,6 +2099,73 @@ class AppointmentStore:
                 "SELECT is_quarantined FROM contacts WHERE chat_key = ?", (chat_key,)
             ).fetchone()
         return bool(row and int(row[0]) == 1)
+
+    def contact_kind(self, chat_key: str) -> tuple[str, float] | None:
+        """O tipo já julgado deste contato, se existir: ``(rotulo, confianca)``.
+
+        Leitura barata de propósito: é ela que a abertura fria consulta, e a
+        abertura não pode pagar rede. Quem julga é o passo que TEM texto com
+        sinal — ver ``gateway/jev_contato.py``.
+        """
+
+        try:
+            with self._connect() as connection:
+                row = connection.execute(
+                    "SELECT contact_kind, contact_kind_confidence "
+                    "FROM contacts WHERE chat_key = ?",
+                    (chat_key,),
+                ).fetchone()
+        except sqlite3.Error:
+            # Banco de release anterior, sem as colunas: o contato simplesmente
+            # não tem rótulo, e o funil segue como sempre seguiu.
+            logger.warning("contact kind lookup failed", exc_info=True)
+            return None
+        if not row or not row[0]:
+            return None
+        try:
+            confidence = float(row[1]) if row[1] is not None else 0.0
+        except (TypeError, ValueError):
+            confidence = 0.0
+        return str(row[0]), confidence
+
+    def record_contact_kind(
+        self, chat_key: str, kind: str, confidence: float, *, now: datetime
+    ) -> None:
+        """Grava o tipo do contato. Rótulo e número, nunca o texto.
+
+        Grava TAMBÉM o que ficou abaixo do limiar: saber que este contato já
+        foi julgado — e com que confiança — é o que permite revisar depois sem
+        reabrir conversa nenhuma.
+        """
+
+        timestamp = now.isoformat()
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO contacts (
+                        chat_key, contact_kind, contact_kind_confidence,
+                        contact_kind_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(chat_key) DO UPDATE SET
+                        contact_kind = excluded.contact_kind,
+                        contact_kind_confidence = excluded.contact_kind_confidence,
+                        contact_kind_at = excluded.contact_kind_at,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        chat_key,
+                        str(kind),
+                        float(confidence),
+                        timestamp,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+        except sqlite3.Error:
+            # O rótulo é otimização de decisão, não estado do agendamento:
+            # falhar aqui não pode custar a resposta ao paciente.
+            logger.warning("contact kind write failed", exc_info=True)
 
     def purge_inactive_flows(self, *, now: datetime, retention_days: int) -> int:
         """Delete flow state untouched for ``retention_days``; no PII lives here."""
@@ -5285,6 +5377,24 @@ class WhatsAppAppointmentsHandler:
             return prior if prior else SILENCE
 
         if flow is None:
+            # A abertura não JULGA, ela LÊ (21/set/2026). Cumprimento não tem
+            # sinal: medido, "Bom dia Dr. Victor" sai `indeterminado` com
+            # confiança 0,97, e o Jev responde 0,09 para "a primeira mensagem
+            # basta para decidir a rota". Quem decide é o rótulo que já está
+            # gravado no contato — e ele só existe porque uma mensagem COM
+            # sinal foi julgada antes (ver ``_julga_contato_e_sai_do_funil``).
+            #
+            # Só vale para ``Route.OPENER``. Quem escreve "quero agendar" pede
+            # o funil de forma explícita e entra, rótulo ou não: um colega de
+            # trabalho também pode querer marcar a própria consulta.
+            if route is Route.OPENER and self._contato_marcado_fora_do_funil(
+                store, chat_key
+            ):
+                logger.info(
+                    "appointment flow: contato marcado fora do funil — abertura "
+                    "devolvida ao modelo, sem menu e sem estado"
+                )
+                return None
             # A cold open re-introduces the secretary. ``greeting_ttl_hours``
             # is the wrong clock here: it exists to stop the flow repeating
             # "Sou a assistente do Dr. Victor Almeida" *inside* an exchange,
@@ -5384,6 +5494,81 @@ class WhatsAppAppointmentsHandler:
             # mensagem não foi processada" por um erro que não é dele.
             return SILENCE
         return reply
+
+    def _contato_marcado_fora_do_funil(
+        self, store: AppointmentStore, chat_key: str
+    ) -> bool:
+        """Este contato já foi julgado como alguém que não vem marcar consulta?
+
+        Leitura pura: uma linha de SQLite, nenhuma rede. Falha de leitura
+        significa "não sei", e não saber devolve o comportamento de hoje.
+        """
+
+        if _jev_contato is None or _jev_contato.desligado():
+            return False
+        try:
+            marcado = store.contact_kind(chat_key)
+        except Exception:  # noqa: BLE001
+            logger.warning("contact kind lookup failed", exc_info=True)
+            return False
+        if not marcado:
+            return False
+        rotulo, confianca = marcado
+        return bool(_jev_contato.fora_do_funil(rotulo, confianca))
+
+    def _julga_contato_e_sai_do_funil(
+        self, store: AppointmentStore, chat_key: str, text: str
+    ) -> bool:
+        """Julga o tipo do contato e, se não for do funil, tira-o de lá.
+
+        Devolve ``True`` quando o turno deve ir ao modelo em vez de receber o
+        menu. Todo o resto — Jev fora do ar, piso barrando, confiança baixa,
+        ``indeterminado``, paciente de verdade — devolve ``False``, que é o
+        comportamento de sempre.
+
+        O fluxo é apagado, e não marcado: sem ele a mensagem seguinte cai em
+        ``classify_route`` e vai ao modelo, e a abertura fria seguinte é
+        barrada pelo rótulo que acabou de ser gravado. Era justamente essa
+        proteção que faltava quando o "6" apagava o fluxo (12/set) — apagar
+        sem rótulo devolvia o menu inteiro na mensagem seguinte.
+        """
+
+        if _jev_contato is None or _jev_contato.desligado():
+            return False
+        try:
+            resultado, diag = _jev_contato.classifica([text])
+            _jev_contato.registra(diag, chave_conversa=chat_key)
+        except Exception:  # noqa: BLE001 — julgamento nunca derruba conversa
+            logger.warning("jev_contato falhou; o funil segue como antes", exc_info=True)
+            return False
+        if resultado is None:
+            return False
+        rotulo, confianca = resultado
+        try:
+            store.record_contact_kind(chat_key, rotulo, confianca, now=self._now())
+        except Exception:  # noqa: BLE001
+            logger.warning("contact kind write failed", exc_info=True)
+        if not _jev_contato.fora_do_funil(rotulo, confianca):
+            return False
+        logger.info(
+            "appointment flow: contato julgado %s (%.2f) — fora do funil, turno "
+            "devolvido ao modelo",
+            rotulo,
+            confianca,
+        )
+        self._track_lead(
+            store,
+            chat_key,
+            FlowState.FORA_DO_FUNIL,
+            {},
+            note="fora do funil: contato julgado %s" % rotulo,
+        )
+        try:
+            store.purge_flow(chat_key)
+        except Exception:  # noqa: BLE001
+            logger.warning("purge_flow failed after contact judgement", exc_info=True)
+            return False
+        return True
 
     def _track_lead(
         self,
@@ -6424,6 +6609,13 @@ class WhatsAppAppointmentsHandler:
                         FlowState.AWAITING_CPF,
                         {"appointment_action": action},
                     )
+                # Daqui sairia o menu DE NOVO — e é exatamente aqui que a
+                # técnica da telemedicina caiu 14 vezes desde 14/ago. É também
+                # o único ponto do estado inicial onde existe texto com sinal:
+                # ela escreveu algo que não é opção de menu. Julgar o CONTATO
+                # aqui custa uma requisição por contato, não por mensagem.
+                if self._julga_contato_e_sai_do_funil(store, chat_key, text):
+                    return None
                 return self._respond(
                     store,
                     message_id,
