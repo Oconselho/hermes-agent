@@ -184,18 +184,30 @@ def fora_do_funil(rotulo: Any, confianca: Any) -> bool:
 
 
 _ENDERECO_RE = re.compile(r"(https?://\S+|www\.\S+)", re.I)
+# A transcrição que outro modelo fez de um áudio ou de uma imagem. O
+# `jev_intent` mediu que ela é **27% das mensagens de entrada**, e que é onde o
+# léxico erra dos dois lados. Para "quem escreve?", ela é pior ainda: o laudo do
+# Gemini descreve o ANEXO, não o remetente — um convite de evento em imagem
+# mandado por um paciente diria `convite_profissional`, e o paciente sairia do
+# funil. Mesmo defeito do link de reportagem, em outra roupa.
+_ANEXO_RE = re.compile(r"\[Leitura do anexo.*?\]\s*", re.I | re.S)
 
 
 def sem_enderecos(texto: Any) -> str:
-    """O texto sem endereços colados, e só isso.
+    """A fala da pessoa: sem endereço colado e sem transcrição de anexo.
 
     De propósito NÃO é o ``_intent_text`` do funil: aquele também tira acento,
     pontuação e caixa, e o julgamento de *quem escreve* se faz melhor sobre a
-    frase como a pessoa a escreveu. O que precisa sair é o endereço — foi ele
-    que virou ``spam`` 0,73 e apagou o fluxo de um paciente com reportagem.
+    frase como a pessoa a escreveu. O que precisa sair é o que **não é fala
+    dela** — o endereço, que virou ``spam`` 0,73 e apagou o fluxo de um
+    paciente com reportagem, e o laudo que outro modelo escreveu sobre um
+    anexo, que fala do arquivo e não de quem mandou.
+
+    O nome ficou curto por já estar em uso; o que ele faz é isto.
     """
 
-    return _ENDERECO_RE.sub(" ", str(texto or "")).strip()
+    limpo = _ANEXO_RE.sub(" ", str(texto or ""))
+    return _ENDERECO_RE.sub(" ", limpo).strip()
 
 
 def tem_sinal(texto: Any) -> bool:
