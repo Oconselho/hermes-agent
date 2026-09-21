@@ -31,6 +31,7 @@ import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { resolveOutboundChatId, sendTextChunks, audioMediaType } from './bridge_helpers.js';
+import { runOutboundOwnerGate } from './outbound_owner_gate.js';
 
 // Parse CLI args
 const args = process.argv.slice(2);
@@ -85,6 +86,28 @@ const CHUNK_DELAY_MS = parseInt(process.env.WHATSAPP_CHUNK_DELAY_MS || '300', 10
 const OWNER_COOLDOWN_MS = 30 * 60 * 1000;  // 30 min
 const OWNER_COOLDOWN_STATE_FILE = path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'owner-reply-cooldowns.json');
 const ownerReplyTimestamps = loadOwnerReplyTimestamps();  // key: chatId, value: timestamp
+// Saída: a mesma regra da entrada, aplicada antes de entregar (21/set/2026).
+// Ver `outbound_owner_gate.js` para os três timestamps que motivaram isto.
+const OWNER_OUTBOUND_GUARD = (process.env.WHATSAPP_OWNER_OUTBOUND_GUARD || 'on').toLowerCase()
+  !== 'off';
+// Espera antes de entregar uma resposta automática, para que a re-checagem
+// tenha o que checar. Curta de propósito: o dono já reclamou de demora, e o
+// Jev respondeu 0,17 para "atrasar todas as respostas é preço proporcional".
+// Teto rígido de 20 s porque o cliente Python desiste do POST em 30 s.
+const OWNER_GRACE_MS = Math.min(
+  20000,
+  Math.max(0, parseInt(process.env.WHATSAPP_OWNER_GRACE_MS || '12000', 10) || 0),
+);
+// Uma resposta partida em vários POSTs é uma resposta só: os pedaços seguintes
+// não pagam a espera nem podem ser cortados no meio.
+const OWNER_CHUNK_CONTINUATION_MS = 8000;
+// Última entrega automática por chat — é o que distingue continuação de resposta nova.
+const lastAutoSendAt = Object.create(null);
+// Registro LONGO de intervenção do dono, para quem quiser saber "este chat é
+// atendido à mão" depois que o cooldown de 30 min já passou. O arquivo de
+// cooldown é podado; este não. Quem lê hoje é o funil, do lado Python.
+const OWNER_INTERVENTION_FILE = path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'owner-interventions.json');
+const OWNER_INTERVENTION_RETENTION_MS = 120 * 24 * 60 * 60 * 1000;  // 120 dias
 // Per-call timeout for sock.sendMessage(). Baileys occasionally hangs forever
 // when uploading media to WhatsApp servers (and, less often, on text sends),
 // which pins the bridge's HTTP handler until the upstream aiohttp timeout
@@ -148,13 +171,73 @@ function saveOwnerReplyTimestamps() {
   } catch {}
 }
 
+function recordOwnerIntervention(chatId, now = Date.now()) {
+  // Retenção longa e arquivo próprio: o de cooldown é podado em 30 min, e
+  // "este chat o Victor atende à mão" é um fato que vale meses.
+  try {
+    let stored = {};
+    if (existsSync(OWNER_INTERVENTION_FILE)) {
+      const parsed = JSON.parse(readFileSync(OWNER_INTERVENTION_FILE, 'utf8'));
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) stored = parsed;
+    }
+    const fresh = {};
+    for (const [key, ts] of Object.entries(stored)) {
+      const numeric = Number(ts);
+      if (key && Number.isFinite(numeric) && (now - numeric) < OWNER_INTERVENTION_RETENTION_MS) {
+        fresh[key] = numeric;
+      }
+    }
+    fresh[chatId] = now;
+    mkdirSync(path.dirname(OWNER_INTERVENTION_FILE), { recursive: true });
+    writeFileSync(OWNER_INTERVENTION_FILE, JSON.stringify(fresh, null, 2));
+  } catch {}
+}
+
 function recordOwnerReply(chatId, reason = 'owner_outbound') {
   const now = Date.now();
   ownerReplyTimestamps[chatId] = now;
   saveOwnerReplyTimestamps();
+  recordOwnerIntervention(chatId, now);
   if (WHATSAPP_DEBUG) {
     try { console.log(JSON.stringify({ event: 'owner_outbound', reason, chatId, cooldown_ms: OWNER_COOLDOWN_MS })); } catch {}
   }
+}
+
+/**
+ * A guarda de saída. Devolve `true` quando a mensagem NÃO deve ser entregue.
+ *
+ * Espera a janela de cortesia quando for o caso e pergunta de novo depois —
+ * é o "reavalie depois de poucos segundos" pedido em 21/set. A supressão
+ * sempre deixa linha no log: silêncio parece sucesso e esconde defeito
+ * (Jev 0,81 para "toda supressão precisa deixar rastro").
+ */
+function ownerGateSuppresses(chatId, { isOwnerReply = false, isInternalNotice = false, endpoint = 'send' } = {}) {
+  return runOutboundOwnerGate({
+    chatId,
+    isOwnerReply,
+    isInternalNotice,
+    enabled: OWNER_OUTBOUND_GUARD,
+    cooldownMs: OWNER_COOLDOWN_MS,
+    graceMs: OWNER_GRACE_MS,
+    chunkContinuationMs: OWNER_CHUNK_CONTINUATION_MS,
+    ownerReplyAtFor: (id) => ownerReplyTimestamps[id],
+    lastAutoSendAtFor: (id) => lastAutoSendAt[id],
+    markAutoSend: (id, ts) => { lastAutoSendAt[id] = ts; },
+    prune: pruneOwnerReplyTimestamps,
+    sleep,
+    onSuppressed: ({ reason, ownerAgeMs }) => {
+      try {
+        console.log(JSON.stringify({
+          event: 'outbound_suppressed',
+          reason,
+          endpoint,
+          chatId,
+          owner_age_ms: ownerAgeMs,
+          grace_ms: OWNER_GRACE_MS,
+        }));
+      } catch {}
+    },
+  });
 }
 
 function sendWithTimeout(chatId, payload, timeoutMs = SEND_TIMEOUT_MS) {
@@ -668,7 +751,7 @@ app.post('/send', async (req, res) => {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
 
-  const { chatId, message, replyTo, ownerReply } = req.body;
+  const { chatId, message, replyTo, ownerReply, internal } = req.body;
   if (!chatId || !message) {
     return res.status(400).json({ error: 'chatId and message are required' });
   }
@@ -679,6 +762,24 @@ app.post('/send', async (req, res) => {
   // so the cooldown blocks the secretary from responding for 30 min.
   if (ownerReply) {
     recordOwnerReply(resolvedChatId, 'send_endpoint_owner_reply');
+  }
+
+  // O dono está atendendo este chat? Então a automação não fala por cima dele.
+  // `success: true` sem messageId é o contrato que o adaptador já entende para
+  // "nada foi enviado, e isso não é falha" — devolver erro aqui viraria retry.
+  if (await ownerGateSuppresses(resolvedChatId, {
+    isOwnerReply: Boolean(ownerReply),
+    isInternalNotice: Boolean(internal),
+    endpoint: 'send',
+  })) {
+    return res.json({
+      success: true,
+      suppressed: 'owner_active',
+      requestedChatId: chatId,
+      resolvedChatId,
+      messageId: null,
+      messageIds: [],
+    });
   }
 
   try {
@@ -764,9 +865,18 @@ app.post('/send-media', async (req, res) => {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
   }
 
-  const { chatId, filePath, mediaType, caption, fileName } = req.body;
+  const { chatId, filePath, mediaType, caption, fileName, ownerReply, internal } = req.body;
   if (!chatId || !filePath) {
     return res.status(400).json({ error: 'chatId and filePath are required' });
+  }
+
+  // Mesma guarda do /send: áudio e imagem automáticos também falam por cima.
+  if (await ownerGateSuppresses(resolveOutboundChatId(chatId, sock.user), {
+    isOwnerReply: Boolean(ownerReply),
+    isInternalNotice: Boolean(internal),
+    endpoint: 'send-media',
+  })) {
+    return res.json({ success: true, suppressed: 'owner_active', chatId, messageId: null });
   }
 
   try {

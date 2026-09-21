@@ -50,6 +50,11 @@ except Exception:  # noqa: BLE001
     # exatamente como antes de 21/set. Nada aqui pode depender dele existir.
     _jev_contato = None
 
+try:  # pragma: no cover - idem
+    from gateway import owner_activity as _owner_activity
+except Exception:  # noqa: BLE001
+    _owner_activity = None
+
 
 class _Silence(str):
     """O funil atendeu a mensagem e responde nada, de propósito.
@@ -5395,6 +5400,16 @@ class WhatsAppAppointmentsHandler:
                     "devolvida ao modelo, sem menu e sem estado"
                 )
                 return None
+            # Intervenção manual do dono vale mais que qualquer classificação de
+            # texto: se ele já respondeu este chat pelo celular, o chat é dele.
+            # Medido em 21/set: a prima recebeu o menu 31 s antes de ele próprio
+            # responder — e ele a atende pessoalmente há semanas.
+            if route is Route.OPENER and self._dono_atende_este_chat(chat_key):
+                logger.info(
+                    "appointment flow: o dono já atendeu este chat à mão — "
+                    "abertura devolvida ao modelo, sem menu e sem estado"
+                )
+                return None
             # A cold open re-introduces the secretary. ``greeting_ttl_hours``
             # is the wrong clock here: it exists to stop the flow repeating
             # "Sou a assistente do Dr. Victor Almeida" *inside* an exchange,
@@ -5515,6 +5530,38 @@ class WhatsAppAppointmentsHandler:
             return False
         rotulo, confianca = marcado
         return bool(_jev_contato.fora_do_funil(rotulo, confianca))
+
+    def _dono_atende_este_chat(self, chat_key: str) -> bool:
+        """O Victor já respondeu este chat à mão dentro da janela declarada?
+
+        Leitura de um arquivo que o bridge escreve; qualquer falha significa
+        "não sei", e não saber devolve o comportamento de hoje.
+        """
+
+        if _owner_activity is None:
+            return False
+        try:
+            return bool(_owner_activity.interveio_recentemente(chat_key))
+        except Exception:  # noqa: BLE001
+            logger.warning("owner intervention lookup failed", exc_info=True)
+            return False
+
+    @property
+    def internal_notice_targets(self) -> frozenset[str]:
+        """Os destinos que NÃO são conversa com contato: recepção e a linha dele.
+
+        Serve para o bridge não segurar um aviso por causa da guarda de dono —
+        se o Victor responde à mão no chat da recepção, o aviso do próximo
+        paciente não pode sumir junto.
+        """
+
+        alvos = {
+            self._reception_chat_id,
+            self._reception_chat_id_configured,
+            self._clinical_notice_chat_id,
+            self._clinical_notice_chat_id_configured,
+        }
+        return frozenset(str(alvo) for alvo in alvos if alvo)
 
     def _julga_contato_e_sai_do_funil(
         self, store: AppointmentStore, chat_key: str, text: str
@@ -8679,6 +8726,27 @@ class WhatsAppAppointmentsHandler:
             raise RuntimeError("appointment time readback mismatch")
 
 
+def _send_accepts_metadata(adapter: Any) -> bool:
+    """O ``send`` deste adaptador aceita ``metadata``?
+
+    Pergunta em vez de tentar: um ``except TypeError`` em volta da chamada
+    engoliria também um TypeError vindo de dentro do envio, que é defeito de
+    verdade e tem de aparecer.
+    """
+
+    try:
+        import inspect
+
+        parametros = inspect.signature(adapter.send).parameters
+    except (TypeError, ValueError, AttributeError):
+        return False
+    if "metadata" in parametros:
+        return True
+    return any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in parametros.values()
+    )
+
+
 async def drain_appointment_outbox(
     handler: WhatsAppAppointmentsHandler,
     adapter: Any,
@@ -8704,8 +8772,21 @@ async def drain_appointment_outbox(
             handler.is_contact_quarantined, item["chat_key"]
         ):
             continue
+        # Aviso à recepção ou à linha do doutor não é conversa com o contato: a
+        # guarda de dono do bridge tem de deixá-lo passar mesmo com o chat
+        # "ativo". Quem sabe quais são esses destinos é este handler.
+        #
+        # O ``metadata`` só é passado quando há o que dizer E o adaptador sabe
+        # recebê-lo: esta função é usada com adaptadores de outras plataformas
+        # (e com duplos de teste) cuja ``send`` tem dois parâmetros e mais nada.
+        interno = item["chat_key"] in handler.internal_notice_targets
         try:
-            result = await adapter.send(item["chat_key"], item["body"])
+            if interno and _send_accepts_metadata(adapter):
+                result = await adapter.send(
+                    item["chat_key"], item["body"], metadata={"internal_notice": True}
+                )
+            else:
+                result = await adapter.send(item["chat_key"], item["body"])
             success = bool(getattr(result, "success", False))
         except Exception:
             success = False

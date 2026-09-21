@@ -922,6 +922,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     "chatId": chat_id,
                     "message": chunk,
                 }
+                # Aviso interno (recepção, linha do doutor) atravessa a guarda
+                # de dono do bridge: ela existe para a automação não falar por
+                # cima dele numa conversa, e um aviso não é conversa. Ver
+                # `scripts/whatsapp-bridge/outbound_owner_gate.js`.
+                if metadata and metadata.get("internal_notice"):
+                    payload["internal"] = True
                 if reply_to and idx == 0:
                     # Only reply-to on the first text chunk, even if the bridge
                     # response omits a parseable message id.

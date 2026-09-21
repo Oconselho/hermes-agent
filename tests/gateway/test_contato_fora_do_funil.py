@@ -46,7 +46,7 @@ from gateway.platforms.whatsapp_appointments import (
     WhatsAppAppointmentsHandler,
     classify_route,
 )
-from tests.gateway.appointment_helpers import event
+from tests.gateway.appointment_helpers import event, payment_config
 
 CHAT = "132555626008614@lid"
 
@@ -410,3 +410,228 @@ def test_banco_antigo_ganha_as_colunas_sem_perder_nada(tmp_path):
     guardados = conexao.execute("SELECT COUNT(*) FROM contacts").fetchone()[0]
     conexao.close()
     assert guardados == 1, "a migração não pode duplicar contato"
+
+
+# --------------------------------------------------------------------------
+# 8. O dono já atendeu este chat à mão
+# --------------------------------------------------------------------------
+#
+# 21/set/2026, um chat, três carimbos:
+#   16:47:51.895  a contato (prima do médico) escreve "Oi"
+#   16:47:52.687  a secretária manda o menu — 0,79 s depois, `api_calls=0`
+#   16:48:23.378  o Dr. Victor responde à mão, 31 s DEPOIS do envio automático
+#
+# A checagem de "o dono está atendendo" existia só na ENTRADA, e por 30 min.
+# Intervenção manual é uma declaração — *este chat é meu* — e vale mais que
+# qualquer classificação de texto.
+
+
+def _arquivo_de_intervencao(tmp_path, chat, quando_ms):
+    import json
+
+    destino = tmp_path / "owner-interventions.json"
+    destino.write_text(json.dumps({chat: quando_ms}), encoding="utf-8")
+    return destino
+
+
+def test_dono_atendeu_o_chat_a_abertura_nao_abre_o_menu(monkeypatch, tmp_path):
+    import time
+
+    from gateway import owner_activity
+
+    arquivo = _arquivo_de_intervencao(tmp_path, CHAT, int((time.time() - 3600) * 1000))
+    monkeypatch.setenv("HERMES_OWNER_INTERVENTION_FILE", str(arquivo))
+    handler, store = _handler(tmp_path)
+    assert owner_activity.interveio_recentemente(CHAT) is True
+
+    resposta = handler.handle(event(SAUDACAO, chat_id=CHAT, message_id="m-1"))
+
+    assert resposta is None, "o menu saiu num chat que o Victor atende à mão"
+    assert store.load_flow(CHAT) is None, "criou estado de funil mesmo assim"
+
+
+def test_pedido_explicito_entra_mesmo_num_chat_que_ele_atende(monkeypatch, tmp_path):
+    import time
+
+    arquivo = _arquivo_de_intervencao(tmp_path, CHAT, int((time.time() - 3600) * 1000))
+    monkeypatch.setenv("HERMES_OWNER_INTERVENTION_FILE", str(arquivo))
+    handler, store = _handler(tmp_path)
+
+    resposta = handler.handle(event(PEDIDO, chat_id=CHAT, message_id="m-1"))
+
+    assert resposta is not None and "Agendar uma consulta" in resposta
+    assert store.load_flow(CHAT) is not None
+
+
+def test_intervencao_velha_nao_segura_mais_nada(monkeypatch, tmp_path):
+    import time
+
+    arquivo = _arquivo_de_intervencao(
+        tmp_path, CHAT, int((time.time() - 45 * 86400) * 1000)
+    )
+    monkeypatch.setenv("HERMES_OWNER_INTERVENTION_FILE", str(arquivo))
+    handler, store = _handler(tmp_path)
+
+    resposta = handler.handle(event(SAUDACAO, chat_id=CHAT, message_id="m-1"))
+
+    assert resposta is not None and "Agendar uma consulta" in resposta
+
+
+def test_janela_zero_desliga_a_regra(monkeypatch, tmp_path):
+    import time
+
+    arquivo = _arquivo_de_intervencao(tmp_path, CHAT, int(time.time() * 1000))
+    monkeypatch.setenv("HERMES_OWNER_INTERVENTION_FILE", str(arquivo))
+    monkeypatch.setenv("HERMES_OWNER_INTERVENTION_DAYS", "0")
+    handler, store = _handler(tmp_path)
+
+    resposta = handler.handle(event(SAUDACAO, chat_id=CHAT, message_id="m-1"))
+
+    assert resposta is not None and "Agendar uma consulta" in resposta
+
+
+@pytest.mark.parametrize(
+    "conteudo",
+    ["", "{}", "não é json", '{"outro@lid": 123}', "[1, 2]", '{"%s": "ontem"}' % CHAT],
+)
+def test_arquivo_ausente_ou_estranho_nao_muda_nada(monkeypatch, tmp_path, conteudo):
+    from gateway import owner_activity
+
+    arquivo = tmp_path / "owner-interventions.json"
+    if conteudo:
+        arquivo.write_text(conteudo, encoding="utf-8")
+    monkeypatch.setenv("HERMES_OWNER_INTERVENTION_FILE", str(arquivo))
+
+    assert owner_activity.interveio_recentemente(CHAT) is False
+
+    handler, store = _handler(tmp_path)
+    resposta = handler.handle(event(SAUDACAO, chat_id=CHAT, message_id="m-1"))
+    assert resposta is not None and "Agendar uma consulta" in resposta
+
+
+def test_carimbo_no_futuro_e_relogio_torto_nao_intervencao(monkeypatch, tmp_path):
+    import time
+
+    from gateway import owner_activity
+
+    arquivo = _arquivo_de_intervencao(tmp_path, CHAT, int((time.time() + 86400) * 1000))
+    monkeypatch.setenv("HERMES_OWNER_INTERVENTION_FILE", str(arquivo))
+    assert owner_activity.interveio_recentemente(CHAT) is False
+
+
+# --------------------------------------------------------------------------
+# 9. Aviso interno atravessa a guarda de dono
+# --------------------------------------------------------------------------
+
+
+def _enfileira(db_path, *, outbox_id, chat_key, body, now):
+    """Uma linha PENDING no outbox — o mesmo atalho dos testes de entrega."""
+
+    import sqlite3
+
+    with sqlite3.connect(db_path) as conexao:
+        conexao.execute(
+            """
+            INSERT INTO outbox_events
+                (id, idempotency_key, chat_key, body, state, created_at, sent_at)
+            VALUES (?, ?, ?, ?, 'PENDING', ?, NULL)
+            """,
+            (outbox_id, "key-" + outbox_id, chat_key, body, now.isoformat()),
+        )
+
+
+
+def test_aviso_para_a_recepcao_vai_marcado_como_interno(tmp_path):
+    """Se o Victor responde à mão no chat da recepção, o aviso seguinte não some."""
+
+    import asyncio
+
+    from gateway.platforms.whatsapp_appointments import drain_appointment_outbox
+
+    db = tmp_path / "appointments.sqlite3"
+    handler = WhatsAppAppointmentsHandler(
+        payment_config(reception_chat_id="557188048263"), db_path=db
+    )
+    AppointmentStore(db)
+    assert handler.internal_notice_targets, "o handler não conhece o destino interno"
+    alvo = sorted(handler.internal_notice_targets)[0]
+
+    entregues = []
+
+    class AdapterQueAceitaMetadata:
+        async def send(self, chat_key, body, metadata=None):
+            entregues.append((chat_key, metadata))
+            return type("R", (), {"success": True})()
+
+    _enfileira(
+        db,
+        outbox_id="ob-aviso-1",
+        chat_key=alvo,
+        body="Assunto clínico — aviso de teste.",
+        now=handler._now(),
+    )
+    asyncio.run(
+        drain_appointment_outbox(
+            handler, AdapterQueAceitaMetadata(), worker_id="w-interno"
+        )
+    )
+
+    assert entregues, "o aviso não foi entregue"
+    assert entregues[0][1] == {"internal_notice": True}
+
+
+def test_adaptador_antigo_sem_metadata_continua_funcionando(tmp_path):
+    """A assinatura de duas posições é a de outras plataformas — e dos duplos."""
+
+    import asyncio
+
+    from gateway.platforms.whatsapp_appointments import drain_appointment_outbox
+
+    db = tmp_path / "appointments.sqlite3"
+    handler = WhatsAppAppointmentsHandler(
+        payment_config(reception_chat_id="557188048263"), db_path=db
+    )
+    AppointmentStore(db)
+    alvo = sorted(handler.internal_notice_targets)[0]
+    entregues = []
+
+    class AdapterAntigo:
+        async def send(self, chat_key, body):
+            entregues.append(chat_key)
+            return type("R", (), {"success": True})()
+
+    _enfileira(db, outbox_id="ob-aviso-2", chat_key=alvo, body="aviso", now=handler._now())
+    total = asyncio.run(
+        drain_appointment_outbox(handler, AdapterAntigo(), worker_id="w-antigo")
+    )
+
+    assert total == 1 and entregues == [alvo]
+
+
+def test_mensagem_de_paciente_nao_vai_marcada_como_interna(tmp_path):
+    import asyncio
+
+    from gateway.platforms.whatsapp_appointments import drain_appointment_outbox
+
+    db = tmp_path / "appointments.sqlite3"
+    handler = WhatsAppAppointmentsHandler(
+        payment_config(reception_chat_id="557188048263"), db_path=db
+    )
+    AppointmentStore(db)
+    entregues = []
+
+    class Adapter:
+        async def send(self, chat_key, body, metadata=None):
+            entregues.append((chat_key, metadata))
+            return type("R", (), {"success": True})()
+
+    _enfileira(
+        db,
+        outbox_id="ob-lead-1",
+        chat_key=CHAT,
+        body="Oi! Ainda quer marcar?",
+        now=handler._now(),
+    )
+    asyncio.run(drain_appointment_outbox(handler, Adapter(), worker_id="w-paciente"))
+
+    assert entregues and entregues[0][1] is None
