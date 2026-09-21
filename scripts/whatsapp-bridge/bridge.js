@@ -189,7 +189,9 @@ function recordOwnerIntervention(chatId, now = Date.now()) {
     }
     fresh[chatId] = now;
     mkdirSync(path.dirname(OWNER_INTERVENTION_FILE), { recursive: true });
-    writeFileSync(OWNER_INTERVENTION_FILE, JSON.stringify(fresh, null, 2));
+    // 0600 explícito: são identificadores de contato, e o arquivo vizinho de
+    // cooldown já vive assim. Não depender do umask de quem subiu o processo.
+    writeFileSync(OWNER_INTERVENTION_FILE, JSON.stringify(fresh, null, 2), { mode: 0o600 });
   } catch {}
 }
 
