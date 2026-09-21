@@ -135,7 +135,9 @@ def test_aviso_de_falta_tira_o_contato_do_funil(monkeypatch, tmp_path):
     assert resposta is None, "o turno tinha de ir ao modelo, não virar menu"
     assert store.load_flow(CHAT) is None, "o contato continuou preso no funil"
     assert store.contact_kind(CHAT) == ("colega_de_trabalho", 1.0)
-    assert len(chamadas) == 1 and chamadas[0][0] == [AVISO_DE_FALTA]
+    assert len(chamadas) == 1 and chamadas[0][0] == [AVISO_DE_FALTA], (
+        "o texto julgado é o da pessoa, sem endereço colado"
+    )
 
 
 def test_a_abertura_seguinte_nao_leva_menu_e_nao_paga_rede(monkeypatch, tmp_path):
@@ -309,7 +311,9 @@ def test_paciente_ja_rotulado_nao_e_julgado_de_novo_na_abertura(monkeypatch, tmp
         ("empresa_ou_fornecedor", 0.94, True),
         ("convite_profissional", 0.75, True),
         ("spam", 0.99, True),
-        ("fraude", 0.88, True),
+        ("spam", 0.89, False),  # 21/set: paciente com reportagem saiu spam 0,73
+        ("fraude", 0.95, True),
+        ("fraude", 0.88, False),
         ("paciente", 1.0, False),
         ("lead", 1.0, False),
         ("familiar_do_paciente", 1.0, False),
@@ -687,3 +691,86 @@ def test_todo_aviso_direto_a_recepcao_vai_marcado_como_interno():
         f"esperava 3 avisos diretos à recepção, encontrei {encontradas} — se o "
         "número mudou, confira se a rota nova também está marcada"
     )
+
+
+# --------------------------------------------------------------------------
+# 10. O link que quase apagou o fluxo de um paciente
+# --------------------------------------------------------------------------
+#
+# Achado pela suíte em 21/set, depois de o código já estar commitado:
+# `test_a_shared_link_never_answers_for_the_patient` passou a falhar porque o
+# julgamento rodava sobre a mensagem CRUA. Medido no Jev, uma vez:
+#
+#     https://www1.folha.uol.com.br/...canetas-emagrecedoras-veja-precos.shtml
+#         -> spam, confiança 0,73
+#
+# Acima do limiar comum. O paciente que compartilha uma reportagem era marcado
+# de spam, saía do funil e perdia o agendamento em andamento. Duas travas
+# saíram daqui: o endereço não vai ao julgamento, e spam/fraude passaram a
+# exigir 0,90 — errar contra um paciente custa caro, deixar um spam seguir no
+# funil não custa nada.
+
+LINK = (
+    "https://www1.folha.uol.com.br/equilibrioesaude/2026/09/"
+    "anvisa-aprova-12-novas-canetas-emagrecedoras-veja-precos.shtml"
+)
+
+
+def test_link_sozinho_nao_e_julgado_e_nao_paga_rede(monkeypatch, tmp_path):
+    handler, store = _handler(tmp_path)
+    _no_menu(handler, store)
+    chamadas = _duplo(monkeypatch, "spam", 0.99)
+
+    resposta = handler.handle(event(LINK, chat_id=CHAT, message_id="m-1"))
+
+    assert chamadas == [], "um endereço sozinho não diz quem escreve"
+    assert store.load_flow(CHAT) is not None, "o fluxo do paciente foi apagado"
+    assert store.contact_kind(CHAT) is None
+    assert resposta is not None
+
+
+def test_o_endereco_nao_vai_para_o_julgamento(monkeypatch, tmp_path):
+    handler, store = _handler(tmp_path)
+    _no_menu(handler, store)
+    chamadas = _duplo(monkeypatch, "paciente", 0.95)
+
+    handler.handle(
+        event(f"olha isso {LINK} me diz o que acha", chat_id=CHAT, message_id="m-1")
+    )
+
+    assert len(chamadas) == 1
+    julgado = chamadas[0][0][0]
+    assert "http" not in julgado and "folha.uol" not in julgado
+    assert "me diz o que acha" in julgado
+
+
+def test_spam_abaixo_de_090_nao_tira_ninguem_do_funil(monkeypatch, tmp_path):
+    handler, store = _handler(tmp_path)
+    _no_menu(handler, store)
+    _duplo(monkeypatch, "spam", 0.73)  # o número real medido no link
+
+    resposta = handler.handle(
+        event("olha o que saiu na reportagem sobre as canetas", chat_id=CHAT, message_id="m-1")
+    )
+
+    assert resposta is not None and "Agendar uma consulta" in resposta
+    assert store.load_flow(CHAT) is not None
+    assert store.contact_kind(CHAT) == ("spam", 0.73), "o rótulo fica registrado"
+
+
+@pytest.mark.parametrize(
+    "texto, tem",
+    [
+        ("Dr. o paciente das 15:30 também não veio", True),
+        ("bom dia", False),
+        ("oi", False),
+        (LINK, False),
+        (f"olha {LINK}", False),
+        ("obrigada doutor", False),
+        ("estou aqui na sala com a paciente", True),
+    ],
+)
+def test_o_que_conta_como_sinal(texto, tem):
+    from gateway import jev_contato
+
+    assert jev_contato.tem_sinal(jev_contato.sem_enderecos(texto)) is tem

@@ -63,6 +63,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -84,6 +85,20 @@ TIMEOUT_PADRAO = 3.0
 # tira ninguém do funil. Foi o que separou o acerto do erro na medição: os dois
 # erros de sub-classe saíram a 0,31 e 0,45.
 LIMIAR_CONFIANCA = 0.70
+
+# Duas classes pedem MAIS que as outras, e a razão é o custo de errar (21/set,
+# achado na suíte): um paciente que compartilha uma reportagem sai `spam` com
+# **0,73** — acima do limiar comum. Marcar um paciente de spam é perder um
+# agendamento, e o rótulo é persistido; deixar um spam de verdade seguir no
+# funil não custa nada a ninguém. Assimetria de dano, limiar assimétrico.
+LIMIAR_POR_CLASSE = {
+    "spam": 0.90,
+    "fraude": 0.90,
+}
+
+# Abaixo disto não há sinal para julgar: sobra cumprimento, link ou uma palavra
+# solta. Não paga rede e não decide nada — a mensagem seguinte decide.
+MINIMO_DE_PALAVRAS = 3
 
 # Os três destinos de AÇÃO. As nove categorias abaixo existem para descrever o
 # contato; o que o código decide com elas é só isto.
@@ -153,6 +168,10 @@ def desligado() -> bool:
     return os.environ.get("HERMES_JEV_CONTATO", "on").lower() in ("off", "0", "false")
 
 
+def limiar_de(rotulo: Any) -> float:
+    return LIMIAR_POR_CLASSE.get(str(rotulo or ""), LIMIAR_CONFIANCA)
+
+
 def fora_do_funil(rotulo: Any, confianca: Any) -> bool:
     """O rótulo, com a confiança que tem, basta para NÃO abrir o funil?"""
 
@@ -160,7 +179,35 @@ def fora_do_funil(rotulo: Any, confianca: Any) -> bool:
         valor = float(confianca)
     except (TypeError, ValueError):
         return False
-    return str(rotulo or "") in FORA and valor >= LIMIAR_CONFIANCA
+    nome = str(rotulo or "")
+    return nome in FORA and valor >= limiar_de(nome)
+
+
+_ENDERECO_RE = re.compile(r"(https?://\S+|www\.\S+)", re.I)
+
+
+def sem_enderecos(texto: Any) -> str:
+    """O texto sem endereços colados, e só isso.
+
+    De propósito NÃO é o ``_intent_text`` do funil: aquele também tira acento,
+    pontuação e caixa, e o julgamento de *quem escreve* se faz melhor sobre a
+    frase como a pessoa a escreveu. O que precisa sair é o endereço — foi ele
+    que virou ``spam`` 0,73 e apagou o fluxo de um paciente com reportagem.
+    """
+
+    return _ENDERECO_RE.sub(" ", str(texto or "")).strip()
+
+
+def tem_sinal(texto: Any) -> bool:
+    """Há texto suficiente para julgar quem escreve?
+
+    ``"bom dia"`` e um link sozinho não dizem nada sobre o remetente — e um
+    link chegou a sair ``spam`` 0,73, o que apagaria o fluxo de um paciente
+    que compartilhou uma reportagem. Quem chama deve passar o texto JÁ sem
+    endereço (o funil tem ``_intent_text`` para isso).
+    """
+
+    return len(str(texto or "").split()) >= MINIMO_DE_PALAVRAS
 
 
 def _timeout_padrao() -> float:
@@ -236,6 +283,9 @@ def classifica(
     uteis = [str(t).strip() for t in textos if str(t or "").strip()]
     if not uteis:
         diag["motivo"] = "sem texto"
+        return None, diag
+    if not any(tem_sinal(t) for t in uteis):
+        diag["motivo"] = "texto sem sinal"
         return None, diag
     diag["n_textos"] = len(uteis)
 

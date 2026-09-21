@@ -5582,8 +5582,15 @@ class WhatsAppAppointmentsHandler:
 
         if _jev_contato is None or _jev_contato.desligado():
             return False
+        # Julga a frase, sem o endereço colado. Um link de reportagem sai
+        # `spam` 0,73 no Jev, e isso apagaria o fluxo de um paciente que
+        # compartilhou uma matéria — foi assim que a suíte pegou o defeito, em
+        # `test_a_shared_link_never_answers_for_the_patient`.
+        julgavel = _jev_contato.sem_enderecos(text)
+        if not _jev_contato.tem_sinal(julgavel):
+            return False
         try:
-            resultado, diag = _jev_contato.classifica([text])
+            resultado, diag = _jev_contato.classifica([julgavel])
             _jev_contato.registra(diag, chave_conversa=chat_key)
         except Exception:  # noqa: BLE001 — julgamento nunca derruba conversa
             logger.warning("jev_contato falhou; o funil segue como antes", exc_info=True)
